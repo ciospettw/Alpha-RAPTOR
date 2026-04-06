@@ -1,4 +1,4 @@
-osm_pbf = "data/osm/lazio-latest.osm.pbf"
+osm_pbf = "https://download.geofabrik.de/europe/italy/centro-latest.osm.pbf"
 walk_radius_meters = 450.0
 walk_speed_mps = 1.35
 max_transfer_candidates = 12
@@ -16,6 +16,10 @@ max_distance_meters = 4000.0
 snap_tolerance_meters = 140.0
 snap_quadratic_kappa_meters = 40.0
 search_window = 512
+
+[osm_diff]
+state_url = "https://download.geofabrik.de/europe/italy/centro-updates/state.txt"
+poll_interval_secs = 1800
 
 [[feeds]]
 id = "roma"

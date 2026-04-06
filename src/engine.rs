@@ -26,7 +26,7 @@ use crate::geo::{
     destination_cell_neighborhood as geo_destination_cell_neighborhood,
     destination_cell_window as geo_destination_cell_window,
 };
-use crate::hpf::{HolographicPedestrianForest, build_or_load_hpf};
+use crate::hpf::{HolographicPedestrianForest, HpfDiffConfig, HpfOverlaySnapshot, build_or_load_hpf};
 use crate::profile_cache::{
     CachedLeg, PreparedSpatialLookup, ProfileCache, ProfileCacheStats, ProfileInsertionPoint,
     ProfileLookupDecision, SpatialProfileInsertionPoint,
@@ -47,6 +47,7 @@ const DEFAULT_HPF_MAX_DISTANCE_METERS: f64 = 4_000.0;
 const DEFAULT_HPF_SNAP_TOLERANCE_METERS: f64 = 140.0;
 const DEFAULT_HPF_SNAP_QUADRATIC_KAPPA_METERS: f64 = 40.0;
 const DEFAULT_HPF_SEARCH_WINDOW: usize = 512;
+const DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS: u64 = 30 * 60;
 const GLOBAL_ID_LOCAL_MASK: u64 = (1u64 << 48) - 1;
 const ENTITY_KIND_SHIFT: u64 = 44;
 const ENTITY_ORDINAL_MASK: u64 = (1u64 << ENTITY_KIND_SHIFT) - 1;
@@ -67,6 +68,7 @@ pub struct FeedConfig {
 #[derive(Debug, Deserialize)]
 struct RawEngineManifest {
     osm_pbf: Option<String>,
+    osm_pbf_allow_invalid_tls: Option<bool>,
     walk_radius_meters: Option<f64>,
     walk_speed_mps: Option<f64>,
     max_transfer_candidates: Option<usize>,
@@ -76,6 +78,7 @@ struct RawEngineManifest {
     default_max_transfers: Option<usize>,
     dvni: Option<RawDvniConfig>,
     hpf: Option<RawHpfConfig>,
+    osm_diff: Option<RawOsmDiffConfig>,
     feeds: Vec<RawFeedConfig>,
 }
 
@@ -91,6 +94,14 @@ struct RawHpfConfig {
     snap_tolerance_meters: Option<f64>,
     snap_quadratic_kappa_meters: Option<f64>,
     search_window: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOsmDiffConfig {
+    state_url: String,
+    diff_base_url: Option<String>,
+    poll_interval_secs: Option<u64>,
+    allow_invalid_tls: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +138,9 @@ pub struct EngineConfig {
     pub manifest_path: Option<PathBuf>,
     pub feeds: Vec<FeedConfig>,
     pub osm_pbf_path: PathBuf,
+    pub osm_pbf_source: String,
+    pub osm_pbf_remote_url: Option<String>,
+    pub osm_pbf_allow_invalid_tls: bool,
     pub walk_radius_meters: f64,
     pub walk_speed_mps: f64,
     pub max_transfer_candidates: usize,
@@ -140,6 +154,7 @@ pub struct EngineConfig {
     pub hpf_snap_tolerance_meters: f64,
     pub hpf_snap_quadratic_kappa_meters: f64,
     pub hpf_search_window: usize,
+    pub osm_diff: Option<HpfDiffConfig>,
     static_inputs_metadata: StaticCacheMetadata,
 }
 
@@ -212,7 +227,18 @@ struct StaticCacheMetadata {
     schema_version: u32,
     manifest_path: Option<String>,
     manifest_modified_unix_secs: Option<u64>,
+    osm_source: StaticOsmSourceMetadata,
     feed_sources: Vec<StaticFeedSourceMetadata>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StaticOsmSourceMetadata {
+    osm_pbf_source: String,
+    osm_pbf_path: String,
+    osm_pbf_remote_url: Option<String>,
+    osm_pbf_allow_invalid_tls: bool,
+    osm_pbf_bytes: u64,
+    osm_pbf_modified_unix_secs: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,6 +352,7 @@ pub struct EngineStats {
     pub build: BuildStats,
     pub realtime: RealtimeDebugSnapshot,
     pub memoization: ProfileCacheStats,
+    pub hpf_overlay: Option<HpfOverlaySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -343,6 +370,11 @@ pub struct BuildStats {
     pub static_total_entities: usize,
     pub cold_store_strategy: &'static str,
     pub osm_pbf_path: String,
+    pub osm_pbf_source: String,
+    pub osm_pbf_remote_url: Option<String>,
+    pub osm_pbf_allow_invalid_tls: bool,
+    pub osm_diff_state_url: Option<String>,
+    pub osm_diff_poll_interval_secs: Option<u64>,
     pub static_gtfs_bytes: u64,
     pub osm_pbf_bytes: u64,
     pub stops: usize,
@@ -912,6 +944,17 @@ impl EngineConfig {
             .parent()
             .unwrap_or_else(|| workspace_root.as_path())
             .to_path_buf();
+        let default_osm_pbf = default_osm_pbf_path(workspace_root).display().to_string();
+        let prepared_osm_pbf = prepare_osm_pbf_source(
+            workspace_root,
+            &manifest_dir,
+            manifest
+                .osm_pbf
+                .as_deref()
+                .unwrap_or(default_osm_pbf.as_str()),
+            manifest.osm_pbf_allow_invalid_tls.unwrap_or(false),
+            refresh_mode,
+        )?;
         let mut seen_ids = HashSet::<String>::new();
         let mut feeds = Vec::with_capacity(manifest.feeds.len());
         for (position, raw_feed) in manifest.feeds.into_iter().enumerate() {
@@ -947,10 +990,10 @@ impl EngineConfig {
             workspace_root: workspace_root.clone(),
             manifest_path: Some(manifest_path),
             feeds,
-            osm_pbf_path: manifest
-                .osm_pbf
-                .map(|path| resolve_path_from(&manifest_dir, &path))
-                .unwrap_or_else(|| default_osm_pbf_path(workspace_root)),
+            osm_pbf_path: prepared_osm_pbf.local_path,
+            osm_pbf_source: prepared_osm_pbf.source,
+            osm_pbf_remote_url: prepared_osm_pbf.remote_url,
+            osm_pbf_allow_invalid_tls: prepared_osm_pbf.allow_invalid_tls,
             walk_radius_meters: manifest.walk_radius_meters.unwrap_or(450.0),
             walk_speed_mps: manifest.walk_speed_mps.unwrap_or(1.35),
             max_transfer_candidates: manifest.max_transfer_candidates.unwrap_or(12),
@@ -996,15 +1039,34 @@ impl EngineConfig {
                 .and_then(|hpf| hpf.search_window)
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
+            osm_diff: manifest.osm_diff.as_ref().map(|diff| HpfDiffConfig {
+                state_url: diff.state_url.clone(),
+                diff_base_url: diff.diff_base_url.clone(),
+                poll_interval_secs: diff
+                    .poll_interval_secs
+                    .unwrap_or(DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS)
+                    .max(60),
+                allow_invalid_tls: diff
+                    .allow_invalid_tls
+                    .unwrap_or(prepared_osm_pbf.allow_invalid_tls),
+            }),
             static_inputs_metadata: StaticCacheMetadata {
                 schema_version: STATIC_CACHE_SCHEMA_VERSION,
                 manifest_path: None,
                 manifest_modified_unix_secs: None,
+                osm_source: StaticOsmSourceMetadata {
+                    osm_pbf_source: String::new(),
+                    osm_pbf_path: String::new(),
+                    osm_pbf_remote_url: None,
+                    osm_pbf_allow_invalid_tls: false,
+                    osm_pbf_bytes: 0,
+                    osm_pbf_modified_unix_secs: None,
+                },
                 feed_sources: Vec::new(),
             },
         };
         config.static_inputs_metadata =
-            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config.feeds)?;
+            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config)?;
         Ok(config)
     }
 
@@ -1026,6 +1088,23 @@ impl EngineConfig {
             static_gtfs_value,
             "data/gtfs/rome_static_gtfs.zip",
             static_gtfs_allow_invalid_tls,
+            refresh_mode,
+        )?;
+        let osm_pbf_allow_invalid_tls = env::var("ALPHA_OSM_PBF_ALLOW_INVALID_TLS")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let default_osm_pbf = default_osm_pbf_path(&workspace_root).display().to_string();
+        let prepared_osm_pbf = prepare_osm_pbf_source_legacy(
+            &workspace_root,
+            env::var("ALPHA_OSM_PBF").ok(),
+            default_osm_pbf.as_str(),
+            osm_pbf_allow_invalid_tls,
             refresh_mode,
         )?;
 
@@ -1051,11 +1130,10 @@ impl EngineConfig {
                 ),
                 depends_on: Vec::new(),
             }],
-            osm_pbf_path: resolve_path(
-                &workspace_root,
-                env::var("ALPHA_OSM_PBF").ok(),
-                "data/osm/lazio-latest.osm.pbf",
-            ),
+            osm_pbf_path: prepared_osm_pbf.local_path,
+            osm_pbf_source: prepared_osm_pbf.source,
+            osm_pbf_remote_url: prepared_osm_pbf.remote_url,
+            osm_pbf_allow_invalid_tls: prepared_osm_pbf.allow_invalid_tls,
             walk_radius_meters: env::var("ALPHA_WALK_RADIUS_M")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1114,15 +1192,43 @@ impl EngineConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
+            osm_diff: env::var("ALPHA_OSM_DIFF_STATE_URL")
+                .ok()
+                .map(|state_url| HpfDiffConfig {
+                    diff_base_url: env::var("ALPHA_OSM_DIFF_BASE_URL").ok(),
+                    poll_interval_secs: env::var("ALPHA_OSM_DIFF_POLL_SECS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS)
+                        .max(60),
+                    allow_invalid_tls: env::var("ALPHA_OSM_DIFF_ALLOW_INVALID_TLS")
+                        .ok()
+                        .map(|value| {
+                            matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "1" | "true" | "yes" | "on"
+                            )
+                        })
+                        .unwrap_or(prepared_osm_pbf.allow_invalid_tls),
+                    state_url,
+                }),
             static_inputs_metadata: StaticCacheMetadata {
                 schema_version: STATIC_CACHE_SCHEMA_VERSION,
                 manifest_path: None,
                 manifest_modified_unix_secs: None,
+                osm_source: StaticOsmSourceMetadata {
+                    osm_pbf_source: String::new(),
+                    osm_pbf_path: String::new(),
+                    osm_pbf_remote_url: None,
+                    osm_pbf_allow_invalid_tls: false,
+                    osm_pbf_bytes: 0,
+                    osm_pbf_modified_unix_secs: None,
+                },
                 feed_sources: Vec::new(),
             },
         };
         config.static_inputs_metadata =
-            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config.feeds)?;
+            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config)?;
         Ok(config)
     }
 
@@ -1255,6 +1361,7 @@ impl Engine {
             config.hpf_snap_tolerance_meters,
             config.hpf_snap_quadratic_kappa_meters,
             config.hpf_search_window,
+            config.osm_diff.clone(),
         );
         let hpf_millis = hpf_started.elapsed().as_millis();
         let (hpf, hpf_strategy, hpf_cache_hit, hpf_covered_nodes, hpf_anchored_stops) =
@@ -1301,6 +1408,11 @@ impl Engine {
             static_total_entities: static_core_result.diff_summary.total_entities,
             cold_store_strategy: "hydra-slab-direct-index+mmap-data",
             osm_pbf_path: config.osm_pbf_path.display().to_string(),
+            osm_pbf_source: config.osm_pbf_source.clone(),
+            osm_pbf_remote_url: config.osm_pbf_remote_url.clone(),
+            osm_pbf_allow_invalid_tls: config.osm_pbf_allow_invalid_tls,
+            osm_diff_state_url: config.osm_diff.as_ref().map(|value| value.state_url.clone()),
+            osm_diff_poll_interval_secs: config.osm_diff.as_ref().map(|value| value.poll_interval_secs),
             static_gtfs_bytes: config
                 .feeds
                 .iter()
@@ -1395,7 +1507,19 @@ impl Engine {
             build: self.static_data.build_stats.clone(),
             realtime: self.realtime.snapshot(&self.static_data, 16),
             memoization: self.profile_cache.snapshot(),
+            hpf_overlay: self.hpf.as_ref().map(|hpf| hpf.overlay_snapshot()),
         }
+    }
+
+    pub async fn refresh_hpf_overlay(&self) -> Result<Option<HpfOverlaySnapshot>> {
+        let Some(hpf) = self.hpf.clone() else {
+            return Ok(None);
+        };
+
+        tokio::task::spawn_blocking(move || hpf.poll_remote_updates())
+            .await
+            .context("HPF overlay refresh task panicked")?
+            .map(Some)
     }
 
     pub fn realtime_snapshot(&self, limit: usize) -> RealtimeDebugSnapshot {
@@ -4039,6 +4163,13 @@ fn default_osm_pbf_path(workspace_root: &Path) -> PathBuf {
         .join("lazio-latest.osm.pbf")
 }
 
+struct PreparedOsmPbfSource {
+    local_path: PathBuf,
+    source: String,
+    remote_url: Option<String>,
+    allow_invalid_tls: bool,
+}
+
 struct PreparedStaticGtfsSource {
     local_path: PathBuf,
     source: String,
@@ -4057,6 +4188,61 @@ struct RemoteStaticGtfsVersionMetadata {
     url: String,
     last_modified: Option<String>,
     etag: Option<String>,
+}
+
+fn prepare_osm_pbf_source(
+    workspace_root: &Path,
+    base_dir: &Path,
+    source_value: &str,
+    allow_invalid_tls: bool,
+    refresh_mode: StaticGtfsRefreshMode,
+) -> Result<PreparedOsmPbfSource> {
+    if is_remote_source(source_value) {
+        let cache_path = remote_osm_pbf_cache_path(workspace_root, source_value);
+        sync_remote_osm_pbf(
+            source_value,
+            allow_invalid_tls,
+            &cache_path,
+            refresh_mode,
+        )?;
+        return Ok(PreparedOsmPbfSource {
+            local_path: cache_path,
+            source: source_value.to_owned(),
+            remote_url: Some(source_value.to_owned()),
+            allow_invalid_tls,
+        });
+    }
+
+    Ok(PreparedOsmPbfSource {
+        local_path: resolve_path_from(base_dir, source_value),
+        source: source_value.to_owned(),
+        remote_url: None,
+        allow_invalid_tls,
+    })
+}
+
+fn prepare_osm_pbf_source_legacy(
+    workspace_root: &Path,
+    source_value: Option<String>,
+    default_name: &str,
+    allow_invalid_tls: bool,
+    refresh_mode: StaticGtfsRefreshMode,
+) -> Result<PreparedOsmPbfSource> {
+    match source_value {
+        Some(source_value) => prepare_osm_pbf_source(
+            workspace_root,
+            workspace_root,
+            &source_value,
+            allow_invalid_tls,
+            refresh_mode,
+        ),
+        None => Ok(PreparedOsmPbfSource {
+            local_path: workspace_root.join(default_name),
+            source: default_name.to_owned(),
+            remote_url: None,
+            allow_invalid_tls,
+        }),
+    }
 }
 
 fn prepare_static_gtfs_source(
@@ -4127,6 +4313,15 @@ fn remote_static_gtfs_cache_path(workspace_root: &Path, feed_id: &str) -> PathBu
     runtime_root(workspace_root)
         .join("static-feeds")
         .join(format!("{feed_id}.static.gtfs.zip"))
+}
+
+fn remote_osm_pbf_cache_path(workspace_root: &Path, source_value: &str) -> PathBuf {
+    let file_name = source_value
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("osm-latest.osm.pbf");
+    runtime_root(workspace_root).join("osm").join(file_name)
 }
 
 fn remote_static_gtfs_version_path(cache_path: &Path) -> PathBuf {
@@ -4454,6 +4649,196 @@ fn sync_remote_static_gtfs(
     Ok(())
 }
 
+fn sync_remote_osm_pbf(
+    url: &str,
+    allow_invalid_tls: bool,
+    cache_path: &Path,
+    refresh_mode: StaticGtfsRefreshMode,
+) -> Result<()> {
+    let client = BlockingHttpClient::builder()
+        .user_agent("alpha-raptor-engine/0.1")
+        .danger_accept_invalid_certs(allow_invalid_tls)
+        .build()
+        .context("failed to build HTTP client for OSM PBF source")?;
+
+    let version_path = remote_static_gtfs_version_path(cache_path);
+    let cached_version = match load_remote_static_gtfs_version_metadata(&version_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warn!(
+                %error,
+                metadata = %version_path.display(),
+                "failed to load cached remote OSM PBF version metadata"
+            );
+            None
+        }
+    };
+
+    let mut probed_version = None;
+    if cache_path.exists() {
+        match refresh_mode {
+            StaticGtfsRefreshMode::Bootstrap => {
+                match probe_remote_static_gtfs_version(&client, "osm-pbf", url) {
+                    Ok(remote_version) => {
+                        if remote_static_gtfs_version_changed(cached_version.as_ref(), &remote_version)
+                        {
+                            info!(
+                                url,
+                                cache = %cache_path.display(),
+                                remote_last_modified = remote_version
+                                    .last_modified
+                                    .as_deref()
+                                    .unwrap_or("<missing>"),
+                                remote_etag = remote_version.etag.as_deref().unwrap_or("<missing>"),
+                                "remote OSM PBF differs upstream; bootstrapping from cached file and deferring sync to background poll"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            url,
+                            cache = %cache_path.display(),
+                            "failed to probe remote OSM PBF metadata during bootstrap; reusing cached file"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            StaticGtfsRefreshMode::Poll => match probe_remote_static_gtfs_version(&client, "osm-pbf", url)
+            {
+                Ok(remote_version) => {
+                    if !remote_static_gtfs_version_changed(cached_version.as_ref(), &remote_version)
+                    {
+                        return Ok(());
+                    }
+                    info!(
+                        url,
+                        cache = %cache_path.display(),
+                        remote_last_modified = remote_version
+                            .last_modified
+                            .as_deref()
+                            .unwrap_or("<missing>"),
+                        remote_etag = remote_version.etag.as_deref().unwrap_or("<missing>"),
+                        "detected upstream OSM PBF version change"
+                    );
+                    probed_version = Some(remote_version);
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        url,
+                        cache = %cache_path.display(),
+                        "failed to probe remote OSM PBF metadata during poll; keeping cached file"
+                    );
+                    return Ok(());
+                }
+            },
+        }
+    }
+
+    let response = client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("failed to download OSM PBF from {url}"));
+
+    let (bytes, version_metadata) = match response {
+        Ok(response) => {
+            let response_version = merged_remote_static_gtfs_version_metadata(
+                url,
+                remote_static_gtfs_version_from_headers(url, response.headers()),
+                probed_version.as_ref(),
+            );
+            let bytes = response
+                .bytes()
+                .context("failed to read OSM PBF response body")?;
+            (bytes, response_version)
+        }
+        Err(error) => {
+            if cache_path.exists() {
+                warn!(
+                    %error,
+                    url,
+                    cache = %cache_path.display(),
+                    "remote OSM PBF refresh failed, reusing cached file"
+                );
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+
+    if let Ok(existing_bytes) = fs::read(cache_path) {
+        if existing_bytes.as_slice() == bytes.as_ref() {
+            if let Err(error) =
+                store_remote_static_gtfs_version_metadata(&version_path, &version_metadata)
+            {
+                warn!(
+                    %error,
+                    metadata = %version_path.display(),
+                    "failed to persist remote OSM PBF version metadata"
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create cache directory for OSM PBF at {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let tmp_path = cache_path.with_extension(format!("download-{unique_suffix}.tmp"));
+    fs::write(&tmp_path, bytes.as_ref()).with_context(|| {
+        format!(
+            "failed to write downloaded OSM PBF to temporary file {}",
+            tmp_path.display()
+        )
+    })?;
+    if cache_path.exists() {
+        fs::remove_file(cache_path).with_context(|| {
+            format!(
+                "failed to replace cached OSM PBF at {}",
+                cache_path.display()
+            )
+        })?;
+    }
+    fs::rename(&tmp_path, cache_path).with_context(|| {
+        format!(
+            "failed to move downloaded OSM PBF into cache path {}",
+            cache_path.display()
+        )
+    })?;
+
+    if let Err(error) = store_remote_static_gtfs_version_metadata(&version_path, &version_metadata) {
+        warn!(
+            %error,
+            metadata = %version_path.display(),
+            "failed to persist remote OSM PBF version metadata"
+        );
+    }
+
+    info!(
+        url,
+        cache = %cache_path.display(),
+        allow_invalid_tls,
+        remote_last_modified = version_metadata.last_modified.as_deref().unwrap_or("<missing>"),
+        remote_etag = version_metadata.etag.as_deref().unwrap_or("<missing>"),
+        "synced remote OSM PBF"
+    );
+
+    Ok(())
+}
+
 fn validate_feed_id(feed_id: &str) -> Result<()> {
     let feed_id = feed_id.trim();
     if feed_id.is_empty() {
@@ -4527,7 +4912,7 @@ fn pack_global_id(feed_index: u16, kind: EntityKind, local_ordinal: u64) -> Resu
 
 fn capture_static_inputs_metadata(
     manifest_path: Option<&PathBuf>,
-    feeds: &[FeedConfig],
+    config: &EngineConfig,
 ) -> Result<StaticCacheMetadata> {
     let manifest_modified_unix_secs = manifest_path
         .and_then(|path| std::fs::metadata(path).ok())
@@ -4535,8 +4920,15 @@ fn capture_static_inputs_metadata(
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs());
 
-    let mut feed_sources = Vec::with_capacity(feeds.len());
-    for feed in feeds {
+    let osm_metadata = std::fs::metadata(&config.osm_pbf_path).with_context(|| {
+        format!(
+            "unable to stat OSM PBF at {}",
+            config.osm_pbf_path.display()
+        )
+    })?;
+
+    let mut feed_sources = Vec::with_capacity(config.feeds.len());
+    for feed in &config.feeds {
         let metadata = std::fs::metadata(&feed.static_gtfs_path).with_context(|| {
             format!(
                 "unable to stat GTFS zip for feed {} at {}",
@@ -4562,6 +4954,18 @@ fn capture_static_inputs_metadata(
         schema_version: STATIC_CACHE_SCHEMA_VERSION,
         manifest_path: manifest_path.map(|path| path.display().to_string()),
         manifest_modified_unix_secs,
+        osm_source: StaticOsmSourceMetadata {
+            osm_pbf_source: config.osm_pbf_source.clone(),
+            osm_pbf_path: config.osm_pbf_path.display().to_string(),
+            osm_pbf_remote_url: config.osm_pbf_remote_url.clone(),
+            osm_pbf_allow_invalid_tls: config.osm_pbf_allow_invalid_tls,
+            osm_pbf_bytes: osm_metadata.len(),
+            osm_pbf_modified_unix_secs: osm_metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs()),
+        },
         feed_sources,
     })
 }

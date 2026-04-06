@@ -25,6 +25,14 @@ pub fn morton_code(latitude: f64, longitude: f64) -> u64 {
     spread_bits(lon) | (spread_bits(lat) << 1)
 }
 
+pub(crate) fn morton_code_from_components(latitude: u32, longitude: u32) -> u64 {
+    spread_bits(longitude) | (spread_bits(latitude) << 1)
+}
+
+pub(crate) fn decode_morton_components(code: u64) -> (u32, u32) {
+    (compact_bits(code >> 1), compact_bits(code))
+}
+
 pub fn decode_morton_code(code: u64) -> (f64, f64) {
     let lon = compact_bits(code);
     let lat = compact_bits(code >> 1);

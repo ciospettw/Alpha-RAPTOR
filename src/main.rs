@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
     let shared_engine = SharedEngine::new(engine.clone());
     spawn_realtime_refresh(shared_engine.clone());
     spawn_static_reload(shared_engine.clone());
+    spawn_hpf_overlay_refresh(shared_engine.clone());
 
     let public_dir = workspace_root.join("public");
     let app = Router::new()
@@ -135,6 +136,10 @@ async fn main() -> Result<()> {
         manifest = ?engine.config.manifest_path.as_ref().map(|path| path.display().to_string()),
         feed_count = engine.config.feeds.len(),
         static_poll_secs = engine.config.static_reload_interval_secs,
+        osm_pbf = %engine.config.osm_pbf_path.display(),
+        osm_pbf_source = %engine.config.osm_pbf_source,
+        osm_diff_state_url = ?engine.config.osm_diff.as_ref().map(|value| value.state_url.clone()),
+        osm_diff_poll_secs = ?engine.config.osm_diff.as_ref().map(|value| value.poll_interval_secs),
         static_gtfs = %engine.config.static_sources_display(),
         trip_updates = %engine.config.trip_updates_display(),
         vehicle_positions = %engine.config.vehicle_positions_display(),
@@ -224,6 +229,45 @@ fn spawn_static_reload(engine: SharedEngine) {
                 }
                 Err(error) => {
                     warn!(%error, "static GTFS change detected but rebuild failed; keeping current engine");
+                }
+            }
+        }
+    });
+}
+
+fn spawn_hpf_overlay_refresh(engine: SharedEngine) {
+    tokio::spawn(async move {
+        let mut first_cycle = true;
+        loop {
+            let poll_every = match engine.current().config.osm_diff.as_ref() {
+                Some(config) => Duration::from_secs(config.poll_interval_secs),
+                None => Duration::from_secs(300),
+            };
+
+            if first_cycle {
+                first_cycle = false;
+            } else {
+                tokio::time::sleep(poll_every).await;
+            }
+
+            let current_engine = engine.current();
+            if current_engine.config.osm_diff.is_none() {
+                continue;
+            }
+
+            match current_engine.refresh_hpf_overlay().await {
+                Ok(Some(snapshot)) => {
+                    info!(
+                        applied_sequence = ?snapshot.applied_sequence,
+                        overlay_cells = snapshot.overlay_cells,
+                        blocked_cells = snapshot.blocked_cells,
+                        synthetic_cells = snapshot.synthetic_cells,
+                        "background HPF overlay refresh completed"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(%error, "background HPF overlay refresh failed");
                 }
             }
         }
