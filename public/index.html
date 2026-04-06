@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Alpha-RAPTOR Map Console</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <form id="queryForm" class="topbar-form">
+        <div class="toolbar-row toolbar-main">
+          <div class="field-group endpoint-field">
+            <div class="field-head">
+              <label for="fromSearch">Da</label>
+              <button id="pickFromButton" class="mini-button" type="button">Mappa</button>
+            </div>
+            <input id="fromSearch" autocomplete="off" placeholder="Fermata o lat,lon" />
+            <input id="fromStopId" type="hidden" />
+            <div id="fromResults" class="search-results"></div>
+          </div>
+
+          <div class="field-group endpoint-field">
+            <div class="field-head">
+              <label for="toSearch">A</label>
+              <button id="pickToButton" class="mini-button" type="button">Mappa</button>
+            </div>
+            <input id="toSearch" autocomplete="off" placeholder="Fermata o lat,lon" />
+            <input id="toStopId" type="hidden" />
+            <div id="toResults" class="search-results"></div>
+          </div>
+
+          <div class="field-group compact-field">
+            <label for="dateInput">Data</label>
+            <input id="dateInput" type="date" />
+          </div>
+
+          <div class="field-group compact-field">
+            <label for="timeInput">Ora</label>
+            <input id="timeInput" type="time" step="60" />
+          </div>
+
+          <div class="field-group compact-field small-field">
+            <label for="maxTransfersInput">Cambi</label>
+            <input id="maxTransfersInput" type="number" min="0" max="8" value="4" />
+          </div>
+
+          <div class="toolbar-actions">
+            <button class="action-button primary-button" type="submit">Route</button>
+            <button id="swapButton" class="action-button" type="button">Swap</button>
+            <button id="refreshRealtimeButton" class="action-button" type="button">Realtime</button>
+            <span id="refreshStatus" class="status-pill">idle</span>
+          </div>
+        </div>
+
+        <div class="toolbar-row toolbar-secondary">
+          <div id="mapHint" class="map-hint">Doppio click mappa: prossimo punto = origine</div>
+          <div id="itinerarySummary" class="summary-strip">Nessuna query eseguita.</div>
+          <div id="statsGrid" class="stats-grid"></div>
+        </div>
+
+        <details class="debug-drawer">
+          <summary>Dettagli</summary>
+          <div class="debug-grid">
+            <section class="debug-panel">
+              <h2>Itinerario</h2>
+              <div id="legsContainer" class="legs-list empty-state">Nessun itinerario.</div>
+            </section>
+
+            <section class="debug-panel">
+              <h2>Trace</h2>
+              <div id="traceContainer" class="empty-state">Nessun trace disponibile.</div>
+            </section>
+
+            <section class="debug-panel">
+              <h2>Realtime</h2>
+              <div id="realtimeContainer" class="empty-state">Caricamento in corso.</div>
+            </section>
+          </div>
+        </details>
+      </form>
+    </header>
+
+    <main class="map-shell">
+      <div id="map"></div>
+    </main>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>
