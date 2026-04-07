@@ -790,6 +790,7 @@ mod tests {
             id: "roma:t0".to_owned(),
             route_index: 0,
             shape_id: Some("roma:shape-0".to_owned()),
+            shape_stop_point_indices: None,
             headsign: Some("Laurentina".to_owned()),
             stop_times: vec![
                 TripStopRecord {

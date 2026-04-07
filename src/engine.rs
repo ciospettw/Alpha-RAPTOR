@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, File},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -37,7 +37,7 @@ use crate::walker::{
 };
 
 const INF_TIME: i32 = i32::MAX / 8;
-const STATIC_CACHE_SCHEMA_VERSION: u32 = 6;
+const STATIC_CACHE_SCHEMA_VERSION: u32 = 8;
 const CHRONOS_BUCKET_SECS: i32 = 15 * 60;
 const DEFAULT_MANIFEST_NAME: &str = "alpha-raptor.toml";
 const DEFAULT_STATIC_DIFF_TOLERANCE: f64 = 0.05;
@@ -48,6 +48,10 @@ const DEFAULT_HPF_SNAP_TOLERANCE_METERS: f64 = 140.0;
 const DEFAULT_HPF_SNAP_QUADRATIC_KAPPA_METERS: f64 = 40.0;
 const DEFAULT_HPF_SEARCH_WINDOW: usize = 512;
 const DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS: u64 = 30 * 60;
+const SVRT_WIDTH: usize = 8;
+const BTT_MIN_HUB_CELL_METERS: f64 = 120.0;
+const BTT_MAX_HUB_CELL_METERS: f64 = 220.0;
+const EMPTY_TRANSFER_SLOT: u16 = u16::MAX;
 const GLOBAL_ID_LOCAL_MASK: u64 = (1u64 << 48) - 1;
 const ENTITY_KIND_SHIFT: u64 = 44;
 const ENTITY_ORDINAL_MASK: u64 = (1u64 << ENTITY_KIND_SHIFT) - 1;
@@ -182,6 +186,7 @@ pub struct StaticData {
     pub lines: Vec<LineRecord>,
     pub stop_to_lines: Vec<Vec<StopLineRef>>,
     pub transfers: Vec<Vec<WalkTransfer>>,
+    transfer_index: TransferRelaxIndex,
     pub stop_cells: HashMap<u64, Vec<usize>>,
     pub service_by_date: HashMap<NaiveDate, HashSet<String>>,
     pub cold_store: Arc<ColdStore>,
@@ -288,6 +293,7 @@ pub struct TripRecord {
     pub id: String,
     pub route_index: usize,
     pub shape_id: Option<String>,
+    pub shape_stop_point_indices: Option<Vec<u32>>,
     pub headsign: Option<String>,
     pub stop_times: Vec<TripStopRecord>,
 }
@@ -323,6 +329,27 @@ pub struct WalkTransfer {
     pub duration_secs: i32,
     pub distance_meters: f64,
     pub polyline: Vec<PolylinePoint>,
+}
+
+#[derive(Clone)]
+struct TransferRelaxIndex {
+    stop_to_hub: Vec<usize>,
+    stop_to_hub_offset: Vec<usize>,
+    hubs: Vec<TransferHub>,
+}
+
+#[derive(Clone)]
+struct TransferHub {
+    stop_indices: Vec<usize>,
+    outgoing_tiles: Vec<TransferTile>,
+}
+
+#[derive(Clone)]
+struct TransferTile {
+    target_hub: usize,
+    target_stop_indices: Vec<usize>,
+    transfer_slots: Vec<u16>,
+    durations: Vec<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1341,6 +1368,10 @@ impl Engine {
         };
         let walker_millis = walker_started.elapsed().as_millis();
         let transfers = walker_build.transfers;
+        let transfer_hub_cell_meters =
+            (config.walk_radius_meters / 3.0).clamp(BTT_MIN_HUB_CELL_METERS, BTT_MAX_HUB_CELL_METERS);
+        let transfer_index =
+            build_transfer_relax_index(&stops, &transfers, transfer_hub_cell_meters);
         let total_transfers = transfers.iter().map(Vec::len).sum();
         let mut service_days: Vec<_> = service_by_date.keys().copied().collect();
         service_days.sort_unstable();
@@ -1465,6 +1496,7 @@ impl Engine {
             lines,
             stop_to_lines,
             transfers,
+            transfer_index,
             stop_cells,
             service_by_date,
             cold_store,
@@ -2003,6 +2035,7 @@ impl Engine {
 
         let trip_mask_started = Instant::now();
         let trip_is_available = self.build_trip_availability(active_services);
+        let trip_has_realtime_update = self.realtime.updated_trip_mask(self.static_data.trips.len());
         let trip_max_positive_delay_secs = self
             .realtime
             .trip_max_positive_departure_delay_secs(self.static_data.trips.len());
@@ -2158,6 +2191,7 @@ impl Engine {
             rounds,
             &marked_stops,
             &trip_is_available,
+            &trip_has_realtime_update,
             &line_max_positive_delay_secs,
             &mut global_best,
             &mut round_arrivals,
@@ -2232,6 +2266,7 @@ impl Engine {
                     start_pos,
                     to_index,
                     &trip_is_available,
+                    &trip_has_realtime_update,
                     line_max_positive_delay_secs[line_index],
                     &best_before_round,
                     &mut global_best,
@@ -2279,6 +2314,7 @@ impl Engine {
                     rounds,
                     &next_marked,
                     &trip_is_available,
+                    &trip_has_realtime_update,
                     &line_max_positive_delay_secs,
                     &mut global_best,
                     &mut round_arrivals,
@@ -2308,34 +2344,17 @@ impl Engine {
             }
 
             let transfer_relax_started = Instant::now();
-            for improved_index in 0..transit_frontier_len {
-                let stop_index = next_marked[improved_index];
-                let stop_arrival = round_arrivals[round][stop_index];
-                if stop_arrival >= INF_TIME || stop_arrival >= global_best[to_index] {
-                    round_metrics.destination_bound_prunes += 1;
-                    continue;
-                }
-                for transfer in &self.static_data.transfers[stop_index] {
-                    round_metrics.transfer_relaxations += 1;
-                    let candidate = stop_arrival + transfer.duration_secs;
-                    if record_stop_improvement(
-                        transfer.to_stop,
-                        candidate,
-                        &mut global_best,
-                        &mut round_arrivals[round],
-                        &mut parents[round],
-                        ParentStep::Walk {
-                            from_stop: stop_index,
-                            duration_secs: transfer.duration_secs,
-                            distance_meters: transfer.distance_meters,
-                        },
-                        &mut next_marked,
-                        &mut next_marked_flags,
-                    ) {
-                        round_metrics.transfer_improvements += 1;
-                    }
-                }
-            }
+            let transfer_frontier = next_marked[..transit_frontier_len].to_vec();
+            self.relax_transfers_tiled(
+                to_index,
+                &transfer_frontier,
+                &mut global_best,
+                &mut round_arrivals[round],
+                &mut parents[round],
+                &mut next_marked,
+                &mut next_marked_flags,
+                &mut round_metrics,
+            );
             let transfer_relax_ms = transfer_relax_started.elapsed().as_millis();
             round_metrics.timings_us.transfer_relax_us = transfer_relax_started.elapsed().as_micros();
 
@@ -2372,6 +2391,7 @@ impl Engine {
                     rounds,
                     &next_marked[transit_frontier_len..],
                     &trip_is_available,
+                    &trip_has_realtime_update,
                     &line_max_positive_delay_secs,
                     &mut global_best,
                     &mut round_arrivals,
@@ -2617,6 +2637,7 @@ impl Engine {
         start_pos: usize,
         destination_stop: usize,
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         line_max_positive_delay_secs: i32,
         best_before_round: &[i32],
         global_best: &mut [i32],
@@ -2631,88 +2652,322 @@ impl Engine {
         let mut boarded_at = 0usize;
         metrics.stop_positions_scanned += line.stop_indices.len().saturating_sub(start_pos);
 
-        for stop_pos in start_pos..line.stop_indices.len() {
-            let stop_index = line.stop_indices[stop_pos];
-            let destination_bound = global_best[destination_stop];
-
+        let mut stop_pos = start_pos;
+        while stop_pos < line.stop_indices.len() {
             if let Some(trip_index) = current_trip {
-                let onboard_started = Instant::now();
-                metrics.onboard_arrival_evaluations += 1;
-                metrics.skipped_stop_checks += 1;
-                if !self.realtime.is_stop_skipped(trip_index, stop_pos) {
-                    metrics.actual_arrival_calls += 1;
-                    let arrival =
-                        self.realtime
-                            .actual_arrival(&self.static_data.trips, trip_index, stop_pos);
-                    if arrival < destination_bound {
-                        record_stop_improvement(
-                            stop_index,
-                            arrival,
-                            global_best,
-                            round_arrivals,
-                            parents,
-                            ParentStep::Transit {
+                let remaining = line.stop_indices.len() - stop_pos;
+                let trip_has_update = trip_has_realtime_update
+                    .get(trip_index)
+                    .copied()
+                    .unwrap_or(true);
+                if !trip_has_update && remaining >= SVRT_WIDTH {
+                    let departure_chunk =
+                        scheduled_departure_chunk(&self.static_data.trips[trip_index], stop_pos);
+                    if !svrt_chunk_has_catchup_candidate(
+                        &line.stop_indices[stop_pos..stop_pos + SVRT_WIDTH],
+                        best_before_round,
+                        &departure_chunk,
+                    ) {
+                        for chunk_pos in stop_pos..stop_pos + SVRT_WIDTH {
+                            self.evaluate_onboard_arrival(
+                                line,
+                                chunk_pos,
+                                destination_stop,
+                                trip_has_realtime_update,
+                                global_best,
+                                round_arrivals,
+                                parents,
+                                improved_stops,
+                                improved_flags,
                                 trip_index,
-                                board_stop: line.stop_indices[boarded_at],
-                                board_pos: boarded_at,
-                                alight_stop: stop_index,
-                                alight_pos: stop_pos,
-                            },
-                            improved_stops,
-                            improved_flags,
-                        );
-                    } else {
-                        metrics.destination_bound_prunes += 1;
+                                boarded_at,
+                                metrics,
+                            );
+                        }
+                        stop_pos += SVRT_WIDTH;
+                        continue;
                     }
                 }
-                metrics.timings_us.line_scan_onboard_us += onboard_started.elapsed().as_micros();
             }
 
-            let ready_at = best_before_round[stop_index];
-            if ready_at >= INF_TIME || ready_at >= destination_bound {
+            self.scan_line_scalar_step(
+                line,
+                stop_pos,
+                destination_stop,
+                trip_is_available,
+                trip_has_realtime_update,
+                line_max_positive_delay_secs,
+                best_before_round,
+                global_best,
+                round_arrivals,
+                parents,
+                improved_stops,
+                improved_flags,
+                &mut current_trip,
+                &mut boarded_at,
+                metrics,
+            );
+            stop_pos += 1;
+        }
+    }
+
+    fn scan_line_scalar_step(
+        &self,
+        line: &LineRecord,
+        stop_pos: usize,
+        destination_stop: usize,
+        trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
+        line_max_positive_delay_secs: i32,
+        best_before_round: &[i32],
+        global_best: &mut [i32],
+        round_arrivals: &mut [i32],
+        parents: &mut [Option<ParentStep>],
+        improved_stops: &mut Vec<usize>,
+        improved_flags: &mut [bool],
+        current_trip: &mut Option<usize>,
+        boarded_at: &mut usize,
+        metrics: &mut RoundMetrics,
+    ) {
+        let stop_index = line.stop_indices[stop_pos];
+
+        if let Some(trip_index) = *current_trip {
+            self.evaluate_onboard_arrival(
+                line,
+                stop_pos,
+                destination_stop,
+                trip_has_realtime_update,
+                global_best,
+                round_arrivals,
+                parents,
+                improved_stops,
+                improved_flags,
+                trip_index,
+                *boarded_at,
+                metrics,
+            );
+        }
+
+        let destination_bound = global_best[destination_stop];
+        let ready_at = best_before_round[stop_index];
+        if ready_at >= INF_TIME || ready_at >= destination_bound {
+            metrics.destination_bound_prunes += 1;
+            return;
+        }
+
+        let trip_search_started = Instant::now();
+        let candidate_trip = self.find_earliest_trip(
+            line,
+            stop_pos,
+            ready_at,
+            trip_is_available,
+            trip_has_realtime_update,
+            line_max_positive_delay_secs,
+            metrics,
+        );
+        metrics.timings_us.line_scan_trip_search_us += trip_search_started.elapsed().as_micros();
+
+        if let Some(candidate_trip) = candidate_trip {
+            let candidate_compare_started = Instant::now();
+            let candidate_departure = self.scan_departure_for_trip(
+                candidate_trip,
+                stop_pos,
+                trip_has_realtime_update,
+                metrics,
+            );
+
+            let replace_current = match *current_trip {
+                Some(active_trip) => {
+                    let active_departure = self.scan_departure_for_trip(
+                        active_trip,
+                        stop_pos,
+                        trip_has_realtime_update,
+                        metrics,
+                    );
+                    candidate_departure < active_departure
+                }
+                None => true,
+            };
+
+            if replace_current {
+                *current_trip = Some(candidate_trip);
+                *boarded_at = stop_pos;
+            }
+            metrics.timings_us.line_scan_candidate_compare_us +=
+                candidate_compare_started.elapsed().as_micros();
+        }
+    }
+
+    fn evaluate_onboard_arrival(
+        &self,
+        line: &LineRecord,
+        stop_pos: usize,
+        destination_stop: usize,
+        trip_has_realtime_update: &[bool],
+        global_best: &mut [i32],
+        round_arrivals: &mut [i32],
+        parents: &mut [Option<ParentStep>],
+        improved_stops: &mut Vec<usize>,
+        improved_flags: &mut [bool],
+        trip_index: usize,
+        boarded_at: usize,
+        metrics: &mut RoundMetrics,
+    ) {
+        let stop_index = line.stop_indices[stop_pos];
+        let destination_bound = global_best[destination_stop];
+        let onboard_started = Instant::now();
+        metrics.onboard_arrival_evaluations += 1;
+
+        let trip_has_update = trip_has_realtime_update
+            .get(trip_index)
+            .copied()
+            .unwrap_or(true);
+        if trip_has_update {
+            metrics.skipped_stop_checks += 1;
+            if self.realtime.is_stop_skipped(trip_index, stop_pos) {
+                metrics.timings_us.line_scan_onboard_us += onboard_started.elapsed().as_micros();
+                return;
+            }
+            metrics.actual_arrival_calls += 1;
+        }
+
+        let arrival = if trip_has_update {
+            self.realtime
+                .actual_arrival(&self.static_data.trips, trip_index, stop_pos)
+        } else {
+            self.static_data.trips[trip_index].stop_times[stop_pos].arrival_secs
+        };
+
+        if arrival < destination_bound {
+            record_stop_improvement(
+                stop_index,
+                arrival,
+                global_best,
+                round_arrivals,
+                parents,
+                ParentStep::Transit {
+                    trip_index,
+                    board_stop: line.stop_indices[boarded_at],
+                    board_pos: boarded_at,
+                    alight_stop: stop_index,
+                    alight_pos: stop_pos,
+                },
+                improved_stops,
+                improved_flags,
+            );
+        } else {
+            metrics.destination_bound_prunes += 1;
+        }
+
+        metrics.timings_us.line_scan_onboard_us += onboard_started.elapsed().as_micros();
+    }
+
+    fn scan_departure_for_trip(
+        &self,
+        trip_index: usize,
+        stop_pos: usize,
+        trip_has_realtime_update: &[bool],
+        metrics: &mut RoundMetrics,
+    ) -> i32 {
+        if trip_has_realtime_update
+            .get(trip_index)
+            .copied()
+            .unwrap_or(true)
+        {
+            metrics.actual_departure_calls += 1;
+            self.realtime
+                .actual_departure(&self.static_data.trips, trip_index, stop_pos)
+        } else {
+            self.static_data.trips[trip_index].stop_times[stop_pos].departure_secs
+        }
+    }
+
+    fn relax_transfers_tiled(
+        &self,
+        destination_stop: usize,
+        frontier: &[usize],
+        global_best: &mut [i32],
+        round_arrivals: &mut [i32],
+        parents: &mut [Option<ParentStep>],
+        improved_stops: &mut Vec<usize>,
+        improved_flags: &mut [bool],
+        metrics: &mut RoundMetrics,
+    ) {
+        let transfer_index = &self.static_data.transfer_index;
+        if frontier.is_empty() || transfer_index.hubs.is_empty() {
+            return;
+        }
+
+        let destination_bound = global_best[destination_stop];
+        let mut touched_hubs = Vec::<usize>::new();
+        let mut frontier_by_hub = HashMap::<usize, Vec<(usize, usize, i32)>>::new();
+
+        for &source_stop in frontier {
+            if source_stop >= transfer_index.stop_to_hub.len() {
+                continue;
+            }
+
+            let stop_arrival = round_arrivals[source_stop];
+            if stop_arrival >= INF_TIME || stop_arrival >= destination_bound {
                 metrics.destination_bound_prunes += 1;
                 continue;
             }
 
-            let trip_search_started = Instant::now();
-            let candidate_trip = self.find_earliest_trip(
-                line,
-                stop_pos,
-                ready_at,
-                trip_is_available,
-                line_max_positive_delay_secs,
-                metrics,
-            );
-            metrics.timings_us.line_scan_trip_search_us += trip_search_started.elapsed().as_micros();
+            let hub_index = transfer_index.stop_to_hub[source_stop];
+            let source_offset = transfer_index.stop_to_hub_offset[source_stop];
+            if let Some(active_sources) = frontier_by_hub.get_mut(&hub_index) {
+                active_sources.push((source_stop, source_offset, stop_arrival));
+            } else {
+                touched_hubs.push(hub_index);
+                frontier_by_hub.insert(hub_index, vec![(source_stop, source_offset, stop_arrival)]);
+            }
+        }
 
-            if let Some(candidate_trip) = candidate_trip {
-                let candidate_compare_started = Instant::now();
-                metrics.actual_departure_calls += 1;
-                let candidate_departure = self.realtime.actual_departure(
-                    &self.static_data.trips,
-                    candidate_trip,
-                    stop_pos,
-                );
+        for hub_index in touched_hubs {
+            let Some(active_sources) = frontier_by_hub.get(&hub_index) else {
+                continue;
+            };
+            for tile in &transfer_index.hubs[hub_index].outgoing_tiles {
+                let target_count = tile.target_stop_indices.len();
+                for (target_offset, &target_stop) in tile.target_stop_indices.iter().enumerate() {
+                    let mut best_candidate = global_best[target_stop];
+                    let mut best_edge = None::<(usize, usize)>;
 
-                let replace_current = match current_trip {
-                    Some(active_trip) => {
-                        metrics.actual_departure_calls += 1;
-                        let active_departure = self.realtime.actual_departure(
-                            &self.static_data.trips,
-                            active_trip,
-                            stop_pos,
-                        );
-                        candidate_departure < active_departure
+                    for &(source_stop, source_offset, source_arrival) in active_sources {
+                        let cell_index = source_offset * target_count + target_offset;
+                        let transfer_slot = tile.transfer_slots[cell_index];
+                        if transfer_slot == EMPTY_TRANSFER_SLOT {
+                            continue;
+                        }
+
+                        metrics.transfer_relaxations += 1;
+                        let candidate = source_arrival + tile.durations[cell_index];
+                        if candidate < best_candidate {
+                            best_candidate = candidate;
+                            best_edge = Some((source_stop, transfer_slot as usize));
+                        }
                     }
-                    None => true,
-                };
 
-                if replace_current {
-                    current_trip = Some(candidate_trip);
-                    boarded_at = stop_pos;
+                    if let Some((source_stop, transfer_slot)) = best_edge {
+                        let transfer = &self.static_data.transfers[source_stop][transfer_slot];
+                        if record_stop_improvement(
+                            transfer.to_stop,
+                            best_candidate,
+                            global_best,
+                            round_arrivals,
+                            parents,
+                            ParentStep::Walk {
+                                from_stop: source_stop,
+                                duration_secs: transfer.duration_secs,
+                                distance_meters: transfer.distance_meters,
+                            },
+                            improved_stops,
+                            improved_flags,
+                        ) {
+                            metrics.transfer_improvements += 1;
+                        }
+                    }
                 }
-                metrics.timings_us.line_scan_candidate_compare_us +=
-                    candidate_compare_started.elapsed().as_micros();
             }
         }
     }
@@ -2723,6 +2978,7 @@ impl Engine {
         stop_pos: usize,
         ready_at: i32,
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         line_max_positive_delay_secs: i32,
         metrics: &mut RoundMetrics,
     ) -> Option<usize> {
@@ -2755,6 +3011,7 @@ impl Engine {
                 stop_pos,
                 ready_at,
                 trip_is_available,
+                trip_has_realtime_update,
                 metrics,
             );
         };
@@ -2808,14 +3065,22 @@ impl Engine {
             if !trip_is_available[trip_index] {
                 continue;
             }
-            metrics.skipped_stop_checks += 1;
-            if self.realtime.is_stop_skipped(trip_index, stop_pos) {
-                continue;
+            if trip_has_realtime_update
+                .get(trip_index)
+                .copied()
+                .unwrap_or(true)
+            {
+                metrics.skipped_stop_checks += 1;
+                if self.realtime.is_stop_skipped(trip_index, stop_pos) {
+                    continue;
+                }
             }
-            metrics.actual_departure_calls += 1;
-            let departure = self
-                .realtime
-                .actual_departure(&self.static_data.trips, trip_index, stop_pos);
+            let departure = self.scan_departure_for_trip(
+                trip_index,
+                stop_pos,
+                trip_has_realtime_update,
+                metrics,
+            );
             if departure >= ready_at && departure < best_departure {
                 best_departure = departure;
                 best_trip = Some(trip_index);
@@ -2835,6 +3100,7 @@ impl Engine {
         stop_pos: usize,
         ready_at: i32,
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         metrics: &mut RoundMetrics,
     ) -> Option<usize> {
         let mut best_trip = None;
@@ -2845,14 +3111,22 @@ impl Engine {
             if !trip_is_available[*trip_index] {
                 continue;
             }
-            metrics.skipped_stop_checks += 1;
-            if self.realtime.is_stop_skipped(*trip_index, stop_pos) {
-                continue;
+            if trip_has_realtime_update
+                .get(*trip_index)
+                .copied()
+                .unwrap_or(true)
+            {
+                metrics.skipped_stop_checks += 1;
+                if self.realtime.is_stop_skipped(*trip_index, stop_pos) {
+                    continue;
+                }
             }
-            metrics.actual_departure_calls += 1;
-            let departure =
-                self.realtime
-                    .actual_departure(&self.static_data.trips, *trip_index, stop_pos);
+            let departure = self.scan_departure_for_trip(
+                *trip_index,
+                stop_pos,
+                trip_has_realtime_update,
+                metrics,
+            );
             if departure >= ready_at && departure < best_departure {
                 best_departure = departure;
                 best_trip = Some(*trip_index);
@@ -2898,6 +3172,7 @@ impl Engine {
         max_rounds: usize,
         candidate_stops: &[usize],
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         line_max_positive_delay_secs: &[i32],
         global_best: &mut [i32],
         round_arrivals: &mut [Vec<i32>],
@@ -3039,6 +3314,7 @@ impl Engine {
                         spatial_match.boundary_arrival_secs,
                         remaining_after_trunk,
                         trip_is_available,
+                        trip_has_realtime_update,
                         line_max_positive_delay_secs,
                         local_subquery_cache,
                     ) else {
@@ -3084,6 +3360,7 @@ impl Engine {
                         remaining_transit_legs,
                         destination_egress_edges,
                         trip_is_available,
+                        trip_has_realtime_update,
                         line_max_positive_delay_secs,
                         local_subquery_cache,
                     )
@@ -3170,6 +3447,7 @@ impl Engine {
         remaining_transit_legs: usize,
         destination_egress_edges: &[QueryVirtualWalk],
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         line_max_positive_delay_secs: &[i32],
         local_subquery_cache: &mut HashMap<LocalSubqueryKey, Option<LocalSubqueryResult>>,
     ) -> Option<(i32, usize, Vec<CachedLeg>)> {
@@ -3183,6 +3461,7 @@ impl Engine {
                 spatial_match.boundary_arrival_secs,
                 remaining_after_trunk,
                 trip_is_available,
+                trip_has_realtime_update,
                 line_max_positive_delay_secs,
                 local_subquery_cache,
             ) else {
@@ -3228,6 +3507,7 @@ impl Engine {
         departure_secs: i32,
         remaining_transit_legs: usize,
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         line_max_positive_delay_secs: &[i32],
         cache: &mut HashMap<LocalSubqueryKey, Option<LocalSubqueryResult>>,
     ) -> Option<LocalSubqueryResult> {
@@ -3248,6 +3528,7 @@ impl Engine {
             departure_secs,
             remaining_transit_legs,
             trip_is_available,
+            trip_has_realtime_update,
             line_max_positive_delay_secs,
         );
         cache.insert(key, computed.clone());
@@ -3261,6 +3542,7 @@ impl Engine {
         departure_secs: i32,
         remaining_transit_legs: usize,
         trip_is_available: &[bool],
+        trip_has_realtime_update: &[bool],
         line_max_positive_delay_secs: &[i32],
     ) -> Option<LocalSubqueryResult> {
         if from_stop == to_stop {
@@ -3345,6 +3627,7 @@ impl Engine {
                     start_pos,
                     to_stop,
                     trip_is_available,
+                    trip_has_realtime_update,
                     line_max_positive_delay_secs[line_index],
                     &best_before_round,
                     &mut global_best,
@@ -3357,34 +3640,17 @@ impl Engine {
             }
 
             let transit_frontier_len = next_marked.len();
-            for improved_index in 0..transit_frontier_len {
-                let stop_index = next_marked[improved_index];
-                let stop_arrival = round_arrivals[round][stop_index];
-                if stop_arrival >= INF_TIME || stop_arrival >= global_best[to_stop] {
-                    continue;
-                }
-
-                for transfer in &self.static_data.transfers[stop_index] {
-                    let candidate = stop_arrival + transfer.duration_secs;
-                    if record_stop_improvement(
-                        transfer.to_stop,
-                        candidate,
-                        &mut global_best,
-                        &mut round_arrivals[round],
-                        &mut parents[round],
-                        ParentStep::Walk {
-                            from_stop: stop_index,
-                            duration_secs: transfer.duration_secs,
-                            distance_meters: transfer.distance_meters,
-                        },
-                        &mut next_marked,
-                        &mut next_marked_flags,
-                    ) && transfer.to_stop == to_stop
-                    {
-                        destination_round = Some(round);
-                    }
-                }
-            }
+            let transfer_frontier = next_marked[..transit_frontier_len].to_vec();
+            self.relax_transfers_tiled(
+                to_stop,
+                &transfer_frontier,
+                &mut global_best,
+                &mut round_arrivals[round],
+                &mut parents[round],
+                &mut next_marked,
+                &mut next_marked_flags,
+                &mut round_metrics,
+            );
 
             if next_marked_flags[to_stop] {
                 destination_round = Some(round);
@@ -3574,24 +3840,14 @@ impl Engine {
     ) -> Vec<PolylinePoint> {
         if let Some(shape_id) = &trip.shape_id {
             if let Ok(Some(shape)) = self.static_data.cold_store.shape_points(shape_id) {
-                let start_dist = trip.stop_times[board_pos].shape_dist_traveled;
-                let end_dist = trip.stop_times[alight_pos].shape_dist_traveled;
-                if let (Some(start_dist), Some(end_dist)) = (start_dist, end_dist) {
-                    let points: Vec<_> = shape
-                        .iter()
-                        .filter(|point| {
-                            point.dist_traveled.is_some_and(|distance| {
-                                distance >= start_dist && distance <= end_dist
-                            })
-                        })
-                        .map(|point| PolylinePoint {
-                            lat: point.lat,
-                            lon: point.lon,
-                        })
-                        .collect();
-                    if points.len() >= 2 {
-                        return points;
-                    }
+                if let Some(points) = shape_polyline_segment(
+                    &shape,
+                    &self.static_data.stops,
+                    trip,
+                    board_pos,
+                    alight_pos,
+                ) {
+                    return points;
                 }
             }
         }
@@ -4743,47 +4999,6 @@ fn sync_remote_osm_pbf(
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download OSM PBF from {url}"));
 
-    let (bytes, version_metadata) = match response {
-        Ok(response) => {
-            let response_version = merged_remote_static_gtfs_version_metadata(
-                url,
-                remote_static_gtfs_version_from_headers(url, response.headers()),
-                probed_version.as_ref(),
-            );
-            let bytes = response
-                .bytes()
-                .context("failed to read OSM PBF response body")?;
-            (bytes, response_version)
-        }
-        Err(error) => {
-            if cache_path.exists() {
-                warn!(
-                    %error,
-                    url,
-                    cache = %cache_path.display(),
-                    "remote OSM PBF refresh failed, reusing cached file"
-                );
-                return Ok(());
-            }
-            return Err(error);
-        }
-    };
-
-    if let Ok(existing_bytes) = fs::read(cache_path) {
-        if existing_bytes.as_slice() == bytes.as_ref() {
-            if let Err(error) =
-                store_remote_static_gtfs_version_metadata(&version_path, &version_metadata)
-            {
-                warn!(
-                    %error,
-                    metadata = %version_path.display(),
-                    "failed to persist remote OSM PBF version metadata"
-                );
-            }
-            return Ok(());
-        }
-    }
-
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -4798,12 +5013,44 @@ fn sync_remote_osm_pbf(
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     let tmp_path = cache_path.with_extension(format!("download-{unique_suffix}.tmp"));
-    fs::write(&tmp_path, bytes.as_ref()).with_context(|| {
-        format!(
-            "failed to write downloaded OSM PBF to temporary file {}",
-            tmp_path.display()
-        )
-    })?;
+
+    let (downloaded_bytes, version_metadata) = match response {
+        Ok(response) => {
+            let response_version = merged_remote_static_gtfs_version_metadata(
+                url,
+                remote_static_gtfs_version_from_headers(url, response.headers()),
+                probed_version.as_ref(),
+            );
+            match stream_blocking_response_to_file(response, &tmp_path, "OSM PBF") {
+                Ok(downloaded_bytes) => (downloaded_bytes, response_version),
+                Err(error) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    if cache_path.exists() {
+                        warn!(
+                            %error,
+                            url,
+                            cache = %cache_path.display(),
+                            "remote OSM PBF refresh failed during body stream, reusing cached file"
+                        );
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Err(error) => {
+            if cache_path.exists() {
+                warn!(
+                    %error,
+                    url,
+                    cache = %cache_path.display(),
+                    "remote OSM PBF refresh failed, reusing cached file"
+                );
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     if cache_path.exists() {
         fs::remove_file(cache_path).with_context(|| {
             format!(
@@ -4831,12 +5078,78 @@ fn sync_remote_osm_pbf(
         url,
         cache = %cache_path.display(),
         allow_invalid_tls,
+        downloaded_bytes,
         remote_last_modified = version_metadata.last_modified.as_deref().unwrap_or("<missing>"),
         remote_etag = version_metadata.etag.as_deref().unwrap_or("<missing>"),
         "synced remote OSM PBF"
     );
 
     Ok(())
+}
+
+fn stream_blocking_response_to_file(
+    mut response: reqwest::blocking::Response,
+    destination_path: &Path,
+    artifact_name: &str,
+) -> Result<u64> {
+    let file = File::create(destination_path).with_context(|| {
+        format!(
+            "failed to create temporary {} file {}",
+            artifact_name,
+            destination_path.display()
+        )
+    })?;
+    let mut writer = BufWriter::new(file);
+    let total_bytes = response.content_length();
+    let mut downloaded_bytes = 0u64;
+    let mut next_progress_log = 64_u64 * 1024 * 1024;
+    let mut buffer = vec![0u8; 1024 * 1024];
+
+    info!(
+        artifact = artifact_name,
+        destination = %destination_path.display(),
+        total_bytes = total_bytes.unwrap_or(0),
+        "starting streamed remote download"
+    );
+
+    loop {
+        let read = response.read(buffer.as_mut_slice()).with_context(|| {
+            format!("failed to read {artifact_name} response body")
+        })?;
+        if read == 0 {
+            break;
+        }
+
+        writer.write_all(&buffer[..read]).with_context(|| {
+            format!(
+                "failed to write streamed {} chunk into {}",
+                artifact_name,
+                destination_path.display()
+            )
+        })?;
+        downloaded_bytes += read as u64;
+
+        if downloaded_bytes >= next_progress_log {
+            info!(
+                artifact = artifact_name,
+                destination = %destination_path.display(),
+                downloaded_bytes,
+                total_bytes = total_bytes.unwrap_or(0),
+                "streamed remote download progress"
+            );
+            next_progress_log += 64_u64 * 1024 * 1024;
+        }
+    }
+
+    writer.flush().with_context(|| {
+        format!(
+            "failed to flush streamed {} into {}",
+            artifact_name,
+            destination_path.display()
+        )
+    })?;
+
+    Ok(downloaded_bytes)
 }
 
 fn validate_feed_id(feed_id: &str) -> Result<()> {
@@ -5456,6 +5769,21 @@ fn build_static_core(parsed_feeds: &[(FeedConfig, Gtfs)]) -> Result<StaticCore> 
             }
 
             let namespaced_trip_id = namespaced_id(&feed.id, &trip.id);
+            let shape_id = trip
+                .shape_id
+                .as_ref()
+                .map(|shape_id| namespaced_id(&feed.id, shape_id));
+            let shape_stop_point_indices = shape_id.as_ref().and_then(|shape_id| {
+                let shape = shapes.get(shape_id)?;
+                let needs_projection = stop_times
+                    .iter()
+                    .any(|stop_time| stop_time.shape_dist_traveled.is_none())
+                    || shape.iter().any(|point| point.dist_traveled.is_none());
+                if !needs_projection {
+                    return None;
+                }
+                build_shape_stop_point_indices(shape, &stops, &stop_times)
+            });
             let index = trips.len();
             trips.push(TripRecord {
                 global_id: pack_global_id(feed.feed_index, EntityKind::Trip, local_index as u64)?,
@@ -5464,10 +5792,8 @@ fn build_static_core(parsed_feeds: &[(FeedConfig, Gtfs)]) -> Result<StaticCore> 
                 local_id: trip.id.clone(),
                 id: namespaced_trip_id.clone(),
                 route_index,
-                shape_id: trip
-                    .shape_id
-                    .as_ref()
-                    .map(|shape_id| namespaced_id(&feed.id, shape_id)),
+                shape_id,
+                shape_stop_point_indices,
                 headsign: trip.trip_headsign.clone(),
                 stop_times,
             });
@@ -5685,7 +6011,10 @@ fn trip_records_equivalent(
     if !route_records_equivalent(&left_routes[left.route_index], &right_routes[right.route_index]) {
         return false;
     }
-    if left.shape_id != right.shape_id || left.headsign != right.headsign {
+    if left.shape_id != right.shape_id
+        || left.shape_stop_point_indices != right.shape_stop_point_indices
+        || left.headsign != right.headsign
+    {
         return false;
     }
     if left.stop_times.len() != right.stop_times.len() {
@@ -5979,6 +6308,233 @@ fn build_full_walker_matrix(config: &EngineConfig, stops: &[StopRecord]) -> Walk
             ))
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct TransferTileBuildCell {
+    source_offset: usize,
+    target_stop: usize,
+    transfer_slot: u16,
+    duration_secs: i32,
+}
+
+fn build_transfer_relax_index(
+    stops: &[StopRecord],
+    transfers: &[Vec<WalkTransfer>],
+    hub_cell_meters: f64,
+) -> TransferRelaxIndex {
+    if stops.is_empty() {
+        return TransferRelaxIndex {
+            stop_to_hub: Vec::new(),
+            stop_to_hub_offset: Vec::new(),
+            hubs: Vec::new(),
+        };
+    }
+
+    let hub_cell_meters = hub_cell_meters.max(1.0);
+    let mut hub_lookup = HashMap::<(u16, i32, i32, usize), usize>::new();
+    let mut stop_to_hub = vec![0usize; stops.len()];
+    let mut stop_to_hub_offset = vec![0usize; stops.len()];
+    let mut hubs = Vec::<TransferHub>::new();
+
+    for (stop_index, stop) in stops.iter().enumerate() {
+        let hub_key = transfer_hub_key(stop, stop_index, hub_cell_meters);
+        let hub_index = if let Some(hub_index) = hub_lookup.get(&hub_key).copied() {
+            hub_index
+        } else {
+            let hub_index = hubs.len();
+            hubs.push(TransferHub {
+                stop_indices: Vec::new(),
+                outgoing_tiles: Vec::new(),
+            });
+            hub_lookup.insert(hub_key, hub_index);
+            hub_index
+        };
+
+        stop_to_hub[stop_index] = hub_index;
+        stop_to_hub_offset[stop_index] = hubs[hub_index].stop_indices.len();
+        hubs[hub_index].stop_indices.push(stop_index);
+    }
+
+    let mut tile_builds = HashMap::<(usize, usize), Vec<TransferTileBuildCell>>::new();
+    for (source_stop, outgoing) in transfers.iter().enumerate() {
+        if source_stop >= stop_to_hub.len() {
+            continue;
+        }
+
+        let source_hub = stop_to_hub[source_stop];
+        let source_offset = stop_to_hub_offset[source_stop];
+        for (transfer_slot, transfer) in outgoing.iter().enumerate() {
+            let Ok(transfer_slot) = u16::try_from(transfer_slot) else {
+                continue;
+            };
+            let target_hub = stop_to_hub[transfer.to_stop];
+            tile_builds
+                .entry((source_hub, target_hub))
+                .or_default()
+                .push(TransferTileBuildCell {
+                    source_offset,
+                    target_stop: transfer.to_stop,
+                    transfer_slot,
+                    duration_secs: transfer.duration_secs,
+                });
+        }
+    }
+
+    for ((source_hub, target_hub), cells) in tile_builds {
+        let source_count = hubs[source_hub].stop_indices.len();
+        if source_count == 0 {
+            continue;
+        }
+
+        let mut target_stop_indices = cells
+            .iter()
+            .map(|cell| cell.target_stop)
+            .collect::<Vec<_>>();
+        target_stop_indices.sort_unstable_by_key(|stop_index| {
+            (stop_to_hub_offset[*stop_index], *stop_index)
+        });
+        target_stop_indices.dedup();
+        if target_stop_indices.is_empty() {
+            continue;
+        }
+
+        let target_count = target_stop_indices.len();
+        let mut target_offsets = HashMap::<usize, usize>::with_capacity(target_count);
+        for (target_offset, target_stop) in target_stop_indices.iter().copied().enumerate() {
+            target_offsets.insert(target_stop, target_offset);
+        }
+
+        let mut transfer_slots = vec![EMPTY_TRANSFER_SLOT; source_count * target_count];
+        let mut durations = vec![INF_TIME; source_count * target_count];
+        for cell in cells {
+            let Some(target_offset) = target_offsets.get(&cell.target_stop).copied() else {
+                continue;
+            };
+            let matrix_index = cell.source_offset * target_count + target_offset;
+            if cell.duration_secs < durations[matrix_index] {
+                durations[matrix_index] = cell.duration_secs;
+                transfer_slots[matrix_index] = cell.transfer_slot;
+            }
+        }
+
+        hubs[source_hub].outgoing_tiles.push(TransferTile {
+            target_hub,
+            target_stop_indices,
+            transfer_slots,
+            durations,
+        });
+    }
+
+    for hub in &mut hubs {
+        hub.outgoing_tiles.sort_by_key(|tile| {
+            (
+                tile.target_hub,
+                tile.target_stop_indices.first().copied().unwrap_or(usize::MAX),
+            )
+        });
+    }
+
+    TransferRelaxIndex {
+        stop_to_hub,
+        stop_to_hub_offset,
+        hubs,
+    }
+}
+
+fn transfer_hub_key(
+    stop: &StopRecord,
+    stop_index: usize,
+    hub_cell_meters: f64,
+) -> (u16, i32, i32, usize) {
+    match (stop.latitude, stop.longitude) {
+        (Some(lat), Some(lon)) => {
+            let lat_bucket = ((lat * 111_320.0) / hub_cell_meters).floor() as i32;
+            let lon_scale = lat.to_radians().cos().abs().max(0.25);
+            let lon_bucket = ((lon * 111_320.0 * lon_scale) / hub_cell_meters).floor() as i32;
+            (stop.feed_index, lat_bucket, lon_bucket, usize::MAX)
+        }
+        _ => (stop.feed_index, 0, 0, stop_index),
+    }
+}
+
+fn scheduled_departure_chunk(trip: &TripRecord, start_pos: usize) -> [i32; SVRT_WIDTH] {
+    let mut departures = [INF_TIME; SVRT_WIDTH];
+    for (lane, stop_time) in trip.stop_times[start_pos..start_pos + SVRT_WIDTH]
+        .iter()
+        .enumerate()
+    {
+        departures[lane] = stop_time.departure_secs;
+    }
+    departures
+}
+
+fn svrt_chunk_has_catchup_candidate(
+    stop_indices: &[usize],
+    best_before_round: &[i32],
+    departure_secs: &[i32],
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if stop_indices.len() == SVRT_WIDTH
+            && departure_secs.len() == SVRT_WIDTH
+            && std::is_x86_feature_detected!("avx2")
+        {
+            let mut lane_indices = [0i32; SVRT_WIDTH];
+            for (lane, stop_index) in stop_indices.iter().copied().enumerate() {
+                lane_indices[lane] = stop_index as i32;
+            }
+
+            let mut lane_departures = [0i32; SVRT_WIDTH];
+            lane_departures.copy_from_slice(&departure_secs[..SVRT_WIDTH]);
+
+            return unsafe {
+                svrt_chunk_has_catchup_candidate_avx2(
+                    &lane_indices,
+                    best_before_round.as_ptr(),
+                    &lane_departures,
+                )
+            };
+        }
+    }
+
+    svrt_chunk_has_catchup_candidate_scalar(stop_indices, best_before_round, departure_secs)
+}
+
+fn svrt_chunk_has_catchup_candidate_scalar(
+    stop_indices: &[usize],
+    best_before_round: &[i32],
+    departure_secs: &[i32],
+) -> bool {
+    stop_indices
+        .iter()
+        .zip(departure_secs.iter().copied())
+        .any(|(stop_index, departure)| {
+            best_before_round
+                .get(*stop_index)
+                .copied()
+                .unwrap_or(INF_TIME)
+                < departure
+        })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn svrt_chunk_has_catchup_candidate_avx2(
+    lane_indices: &[i32; SVRT_WIDTH],
+    best_before_ptr: *const i32,
+    lane_departures: &[i32; SVRT_WIDTH],
+) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_i32gather_epi32,
+        _mm256_loadu_si256, _mm256_movemask_ps,
+    };
+
+    let indices = unsafe { _mm256_loadu_si256(lane_indices.as_ptr() as *const __m256i) };
+    let ready = unsafe { _mm256_i32gather_epi32(best_before_ptr, indices, 4) };
+    let departures = unsafe { _mm256_loadu_si256(lane_departures.as_ptr() as *const __m256i) };
+    let cmp = _mm256_cmpgt_epi32(departures, ready);
+    _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) != 0
 }
 
 fn rebuild_differential_walker_transfers(
@@ -6518,13 +7074,143 @@ fn straight_polyline(from: &StopRecord, to: &StopRecord) -> Vec<PolylinePoint> {
     }
 }
 
+fn shape_polyline_segment(
+    shape: &[ShapePoint],
+    stops: &[StopRecord],
+    trip: &TripRecord,
+    board_pos: usize,
+    alight_pos: usize,
+) -> Option<Vec<PolylinePoint>> {
+    shape_polyline_by_distance(
+        shape,
+        trip.stop_times.get(board_pos)?.shape_dist_traveled,
+        trip.stop_times.get(alight_pos)?.shape_dist_traveled,
+    )
+    .or_else(|| shape_polyline_by_stop_projection(shape, stops, trip, board_pos, alight_pos))
+}
+
+fn shape_polyline_by_distance(
+    shape: &[ShapePoint],
+    start_dist: Option<f32>,
+    end_dist: Option<f32>,
+) -> Option<Vec<PolylinePoint>> {
+    let (Some(start_dist), Some(end_dist)) = (start_dist, end_dist) else {
+        return None;
+    };
+    if end_dist < start_dist {
+        return None;
+    }
+
+    let points: Vec<_> = shape
+        .iter()
+        .filter(|point| {
+            point.dist_traveled.is_some_and(|distance| distance >= start_dist && distance <= end_dist)
+        })
+        .map(|point| PolylinePoint {
+            lat: point.lat,
+            lon: point.lon,
+        })
+        .collect();
+    (points.len() >= 2).then_some(points)
+}
+
+fn shape_polyline_by_stop_projection(
+    shape: &[ShapePoint],
+    stops: &[StopRecord],
+    trip: &TripRecord,
+    board_pos: usize,
+    alight_pos: usize,
+) -> Option<Vec<PolylinePoint>> {
+    if shape.len() < 2 || board_pos > alight_pos {
+        return None;
+    }
+
+    let projected_indices = trip.shape_stop_point_indices.as_ref()?;
+    let start_index = usize::try_from(*projected_indices.get(board_pos)?).ok()?;
+    let end_index = usize::try_from(*projected_indices.get(alight_pos)?).ok()?;
+    if end_index <= start_index {
+        return None;
+    }
+
+    let mut polyline = Vec::with_capacity(end_index - start_index + 3);
+    push_stop_polyline_point(&mut polyline, stops.get(trip.stop_times.get(board_pos)?.stop_index)?);
+    for point in &shape[start_index..=end_index] {
+        push_polyline_point(&mut polyline, point.lat, point.lon);
+    }
+    push_stop_polyline_point(&mut polyline, stops.get(trip.stop_times.get(alight_pos)?.stop_index)?);
+
+    (polyline.len() >= 2).then_some(polyline)
+}
+
+fn build_shape_stop_point_indices(
+    shape: &[ShapePoint],
+    stops: &[StopRecord],
+    stop_times: &[TripStopRecord],
+) -> Option<Vec<u32>> {
+    if shape.is_empty() {
+        return None;
+    }
+
+    let mut projected = Vec::with_capacity(stop_times.len());
+    let mut search_start = 0usize;
+    for stop_time in stop_times {
+        let stop = stops.get(stop_time.stop_index)?;
+        let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) else {
+            return None;
+        };
+        let index = nearest_shape_point_index(shape, lat, lon, search_start)?;
+        projected.push(u32::try_from(index).ok()?);
+        search_start = index;
+    }
+
+    Some(projected)
+}
+
+fn nearest_shape_point_index(
+    shape: &[ShapePoint],
+    latitude: f64,
+    longitude: f64,
+    start_index: usize,
+) -> Option<usize> {
+    let first_point = shape.get(start_index)?;
+    let mut best_index = start_index;
+    let mut best_distance = haversine_meters(latitude, longitude, first_point.lat, first_point.lon);
+
+    for (offset, point) in shape[start_index + 1..].iter().enumerate() {
+        let index = start_index + offset + 1;
+        let distance = haversine_meters(latitude, longitude, point.lat, point.lon);
+        if distance < best_distance {
+            best_distance = distance;
+            best_index = index;
+        }
+    }
+
+    Some(best_index)
+}
+
+fn push_stop_polyline_point(polyline: &mut Vec<PolylinePoint>, stop: &StopRecord) {
+    if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
+        push_polyline_point(polyline, lat, lon);
+    }
+}
+
+fn push_polyline_point(polyline: &mut Vec<PolylinePoint>, lat: f64, lon: f64) {
+    let should_push = polyline
+        .last()
+        .is_none_or(|point| point.lat.to_bits() != lat.to_bits() || point.lon.to_bits() != lon.to_bits());
+    if should_push {
+        polyline.push(PolylinePoint { lat, lon });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CHRONOS_BUCKET_SECS, LineRecord, RemoteStaticGtfsVersionMetadata, TripRecord,
-        TripStopRecord,
-        build_chronos_bucket_start_indices, finalize_line_temporal_indices,
-        remote_static_gtfs_version_changed,
+        CHRONOS_BUCKET_SECS, LineRecord, RemoteStaticGtfsVersionMetadata, ShapePoint,
+        StopRecord, TripRecord, TripStopRecord, WalkTransfer, build_chronos_bucket_start_indices,
+        build_shape_stop_point_indices, build_transfer_relax_index,
+        finalize_line_temporal_indices, shape_polyline_segment,
+        remote_static_gtfs_version_changed, svrt_chunk_has_catchup_candidate_scalar,
     };
 
     #[test]
@@ -6547,6 +7233,7 @@ mod tests {
                 id: "feed:t1".to_owned(),
                 route_index: 0,
                 shape_id: None,
+                shape_stop_point_indices: None,
                 headsign: None,
                 stop_times: vec![
                     TripStopRecord {
@@ -6573,6 +7260,7 @@ mod tests {
                 id: "feed:t2".to_owned(),
                 route_index: 0,
                 shape_id: None,
+                shape_stop_point_indices: None,
                 headsign: None,
                 stop_times: vec![
                     TripStopRecord {
@@ -6641,5 +7329,328 @@ mod tests {
         };
 
         assert!(remote_static_gtfs_version_changed(Some(&cached), &remote));
+    }
+
+    #[test]
+    fn transfer_relax_index_tiles_edges_by_hub_pair() {
+        let stops = vec![
+            StopRecord {
+                global_id: 1,
+                feed_index: 0,
+                feed_id: "feed".to_owned(),
+                local_id: "a".to_owned(),
+                id: "feed:a".to_owned(),
+                code: None,
+                name: "A".to_owned(),
+                latitude: Some(41.9000),
+                longitude: Some(12.5000),
+                search_blob: String::new(),
+            },
+            StopRecord {
+                global_id: 2,
+                feed_index: 0,
+                feed_id: "feed".to_owned(),
+                local_id: "b".to_owned(),
+                id: "feed:b".to_owned(),
+                code: None,
+                name: "B".to_owned(),
+                latitude: Some(41.9001),
+                longitude: Some(12.5001),
+                search_blob: String::new(),
+            },
+            StopRecord {
+                global_id: 3,
+                feed_index: 0,
+                feed_id: "feed".to_owned(),
+                local_id: "c".to_owned(),
+                id: "feed:c".to_owned(),
+                code: None,
+                name: "C".to_owned(),
+                latitude: Some(41.9020),
+                longitude: Some(12.5020),
+                search_blob: String::new(),
+            },
+            StopRecord {
+                global_id: 4,
+                feed_index: 0,
+                feed_id: "feed".to_owned(),
+                local_id: "d".to_owned(),
+                id: "feed:d".to_owned(),
+                code: None,
+                name: "D".to_owned(),
+                latitude: Some(41.9021),
+                longitude: Some(12.5021),
+                search_blob: String::new(),
+            },
+        ];
+        let transfers = vec![
+            vec![WalkTransfer {
+                to_stop: 2,
+                duration_secs: 90,
+                distance_meters: 120.0,
+                polyline: Vec::new(),
+            }],
+            vec![WalkTransfer {
+                to_stop: 3,
+                duration_secs: 60,
+                distance_meters: 80.0,
+                polyline: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        ];
+
+        let index = build_transfer_relax_index(&stops, &transfers, 180.0);
+
+        assert_eq!(index.hubs.len(), 2);
+        assert_eq!(index.stop_to_hub[0], index.stop_to_hub[1]);
+        assert_eq!(index.stop_to_hub[2], index.stop_to_hub[3]);
+
+        let source_hub = index.stop_to_hub[0];
+        let tile = &index.hubs[source_hub].outgoing_tiles[0];
+        assert_eq!(tile.target_stop_indices, vec![2, 3]);
+        assert_eq!(tile.transfer_slots.len(), 4);
+        assert_eq!(tile.transfer_slots[0], 0);
+        assert_eq!(tile.transfer_slots[3], 0);
+    }
+
+    #[test]
+    fn svrt_scalar_mask_detects_when_catchup_is_possible() {
+        let stop_indices = vec![1usize, 3, 5, 7];
+        let mut best_before_round = vec![i32::MAX; 8];
+        best_before_round[1] = 320;
+        best_before_round[3] = 410;
+        best_before_round[5] = 600;
+        best_before_round[7] = 720;
+
+        assert!(svrt_chunk_has_catchup_candidate_scalar(
+            &stop_indices,
+            &best_before_round,
+            &[300, 420, 590, 700],
+        ));
+        assert!(!svrt_chunk_has_catchup_candidate_scalar(
+            &stop_indices,
+            &best_before_round,
+            &[300, 400, 590, 700],
+        ));
+    }
+
+    #[test]
+    fn shape_polyline_segment_prefers_shape_distances_when_present() {
+        let stops = vec![
+            test_stop(0, "a", 41.0, 12.0),
+            test_stop(1, "b", 41.0, 12.2),
+        ];
+        let trip = TripRecord {
+            global_id: 1,
+            feed_index: 0,
+            feed_id: "feed".to_owned(),
+            local_id: "trip-1".to_owned(),
+            id: "feed:trip-1".to_owned(),
+            route_index: 0,
+            shape_id: Some("feed:shape-1".to_owned()),
+            shape_stop_point_indices: None,
+            headsign: None,
+            stop_times: vec![
+                TripStopRecord {
+                    stop_index: 0,
+                    arrival_secs: 0,
+                    departure_secs: 0,
+                    stop_sequence: 1,
+                    shape_dist_traveled: Some(10.0),
+                },
+                TripStopRecord {
+                    stop_index: 1,
+                    arrival_secs: 60,
+                    departure_secs: 60,
+                    stop_sequence: 2,
+                    shape_dist_traveled: Some(20.0),
+                },
+            ],
+        };
+        let shape = vec![
+            ShapePoint {
+                lat: 40.0,
+                lon: 10.0,
+                dist_traveled: Some(0.0),
+            },
+            ShapePoint {
+                lat: 40.1,
+                lon: 10.1,
+                dist_traveled: Some(10.0),
+            },
+            ShapePoint {
+                lat: 40.2,
+                lon: 10.2,
+                dist_traveled: Some(20.0),
+            },
+            ShapePoint {
+                lat: 40.3,
+                lon: 10.3,
+                dist_traveled: Some(30.0),
+            },
+        ];
+
+        let polyline = shape_polyline_segment(&shape, &stops, &trip, 0, 1).expect("shape polyline");
+
+        assert_eq!(polyline.len(), 2);
+        assert_eq!(polyline[0].lat, 40.1);
+        assert_eq!(polyline[1].lat, 40.2);
+    }
+
+    #[test]
+    fn build_shape_stop_point_indices_projects_stops_in_order() {
+        let stops = vec![
+            test_stop(0, "a", 41.0000, 12.0000),
+            test_stop(1, "b", 41.0000, 12.0101),
+            test_stop(2, "c", 41.0101, 12.0201),
+        ];
+        let stop_times = vec![
+            TripStopRecord {
+                stop_index: 0,
+                arrival_secs: 0,
+                departure_secs: 0,
+                stop_sequence: 1,
+                shape_dist_traveled: None,
+            },
+            TripStopRecord {
+                stop_index: 1,
+                arrival_secs: 60,
+                departure_secs: 60,
+                stop_sequence: 2,
+                shape_dist_traveled: None,
+            },
+            TripStopRecord {
+                stop_index: 2,
+                arrival_secs: 120,
+                departure_secs: 120,
+                stop_sequence: 3,
+                shape_dist_traveled: None,
+            },
+        ];
+        let shape = vec![
+            ShapePoint {
+                lat: 41.0000,
+                lon: 12.0000,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0000,
+                lon: 12.0050,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0000,
+                lon: 12.0100,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0050,
+                lon: 12.0150,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0100,
+                lon: 12.0200,
+                dist_traveled: None,
+            },
+        ];
+
+        let indices = build_shape_stop_point_indices(&shape, &stops, &stop_times).expect("shape indices");
+
+        assert_eq!(indices, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn shape_polyline_segment_projects_stops_when_shape_distances_are_missing() {
+        let stops = vec![
+            test_stop(0, "a", 41.0000, 12.0000),
+            test_stop(1, "b", 41.0000, 12.0101),
+            test_stop(2, "c", 41.0101, 12.0201),
+        ];
+        let trip = TripRecord {
+            global_id: 1,
+            feed_index: 0,
+            feed_id: "feed".to_owned(),
+            local_id: "trip-2".to_owned(),
+            id: "feed:trip-2".to_owned(),
+            route_index: 0,
+            shape_id: Some("feed:shape-2".to_owned()),
+            shape_stop_point_indices: Some(vec![0, 2, 4]),
+            headsign: None,
+            stop_times: vec![
+                TripStopRecord {
+                    stop_index: 0,
+                    arrival_secs: 0,
+                    departure_secs: 0,
+                    stop_sequence: 1,
+                    shape_dist_traveled: None,
+                },
+                TripStopRecord {
+                    stop_index: 1,
+                    arrival_secs: 60,
+                    departure_secs: 60,
+                    stop_sequence: 2,
+                    shape_dist_traveled: None,
+                },
+                TripStopRecord {
+                    stop_index: 2,
+                    arrival_secs: 120,
+                    departure_secs: 120,
+                    stop_sequence: 3,
+                    shape_dist_traveled: None,
+                },
+            ],
+        };
+        let shape = vec![
+            ShapePoint {
+                lat: 41.0000,
+                lon: 12.0000,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0000,
+                lon: 12.0050,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0000,
+                lon: 12.0100,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0050,
+                lon: 12.0150,
+                dist_traveled: None,
+            },
+            ShapePoint {
+                lat: 41.0100,
+                lon: 12.0200,
+                dist_traveled: None,
+            },
+        ];
+
+        let polyline = shape_polyline_segment(&shape, &stops, &trip, 0, 2).expect("shape polyline");
+
+        assert!(polyline.len() >= 5);
+        assert_eq!(polyline.first().unwrap().lat, 41.0000);
+        assert!(polyline.iter().any(|point| point.lon == 12.0050));
+        assert!(polyline.iter().any(|point| point.lon == 12.0150));
+        assert_eq!(polyline.last().unwrap().lat, 41.0101);
+    }
+
+    fn test_stop(global_id: u64, local_id: &str, latitude: f64, longitude: f64) -> StopRecord {
+        StopRecord {
+            global_id,
+            feed_index: 0,
+            feed_id: "feed".to_owned(),
+            local_id: local_id.to_owned(),
+            id: format!("feed:{local_id}"),
+            code: None,
+            name: local_id.to_owned(),
+            latitude: Some(latitude),
+            longitude: Some(longitude),
+            search_blob: String::new(),
+        }
     }
 }
