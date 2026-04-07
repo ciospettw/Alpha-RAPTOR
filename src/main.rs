@@ -6,12 +6,7 @@ mod profile_cache;
 mod realtime;
 mod walker;
 
-use std::{
-    env,
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -81,9 +76,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:7878".to_owned())
         .parse::<SocketAddr>()
         .context("ALPHA_BIND must be a valid socket address")?;
-    let config = EngineConfig::from_env(workspace_root.clone())?;
     let engine_load_started = std::time::Instant::now();
-    let engine = Engine::load(config).context("failed to initialize Alpha-RAPTOR engine")?;
+    let engine = load_engine_from_workspace(workspace_root.clone())
+        .await
+        .context("failed to initialize Alpha-RAPTOR engine")?;
     let engine_load_ms = engine_load_started.elapsed().as_millis();
     let build_snapshot = engine.stats().build;
     info!(
@@ -169,6 +165,15 @@ fn init_tracing() {
         .init();
 }
 
+async fn load_engine_from_workspace(workspace_root: PathBuf) -> Result<Engine> {
+    tokio::task::spawn_blocking(move || {
+        let config = EngineConfig::from_env(workspace_root)?;
+        Engine::load(config)
+    })
+    .await
+    .context("engine bootstrap task panicked")?
+}
+
 fn spawn_realtime_refresh(engine: SharedEngine) {
     tokio::spawn(async move {
         loop {
@@ -195,10 +200,19 @@ fn spawn_static_reload(engine: SharedEngine) {
             }
 
             let current_engine = engine.current();
-            let next_config = match current_engine.config.reload_from_source() {
-                Ok(config) => config,
-                Err(error) => {
+            let current_config = current_engine.config.clone();
+            let next_config = match tokio::task::spawn_blocking(move || {
+                current_config.reload_from_source()
+            })
+            .await
+            {
+                Ok(Ok(config)) => config,
+                Ok(Err(error)) => {
                     warn!(%error, "failed to reload engine configuration for static polling");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(%error, "static polling configuration task panicked");
                     continue;
                 }
             };
@@ -212,8 +226,13 @@ fn spawn_static_reload(engine: SharedEngine) {
                 "detected static GTFS change, rebuilding engine in background"
             );
             let rebuild_started = std::time::Instant::now();
-            match Engine::reload_from_previous(current_engine.as_ref(), next_config) {
-                Ok(next_engine) => {
+            let previous_engine = current_engine.clone();
+            match tokio::task::spawn_blocking(move || {
+                Engine::reload_from_previous(previous_engine.as_ref(), next_config)
+            })
+            .await
+            {
+                Ok(Ok(next_engine)) => {
                     if let Err(error) = next_engine.refresh_realtime().await {
                         warn!(%error, "reloaded engine initialized but realtime prewarm failed");
                     }
@@ -227,8 +246,11 @@ fn spawn_static_reload(engine: SharedEngine) {
                         "static engine swap completed"
                     );
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(%error, "static GTFS change detected but rebuild failed; keeping current engine");
+                }
+                Err(error) => {
+                    warn!(%error, "static GTFS rebuild task panicked; keeping current engine");
                 }
             }
         }

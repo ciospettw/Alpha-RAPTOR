@@ -20,7 +20,10 @@ use osmpbfreader::{
     osmformat::HeaderBlock,
 };
 use protobuf::Message;
-use quick_xml::{Reader, events::{BytesStart, Event}};
+use quick_xml::{
+    Reader,
+    events::{BytesStart, Event},
+};
 use reqwest::blocking::Client as BlockingClient;
 use rstar::{AABB, PointDistance, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
@@ -28,9 +31,7 @@ use tracing::{info, warn};
 
 use crate::{
     engine::{PolylinePoint, StopRecord},
-    geo::{
-        decode_morton_code, decode_morton_components, morton_code, morton_code_from_components,
-    },
+    geo::{decode_morton_code, decode_morton_components, morton_code, morton_code_from_components},
 };
 
 const OSM_HPF_STRATEGY: &str = "osm-pbf-cached-hpf";
@@ -344,7 +345,11 @@ impl HolographicPedestrianForest {
             last_poll_timestamp: runtime.last_poll_timestamp.clone(),
             overlay_cells: runtime.entries.len(),
             blocked_cells: runtime.entries.iter().filter(|entry| entry.blocked).count(),
-            synthetic_cells: runtime.entries.iter().filter(|entry| entry.synthetic).count(),
+            synthetic_cells: runtime
+                .entries
+                .iter()
+                .filter(|entry| entry.synthetic)
+                .count(),
             way_overrides: runtime.way_overrides.len(),
             last_error: runtime.last_error.clone(),
         }
@@ -358,7 +363,8 @@ impl HolographicPedestrianForest {
             let mut runtime = (*self.overlay_runtime.load_full()).clone();
             runtime.enabled = false;
             runtime.last_poll_timestamp = Some(Utc::now().to_rfc3339());
-            runtime.last_error = Some("HPF way-raster index unavailable; diff polling is disabled".to_owned());
+            runtime.last_error =
+                Some("HPF way-raster index unavailable; diff polling is disabled".to_owned());
             self.overlay_runtime.store(Arc::new(runtime));
             return Ok(self.overlay_snapshot());
         };
@@ -393,7 +399,12 @@ impl HolographicPedestrianForest {
             .get(&diff_config.state_url)
             .send()
             .and_then(|response| response.error_for_status())
-            .with_context(|| format!("failed to fetch OSM diff state from {}", diff_config.state_url))?
+            .with_context(|| {
+                format!(
+                    "failed to fetch OSM diff state from {}",
+                    diff_config.state_url
+                )
+            })?
             .text()
             .context("failed to read OSM diff state response body")?;
         let remote_state = parse_remote_state_file(&state_body)?;
@@ -420,11 +431,7 @@ impl HolographicPedestrianForest {
             if next_runtime.applied_sequence.is_none() {
                 next_runtime.applied_sequence = Some(applied_sequence);
                 next_runtime.applied_timestamp = remote_state.timestamp.clone();
-                persist_overlay_runtime(
-                    &self.overlay_path,
-                    &self.base_metadata,
-                    &next_runtime,
-                )?;
+                persist_overlay_runtime(&self.overlay_path, &self.base_metadata, &next_runtime)?;
             }
             self.overlay_runtime.store(Arc::new(next_runtime));
             return Ok(self.overlay_snapshot());
@@ -433,7 +440,10 @@ impl HolographicPedestrianForest {
         let mut draft = overlay_draft_from_runtime(&runtime);
         for sequence in (applied_sequence + 1)..=remote_state.sequence_number {
             let diff_url = sequence_diff_url(
-                runtime.diff_base_url.as_deref().unwrap_or(&configured_base_url),
+                runtime
+                    .diff_base_url
+                    .as_deref()
+                    .unwrap_or(&configured_base_url),
                 sequence,
             );
             let diff_bytes = client
@@ -449,12 +459,8 @@ impl HolographicPedestrianForest {
         }
         draft.applied_timestamp = remote_state.timestamp;
 
-        let mut next_runtime = overlay_runtime_from_draft(
-            &draft,
-            diff_config,
-            Some(poll_timestamp),
-            None,
-        );
+        let mut next_runtime =
+            overlay_runtime_from_draft(&draft, diff_config, Some(poll_timestamp), None);
         next_runtime.enabled = true;
         persist_overlay_runtime(&self.overlay_path, &self.base_metadata, &next_runtime)?;
         self.overlay_runtime.store(Arc::new(next_runtime));
@@ -577,11 +583,7 @@ impl HolographicPedestrianForest {
                     duration_secs: (candidate.distance_meters / self.walk_speed_mps).ceil() as i32,
                     distance_meters: candidate.distance_meters,
                     polyline: self.reconstruct_candidate_polyline(
-                        &candidate,
-                        latitude,
-                        longitude,
-                        stop_lat,
-                        stop_lon,
+                        &candidate, latitude, longitude, stop_lat, stop_lon,
                     ),
                     used_asymptotic_penalty: candidate.used_asymptotic_penalty,
                 })
@@ -664,7 +666,11 @@ impl HolographicPedestrianForest {
         let Some(state) = self.effective_cell_state(overlay, cell) else {
             return;
         };
-        if state.blocked || !state.synthetic || !state.cost_meters.is_finite() || state.root_stop_index == u32::MAX {
+        if state.blocked
+            || !state.synthetic
+            || !state.cost_meters.is_finite()
+            || state.root_stop_index == u32::MAX
+        {
             return;
         }
 
@@ -714,7 +720,9 @@ impl HolographicPedestrianForest {
 
         match candidate.location {
             CandidateLocation::BaseNode(index) => self.reconstruct_base_tail(index, &mut polyline),
-            CandidateLocation::OverlayCell(cell) => self.reconstruct_overlay_tail(cell, &mut polyline),
+            CandidateLocation::OverlayCell(cell) => {
+                self.reconstruct_overlay_tail(cell, &mut polyline)
+            }
         }
 
         push_polyline_point(&mut polyline, stop_lat, stop_lon);
@@ -733,7 +741,6 @@ impl HolographicPedestrianForest {
     }
 
     fn reconstruct_base_tail_raw(&self, start_index: usize, polyline: &mut Vec<PolylinePoint>) {
-
         let mut cursor = start_index;
         loop {
             let node = &self.nodes[cursor];
@@ -768,7 +775,9 @@ impl HolographicPedestrianForest {
             let (lat, lon) = overlay_cell_center(cell);
             push_polyline_point(polyline, lat, lon);
 
-            let next = self.overlay_entry(overlay, cell).and_then(|entry| entry.parent_cell);
+            let next = self
+                .overlay_entry(overlay, cell)
+                .and_then(|entry| entry.parent_cell);
             let Some(next_cell) = next else {
                 break;
             };
@@ -791,7 +800,11 @@ impl HolographicPedestrianForest {
             .cloned()
     }
 
-    fn effective_cell_state(&self, overlay: &HpfOverlayRuntime, cell: u64) -> Option<EffectiveCellState> {
+    fn effective_cell_state(
+        &self,
+        overlay: &HpfOverlayRuntime,
+        cell: u64,
+    ) -> Option<EffectiveCellState> {
         if let Some(entry) = self.overlay_entry(overlay, cell) {
             return Some(EffectiveCellState {
                 cost_meters: f64::from(entry.cost_meters),
@@ -849,7 +862,8 @@ impl HolographicPedestrianForest {
             let should_replace = match &best {
                 Some((_, current)) => {
                     candidate.cost_meters < current.cost_meters
-                        || (candidate.cost_meters - current.cost_meters).abs() < HPF_OVERLAY_EPSILON_METERS
+                        || (candidate.cost_meters - current.cost_meters).abs()
+                            < HPF_OVERLAY_EPSILON_METERS
                             && candidate.root_stop_index < current.root_stop_index
                 }
                 None => true,
@@ -888,7 +902,13 @@ impl HolographicPedestrianForest {
                 Vec::new()
             };
 
-            update_way_override(draft, way_index, change.way_id, walkable, next_cells.clone());
+            update_way_override(
+                draft,
+                way_index,
+                change.way_id,
+                walkable,
+                next_cells.clone(),
+            );
             if walkable && !next_cells.is_empty() {
                 self.cool_new_way(draft, &next_cells);
             }
@@ -903,7 +923,10 @@ impl HolographicPedestrianForest {
                 .entries
                 .get(&cell)
                 .map(|entry| entry.root_stop_index)
-                .or_else(|| self.best_base_node_for_cell(cell).map(|(_, state)| state.root_stop_index))
+                .or_else(|| {
+                    self.best_base_node_for_cell(cell)
+                        .map(|(_, state)| state.root_stop_index)
+                })
                 .unwrap_or(u32::MAX);
             draft.entries.insert(
                 cell,
@@ -956,10 +979,9 @@ impl HolographicPedestrianForest {
             }
             let cost = next_cost + overlay_transition_cost(cell, next_cell);
             let current = self.effective_cell_state_from_draft(draft, cell);
-            if current
-                .as_ref()
-                .is_none_or(|state| state.blocked || cost + HPF_OVERLAY_EPSILON_METERS < state.cost_meters)
-            {
+            if current.as_ref().is_none_or(|state| {
+                state.blocked || cost + HPF_OVERLAY_EPSILON_METERS < state.cost_meters
+            }) {
                 draft.entries.insert(
                     cell,
                     HpfOverlayCell {
@@ -1056,7 +1078,11 @@ impl HolographicPedestrianForest {
         }
     }
 
-    fn best_neighbor_relaxation(&self, draft: &HpfOverlayDraft, cell: u64) -> Option<EffectiveCellState> {
+    fn best_neighbor_relaxation(
+        &self,
+        draft: &HpfOverlayDraft,
+        cell: u64,
+    ) -> Option<EffectiveCellState> {
         let mut best = None::<(u64, EffectiveCellState)>;
         for neighbor in overlay_moore_neighbors(cell) {
             if neighbor == cell {
@@ -1065,7 +1091,8 @@ impl HolographicPedestrianForest {
             let Some(state) = self.effective_cell_state_from_draft(draft, neighbor) else {
                 continue;
             };
-            if state.blocked || !state.cost_meters.is_finite() || state.root_stop_index == u32::MAX {
+            if state.blocked || !state.cost_meters.is_finite() || state.root_stop_index == u32::MAX
+            {
                 continue;
             }
 
@@ -1161,7 +1188,8 @@ impl HolographicPedestrianForest {
             let Some(state) = self.effective_cell_state_from_draft(draft, neighbor) else {
                 continue;
             };
-            if state.blocked || !state.cost_meters.is_finite() || state.root_stop_index == u32::MAX {
+            if state.blocked || !state.cost_meters.is_finite() || state.root_stop_index == u32::MAX
+            {
                 continue;
             }
             let cost = state.cost_meters + overlay_transition_cost(cell, neighbor);
@@ -1262,9 +1290,7 @@ pub fn build_or_load_hpf(
     })
 }
 
-fn load_walkable_osm(
-    osm_pbf_path: &Path,
-) -> Result<(HashMap<NodeId, (f64, f64)>, Vec<Way>)> {
+fn load_walkable_osm(osm_pbf_path: &Path) -> Result<(HashMap<NodeId, (f64, f64)>, Vec<Way>)> {
     let file = File::open(osm_pbf_path)
         .with_context(|| format!("unable to open OSM PBF at {}", osm_pbf_path.display()))?;
     let mut pbf = OsmPbfReader::new(BufReader::new(file));
@@ -1323,7 +1349,10 @@ fn build_hpf_cache_from_data(
             )
         })
         .collect::<Vec<_>>();
-    let anchored_stops = stop_anchors.iter().filter(|anchor| anchor.is_some()).count();
+    let anchored_stops = stop_anchors
+        .iter()
+        .filter(|anchor| anchor.is_some())
+        .count();
     if anchored_stops == 0 {
         bail!("no GTFS stops could be anchored to the pedestrian graph for HPF")
     }
@@ -1335,13 +1364,19 @@ fn build_hpf_cache_from_data(
     let mut nodes = Vec::<(usize, HpfNode)>::new();
     for (graph_index, best_distance) in best_distances.iter().copied().enumerate() {
         let root_stop_index = roots[graph_index];
-        if !best_distance.is_finite() || best_distance > max_distance_meters || root_stop_index == u32::MAX {
+        if !best_distance.is_finite()
+            || best_distance > max_distance_meters
+            || root_stop_index == u32::MAX
+        {
             continue;
         }
         nodes.push((
             graph_index,
             HpfNode {
-                morton: morton_code(graph_coordinates[graph_index].0, graph_coordinates[graph_index].1),
+                morton: morton_code(
+                    graph_coordinates[graph_index].0,
+                    graph_coordinates[graph_index].1,
+                ),
                 parent_index: u32::MAX,
                 root_stop_index,
                 cost_meters: best_distance as f32,
@@ -1576,8 +1611,9 @@ fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<Option<H
 
 fn store_cache(cache_path: &Path, cache: &HpfCache) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("unable to create HPF cache directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("unable to create HPF cache directory {}", parent.display())
+        })?;
     }
     let file = File::create(cache_path)
         .with_context(|| format!("unable to create HPF cache {}", cache_path.display()))?;
@@ -1712,8 +1748,12 @@ fn load_overlay_persisted(
     let file = File::open(overlay_path)
         .with_context(|| format!("unable to open HPF overlay {}", overlay_path.display()))?;
     let reader = BufReader::new(file);
-    let persisted: HpfOverlayPersisted = bincode::deserialize_from(reader)
-        .with_context(|| format!("unable to deserialize HPF overlay {}", overlay_path.display()))?;
+    let persisted: HpfOverlayPersisted = bincode::deserialize_from(reader).with_context(|| {
+        format!(
+            "unable to deserialize HPF overlay {}",
+            overlay_path.display()
+        )
+    })?;
     if &persisted.magic != HPF_OVERLAY_MAGIC {
         return Ok(None);
     }
@@ -1729,8 +1769,12 @@ fn persist_overlay_runtime(
     runtime: &HpfOverlayRuntime,
 ) -> Result<()> {
     if let Some(parent) = overlay_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("unable to create HPF overlay directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "unable to create HPF overlay directory {}",
+                parent.display()
+            )
+        })?;
     }
 
     let persisted = HpfOverlayPersisted {
@@ -1745,8 +1789,12 @@ fn persist_overlay_runtime(
     };
 
     let tmp_path = overlay_path.with_extension("overlay.tmp");
-    let file = File::create(&tmp_path)
-        .with_context(|| format!("unable to create HPF overlay temp file {}", tmp_path.display()))?;
+    let file = File::create(&tmp_path).with_context(|| {
+        format!(
+            "unable to create HPF overlay temp file {}",
+            tmp_path.display()
+        )
+    })?;
     bincode::serialize_into(BufWriter::new(file), &persisted)
         .context("failed to serialize HPF overlay state")?;
     if overlay_path.exists() {
@@ -1820,7 +1868,12 @@ fn overlay_draft_from_runtime(runtime: &HpfOverlayRuntime) -> HpfOverlayDraft {
     HpfOverlayDraft {
         applied_sequence: runtime.applied_sequence,
         applied_timestamp: runtime.applied_timestamp.clone(),
-        entries: runtime.entries.iter().cloned().map(|entry| (entry.cell, entry)).collect(),
+        entries: runtime
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.cell, entry))
+            .collect(),
         way_overrides: runtime
             .way_overrides
             .iter()
@@ -1947,9 +2000,10 @@ fn parse_osc_diff(bytes: &[u8]) -> Result<OscDiff> {
                 }
                 b"tag" => {
                     if let Some(way) = current_way.as_mut() {
-                        if let (Some(key), Some(value)) =
-                            (parse_attr_string(&event, b"k"), parse_attr_string(&event, b"v"))
-                        {
+                        if let (Some(key), Some(value)) = (
+                            parse_attr_string(&event, b"k"),
+                            parse_attr_string(&event, b"v"),
+                        ) {
                             way.tags.insert(key, value);
                         }
                     }
@@ -1992,7 +2046,8 @@ fn parse_osc_node(event: &BytesStart<'_>) -> Result<Option<(i64, f64, f64)>> {
     let Some(id) = parse_attr_i64(event, b"id") else {
         return Ok(None);
     };
-    let (Some(lat), Some(lon)) = (parse_attr_f64(event, b"lat"), parse_attr_f64(event, b"lon")) else {
+    let (Some(lat), Some(lon)) = (parse_attr_f64(event, b"lat"), parse_attr_f64(event, b"lon"))
+    else {
         return Ok(None);
     };
     Ok(Some((id, lat, lon)))
@@ -2066,8 +2121,12 @@ fn store_way_index(
     entries: &[(i64, Vec<u64>)],
 ) -> Result<()> {
     if let Some(parent) = way_index_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("unable to create HPF way index directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "unable to create HPF way index directory {}",
+                parent.display()
+            )
+        })?;
     }
 
     let tmp_path = way_index_path.with_extension("ways.tmp");
@@ -2077,7 +2136,12 @@ fn store_way_index(
     );
     writer.write_all(HPF_WAY_INDEX_MAGIC)?;
     writer.write_all(&metadata.osm_pbf_bytes.to_le_bytes())?;
-    writer.write_all(&metadata.osm_pbf_modified_unix_secs.unwrap_or(u64::MAX).to_le_bytes())?;
+    writer.write_all(
+        &metadata
+            .osm_pbf_modified_unix_secs
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    )?;
     writer.write_all(&metadata.stop_fingerprint.to_le_bytes())?;
     writer.write_all(&metadata.max_distance_bits.to_le_bytes())?;
     writer.write_all(&(entries.len() as u64).to_le_bytes())?;
@@ -2098,11 +2162,19 @@ fn store_way_index(
     writer.flush()?;
 
     if way_index_path.exists() {
-        fs::remove_file(way_index_path)
-            .with_context(|| format!("unable to replace HPF way index {}", way_index_path.display()))?;
+        fs::remove_file(way_index_path).with_context(|| {
+            format!(
+                "unable to replace HPF way index {}",
+                way_index_path.display()
+            )
+        })?;
     }
-    fs::rename(&tmp_path, way_index_path)
-        .with_context(|| format!("unable to move HPF way index into {}", way_index_path.display()))
+    fs::rename(&tmp_path, way_index_path).with_context(|| {
+        format!(
+            "unable to move HPF way index into {}",
+            way_index_path.display()
+        )
+    })
 }
 
 fn load_way_index(
@@ -2158,8 +2230,10 @@ impl HpfWayIndex {
                 Ordering::Less => left = mid + 1,
                 Ordering::Greater => right = mid,
                 Ordering::Equal => {
-                    let cell_offset = read_u64_le(&self.mmap[record_offset + 8..record_offset + 16]) as usize;
-                    let len = read_u32_le(&self.mmap[record_offset + 16..record_offset + 20]) as usize;
+                    let cell_offset =
+                        read_u64_le(&self.mmap[record_offset + 8..record_offset + 16]) as usize;
+                    let len =
+                        read_u32_le(&self.mmap[record_offset + 16..record_offset + 20]) as usize;
                     let start = self.cells_offset + (cell_offset * 8);
                     let end = start + (len * 8);
                     if end > self.mmap.len() {
@@ -2194,8 +2268,8 @@ fn read_pbf_replication_anchor(osm_pbf_path: &Path) -> Result<HpfPbfReplicationA
 
     let mut blob_bytes = vec![0; header.datasize() as usize];
     reader.read_exact(&mut blob_bytes)?;
-    let blob = Blob::parse_from_bytes(&blob_bytes)
-        .context("failed to parse OSM PBF header blob")?;
+    let blob =
+        Blob::parse_from_bytes(&blob_bytes).context("failed to parse OSM PBF header blob")?;
     let raw = if blob.has_raw() {
         blob.raw().to_vec()
     } else if blob.has_zlib_data() {
@@ -2206,8 +2280,8 @@ fn read_pbf_replication_anchor(osm_pbf_path: &Path) -> Result<HpfPbfReplicationA
     } else {
         bail!("unsupported OSM PBF header compression")
     };
-    let header_block = HeaderBlock::parse_from_bytes(&raw)
-        .context("failed to parse OSM PBF header block")?;
+    let header_block =
+        HeaderBlock::parse_from_bytes(&raw).context("failed to parse OSM PBF header block")?;
 
     let timestamp = if header_block.has_osmosis_replication_timestamp() {
         chrono::DateTime::<Utc>::from_timestamp(header_block.osmosis_replication_timestamp(), 0)
@@ -2233,11 +2307,7 @@ fn read_pbf_replication_anchor(osm_pbf_path: &Path) -> Result<HpfPbfReplicationA
     })
 }
 
-fn current_way_cells(
-    draft: &HpfOverlayDraft,
-    way_index: &HpfWayIndex,
-    way_id: i64,
-) -> Vec<u64> {
+fn current_way_cells(draft: &HpfOverlayDraft, way_index: &HpfWayIndex, way_id: i64) -> Vec<u64> {
     match draft.way_overrides.get(&way_id) {
         Some(override_state) if override_state.walkable => override_state.cells.clone(),
         Some(_) => Vec::new(),
@@ -2280,10 +2350,7 @@ fn rasterize_change_cells(change: &OscWayChange, current_cells: &[u64]) -> Resul
     }
 }
 
-fn rasterize_way_cells(
-    node_coordinates: &HashMap<NodeId, (f64, f64)>,
-    way: &Way,
-) -> Vec<u64> {
+fn rasterize_way_cells(node_coordinates: &HashMap<NodeId, (f64, f64)>, way: &Way) -> Vec<u64> {
     let mut coordinates = Vec::new();
     for node_id in &way.nodes {
         if let Some(&coordinate) = node_coordinates.get(node_id) {
@@ -2340,9 +2407,10 @@ fn overlay_moore_neighbors(cell: u64) -> Vec<u64> {
             {
                 continue;
             }
-            neighbors.push(
-                overlay_cell_from_morton(morton_code_from_components(next_lat as u32, next_lon as u32)),
-            );
+            neighbors.push(overlay_cell_from_morton(morton_code_from_components(
+                next_lat as u32,
+                next_lon as u32,
+            )));
         }
     }
     neighbors
@@ -2373,7 +2441,8 @@ fn prune_overlay_entry(
     }
     if entry.root_stop_index == base_state.root_stop_index
         && entry.parent_cell == base_state.parent_cell
-        && (f64::from(entry.cost_meters) - base_state.cost_meters).abs() <= HPF_OVERLAY_EPSILON_METERS
+        && (f64::from(entry.cost_meters) - base_state.cost_meters).abs()
+            <= HPF_OVERLAY_EPSILON_METERS
     {
         draft.entries.remove(&cell);
     }
@@ -2421,8 +2490,7 @@ fn is_walkable_tags(tags: &HashMap<String, String>) -> bool {
                 | "bus_guideway"
         );
     }
-    tags.get("railway")
-        .is_some_and(|value| value == "platform")
+    tags.get("railway").is_some_and(|value| value == "platform")
         || tags
             .get("public_transport")
             .is_some_and(|value| value == "platform")
@@ -2558,19 +2626,19 @@ mod tests {
     #[test]
     fn query_connectors_prefers_lowest_total_cost_per_stop() {
         let forest = test_forest(vec![
-                HpfNode {
-                    morton: morton_code(41.9000, 12.5000),
-                    parent_index: u32::MAX,
-                    root_stop_index: 0,
-                    cost_meters: 100.0,
-                },
-                HpfNode {
-                    morton: morton_code(41.9002, 12.5002),
-                    parent_index: u32::MAX,
-                    root_stop_index: 1,
-                    cost_meters: 80.0,
-                },
-            ]);
+            HpfNode {
+                morton: morton_code(41.9000, 12.5000),
+                parent_index: u32::MAX,
+                root_stop_index: 0,
+                cost_meters: 100.0,
+            },
+            HpfNode {
+                morton: morton_code(41.9002, 12.5002),
+                parent_index: u32::MAX,
+                root_stop_index: 1,
+                cost_meters: 80.0,
+            },
+        ]);
         let stops = vec![
             StopRecord {
                 global_id: 1,
@@ -2607,19 +2675,19 @@ mod tests {
     #[test]
     fn query_connectors_prefers_network_coverage_over_long_asymptotic_snap() {
         let forest = test_forest(vec![
-                HpfNode {
-                    morton: morton_code(41.9000, 12.5000),
-                    parent_index: u32::MAX,
-                    root_stop_index: 0,
-                    cost_meters: 17.79,
-                },
-                HpfNode {
-                    morton: morton_code(41.9000, 12.5038),
-                    parent_index: u32::MAX,
-                    root_stop_index: 0,
-                    cost_meters: 527.93,
-                },
-            ]);
+            HpfNode {
+                morton: morton_code(41.9000, 12.5000),
+                parent_index: u32::MAX,
+                root_stop_index: 0,
+                cost_meters: 17.79,
+            },
+            HpfNode {
+                morton: morton_code(41.9000, 12.5038),
+                parent_index: u32::MAX,
+                root_stop_index: 0,
+                cost_meters: 527.93,
+            },
+        ]);
         let stops = vec![StopRecord {
             global_id: 1,
             feed_index: 0,

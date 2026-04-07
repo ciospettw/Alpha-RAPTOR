@@ -786,7 +786,10 @@ fn load_cache(cache_path: &Path, metadata: &WalkerCacheMetadata) -> Result<Optio
 fn store_cache(cache_path: &Path, cache: &WalkerCache) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!("unable to create walker cache directory {}", parent.display())
+            format!(
+                "unable to create walker cache directory {}",
+                parent.display()
+            )
         })?;
     }
     let file = File::create(cache_path)

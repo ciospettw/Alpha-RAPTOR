@@ -622,7 +622,11 @@ impl ProfileCache {
     pub fn snapshot(&self) -> ProfileCacheStats {
         let _guard = self.gate.read().expect("profile cache gate poisoned");
         let exact_keys = self.exact_entries.len();
-        let exact_points = self.exact_entries.iter().map(|entry| entry.value().len()).sum();
+        let exact_points = self
+            .exact_entries
+            .iter()
+            .map(|entry| entry.value().len())
+            .sum();
         let spatial_keys = self.spatial_entries.len();
         let spatial_points = self
             .spatial_entries
@@ -1026,13 +1030,8 @@ mod tests {
             }],
         );
 
-        let matches = cache.lookup_spatial_cells(
-            service_date,
-            &[9000, 9001, 9002],
-            7,
-            7 * 3600 + 30 * 60,
-            1,
-        );
+        let matches =
+            cache.lookup_spatial_cells(service_date, &[9000, 9001, 9002], 7, 7 * 3600 + 30 * 60, 1);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].boundary_stop, 42);
     }

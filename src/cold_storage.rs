@@ -271,10 +271,8 @@ impl ColdStore {
             Err(_) => return Ok(false),
         };
 
-        Ok(
-            header.schema_version == COLD_STORE_SCHEMA_VERSION
-                && header.generation_token == generation_token,
-        )
+        Ok(header.schema_version == COLD_STORE_SCHEMA_VERSION
+            && header.generation_token == generation_token)
     }
 
     fn open(paths: &ColdStorePaths) -> Result<Self> {
@@ -285,9 +283,11 @@ impl ColdStore {
             )
         })?;
         let data = unsafe { MmapOptions::new().map(&data_file) }.with_context(|| {
-            format!("unable to mmap Hydra-Slab data {}", paths.data_path.display())
-        })
-        ?;
+            format!(
+                "unable to mmap Hydra-Slab data {}",
+                paths.data_path.display()
+            )
+        })?;
 
         let index_file = File::open(&paths.index_path).with_context(|| {
             format!(
@@ -296,7 +296,10 @@ impl ColdStore {
             )
         })?;
         let index = unsafe { MmapOptions::new().map(&index_file) }.with_context(|| {
-            format!("unable to mmap Hydra-Slab index {}", paths.index_path.display())
+            format!(
+                "unable to mmap Hydra-Slab index {}",
+                paths.index_path.display()
+            )
         })?;
 
         if index.len() < INDEX_HEADER_BYTES {
@@ -316,10 +319,9 @@ impl ColdStore {
             index.len(),
             "shape directory",
         )?;
-        let shape_entries: Vec<ShapeDirectoryEntry> = bincode::deserialize(
-            &index[shape_directory_range],
-        )
-        .context("failed to deserialize Hydra-Slab shape directory")?;
+        let shape_entries: Vec<ShapeDirectoryEntry> =
+            bincode::deserialize(&index[shape_directory_range])
+                .context("failed to deserialize Hydra-Slab shape directory")?;
         let shape_directory = shape_entries
             .into_iter()
             .map(|entry| (entry.shape_id, entry.blob))
@@ -346,9 +348,7 @@ impl ColdStore {
     {
         let slot = u64::try_from(slot).context("slot index exceeds u64 range")?;
         if slot >= section_len {
-            bail!(
-                "Hydra-Slab {kind} slot {slot} exceeds section length {section_len}"
-            );
+            bail!("Hydra-Slab {kind} slot {slot} exceeds section length {section_len}");
         }
 
         let relative = slot
@@ -371,12 +371,8 @@ impl ColdStore {
     where
         T: for<'de> Deserialize<'de>,
     {
-        let payload_range = byte_range(
-            blob.offset,
-            u64::from(blob.len),
-            self.data.len(),
-            "payload",
-        )?;
+        let payload_range =
+            byte_range(blob.offset, u64::from(blob.len), self.data.len(), "payload")?;
         bincode::deserialize(&self.data[payload_range])
             .context("failed to deserialize Hydra-Slab payload")
     }
@@ -406,10 +402,7 @@ fn build_store(
 ) -> Result<()> {
     if let Some(parent) = paths.data_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "unable to create Hydra-Slab directory {}",
-                parent.display()
-            )
+            format!("unable to create Hydra-Slab directory {}", parent.display())
         })?;
     }
 
@@ -499,8 +492,8 @@ fn build_store(
     }
 
     let shape_directory_offset = index_bytes.len() as u64;
-    let shape_directory_bytes =
-        bincode::serialize(&shape_directory).context("failed to serialize Hydra-Slab shape directory")?;
+    let shape_directory_bytes = bincode::serialize(&shape_directory)
+        .context("failed to serialize Hydra-Slab shape directory")?;
     index_bytes.extend_from_slice(&shape_directory_bytes);
 
     let header = HydraIndexHeader {
@@ -528,11 +521,7 @@ fn build_store(
     Ok(())
 }
 
-fn write_blob<T>(
-    writer: &mut BufWriter<File>,
-    value: &T,
-    offset: &mut u64,
-) -> Result<BlobIndex>
+fn write_blob<T>(writer: &mut BufWriter<File>, value: &T, offset: &mut u64) -> Result<BlobIndex>
 where
     T: Serialize,
 {
@@ -683,7 +672,12 @@ impl BlobIndex {
     }
 }
 
-fn byte_range(offset: u64, len: u64, total_len: usize, label: &str) -> Result<std::ops::Range<usize>> {
+fn byte_range(
+    offset: u64,
+    len: u64,
+    total_len: usize,
+    label: &str,
+) -> Result<std::ops::Range<usize>> {
     let start = usize::try_from(offset).context("Hydra-Slab offset exceeds usize")?;
     let len = usize::try_from(len).context("Hydra-Slab length exceeds usize")?;
     let end = start
@@ -723,7 +717,10 @@ fn read_u64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        process,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use crate::engine::{RouteRecord, ShapePoint, StopRecord, TripRecord, TripStopRecord};
 

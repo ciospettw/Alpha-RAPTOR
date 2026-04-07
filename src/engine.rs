@@ -26,7 +26,9 @@ use crate::geo::{
     destination_cell_neighborhood as geo_destination_cell_neighborhood,
     destination_cell_window as geo_destination_cell_window,
 };
-use crate::hpf::{HolographicPedestrianForest, HpfDiffConfig, HpfOverlaySnapshot, build_or_load_hpf};
+use crate::hpf::{
+    HolographicPedestrianForest, HpfDiffConfig, HpfOverlaySnapshot, build_or_load_hpf,
+};
 use crate::profile_cache::{
     CachedLeg, PreparedSpatialLookup, ProfileCache, ProfileCacheStats, ProfileInsertionPoint,
     ProfileLookupDecision, SpatialProfileInsertionPoint,
@@ -1107,7 +1109,12 @@ impl EngineConfig {
         let static_gtfs_value = env::var("ALPHA_STATIC_GTFS").ok();
         let static_gtfs_allow_invalid_tls = env::var("ALPHA_STATIC_GTFS_ALLOW_INVALID_TLS")
             .ok()
-            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
         let prepared_static_gtfs = prepare_static_gtfs_source_legacy(
             &workspace_root,
@@ -1264,12 +1271,7 @@ impl EngineConfig {
             .iter()
             .map(|feed| {
                 if let Some(url) = &feed.static_gtfs_remote_url {
-                    format!(
-                        "{}={} -> {}",
-                        feed.id,
-                        url,
-                        feed.static_gtfs_path.display()
-                    )
+                    format!("{}={} -> {}", feed.id, url, feed.static_gtfs_path.display())
                 } else {
                     format!("{}={}", feed.id, feed.static_gtfs_path.display())
                 }
@@ -1368,8 +1370,8 @@ impl Engine {
         };
         let walker_millis = walker_started.elapsed().as_millis();
         let transfers = walker_build.transfers;
-        let transfer_hub_cell_meters =
-            (config.walk_radius_meters / 3.0).clamp(BTT_MIN_HUB_CELL_METERS, BTT_MAX_HUB_CELL_METERS);
+        let transfer_hub_cell_meters = (config.walk_radius_meters / 3.0)
+            .clamp(BTT_MIN_HUB_CELL_METERS, BTT_MAX_HUB_CELL_METERS);
         let transfer_index =
             build_transfer_relax_index(&stops, &transfers, transfer_hub_cell_meters);
         let total_transfers = transfers.iter().map(Vec::len).sum();
@@ -1442,8 +1444,14 @@ impl Engine {
             osm_pbf_source: config.osm_pbf_source.clone(),
             osm_pbf_remote_url: config.osm_pbf_remote_url.clone(),
             osm_pbf_allow_invalid_tls: config.osm_pbf_allow_invalid_tls,
-            osm_diff_state_url: config.osm_diff.as_ref().map(|value| value.state_url.clone()),
-            osm_diff_poll_interval_secs: config.osm_diff.as_ref().map(|value| value.poll_interval_secs),
+            osm_diff_state_url: config
+                .osm_diff
+                .as_ref()
+                .map(|value| value.state_url.clone()),
+            osm_diff_poll_interval_secs: config
+                .osm_diff
+                .as_ref()
+                .map(|value| value.poll_interval_secs),
             static_gtfs_bytes: config
                 .feeds
                 .iter()
@@ -1513,7 +1521,10 @@ impl Engine {
     }
 
     pub async fn refresh_realtime(&self) -> Result<RealtimeDebugSnapshot> {
-        let refresh = self.realtime.refresh(&self.static_data, &self.config).await?;
+        let refresh = self
+            .realtime
+            .refresh(&self.static_data, &self.config)
+            .await?;
         let invalidation = self
             .profile_cache
             .invalidate_trips(&refresh.changed_trip_indices);
@@ -1602,7 +1613,10 @@ impl Engine {
             .collect()
     }
 
-    async fn resolve_query_plan(&self, request: &QueryRequest) -> Result<(QueryPlan, QueryPlanMetrics)> {
+    async fn resolve_query_plan(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<(QueryPlan, QueryPlanMetrics)> {
         let from_input = self.resolve_query_input(
             "origin",
             request.from.as_deref(),
@@ -1624,7 +1638,10 @@ impl Engine {
         let mut metrics = QueryPlanMetrics::default();
 
         let (from_index, display_from, source_access_edges) = match from_input {
-            QueryEndpointInput::Stop { stop_index, display } => (stop_index, display, Vec::new()),
+            QueryEndpointInput::Stop {
+                stop_index,
+                display,
+            } => (stop_index, display, Vec::new()),
             QueryEndpointInput::Coordinate(point) => {
                 metrics.source_virtualized = true;
                 let virtual_index = next_virtual_index;
@@ -1644,54 +1661,61 @@ impl Engine {
             }
         };
 
-        let (to_index, display_to, exact_destination_stop, destination_cells, destination_cell_for_insert, destination_egress_edges) =
-            match to_input {
-                QueryEndpointInput::Stop { stop_index, display } => (
-                    stop_index,
-                    display,
-                    Some(stop_index),
-                    self.stop_destination_neighborhood(stop_index),
-                    self.stop_destination_cell(stop_index),
-                    Vec::new(),
-                ),
-                QueryEndpointInput::Coordinate(point) => {
-                    metrics.destination_virtualized = true;
-                    let virtual_index = next_virtual_index;
-                    let display = virtual_stop_result(
-                        "Destinazione GPS",
-                        point.latitude,
-                        point.longitude,
-                    );
-                    overlay.virtual_stops.insert(virtual_index, display.clone());
-                    let edges = self
-                        .resolve_virtual_walks(point.clone(), virtual_index, false, &mut metrics)
-                        .await?;
-                    for edge in &edges {
-                        overlay
-                            .virtual_walks
-                            .insert((edge.from_stop, edge.to_stop), edge.clone());
-                    }
-                    metrics.destination_seed_count = edges.len();
-                    (
-                        virtual_index,
-                        display,
-                        None,
-                        geo_destination_cell_neighborhood(Some(point.latitude), Some(point.longitude)),
-                        geo_destination_cell(Some(point.latitude), Some(point.longitude)),
-                        edges,
-                    )
+        let (
+            to_index,
+            display_to,
+            exact_destination_stop,
+            destination_cells,
+            destination_cell_for_insert,
+            destination_egress_edges,
+        ) = match to_input {
+            QueryEndpointInput::Stop {
+                stop_index,
+                display,
+            } => (
+                stop_index,
+                display,
+                Some(stop_index),
+                self.stop_destination_neighborhood(stop_index),
+                self.stop_destination_cell(stop_index),
+                Vec::new(),
+            ),
+            QueryEndpointInput::Coordinate(point) => {
+                metrics.destination_virtualized = true;
+                let virtual_index = next_virtual_index;
+                let display =
+                    virtual_stop_result("Destinazione GPS", point.latitude, point.longitude);
+                overlay.virtual_stops.insert(virtual_index, display.clone());
+                let edges = self
+                    .resolve_virtual_walks(point.clone(), virtual_index, false, &mut metrics)
+                    .await?;
+                for edge in &edges {
+                    overlay
+                        .virtual_walks
+                        .insert((edge.from_stop, edge.to_stop), edge.clone());
                 }
-            };
-
-        metrics.connector_strategy = if metrics.source_virtualized || metrics.destination_virtualized {
-            if self.hpf.is_some() {
-                "hpf-local-forest".to_owned()
-            } else {
-                "stop-knn-haversine-fallback".to_owned()
+                metrics.destination_seed_count = edges.len();
+                (
+                    virtual_index,
+                    display,
+                    None,
+                    geo_destination_cell_neighborhood(Some(point.latitude), Some(point.longitude)),
+                    geo_destination_cell(Some(point.latitude), Some(point.longitude)),
+                    edges,
+                )
             }
-        } else {
-            "discrete-stop-query".to_owned()
         };
+
+        metrics.connector_strategy =
+            if metrics.source_virtualized || metrics.destination_virtualized {
+                if self.hpf.is_some() {
+                    "hpf-local-forest".to_owned()
+                } else {
+                    "stop-knn-haversine-fallback".to_owned()
+                }
+            } else {
+                "discrete-stop-query".to_owned()
+            };
 
         Ok((
             QueryPlan {
@@ -1740,13 +1764,13 @@ impl Engine {
             }));
         }
 
-        let stop_index = self.resolve_stop_query(stop_id, stop_gid).with_context(|| {
-            match (stop_id, stop_gid) {
+        let stop_index = self
+            .resolve_stop_query(stop_id, stop_gid)
+            .with_context(|| match (stop_id, stop_gid) {
                 (Some(stop_id), _) => format!("unknown {label} stop {stop_id}"),
                 (_, Some(stop_gid)) => format!("unknown {label} stop gid:{stop_gid}"),
                 _ => format!("missing {label} stop"),
-            }
-        })?;
+            })?;
         Ok(QueryEndpointInput::Stop {
             stop_index,
             display: self.stop_result(stop_index),
@@ -1860,7 +1884,9 @@ impl Engine {
         let mut walks = projected
             .iter()
             .cloned()
-            .map(|candidate| self.virtual_walk_fallback(point.clone(), virtual_index, candidate, is_source))
+            .map(|candidate| {
+                self.virtual_walk_fallback(point.clone(), virtual_index, candidate, is_source)
+            })
             .collect::<Vec<_>>();
 
         walks.sort_by(|left, right| {
@@ -2035,7 +2061,9 @@ impl Engine {
 
         let trip_mask_started = Instant::now();
         let trip_is_available = self.build_trip_availability(active_services);
-        let trip_has_realtime_update = self.realtime.updated_trip_mask(self.static_data.trips.len());
+        let trip_has_realtime_update = self
+            .realtime
+            .updated_trip_mask(self.static_data.trips.len());
         let trip_max_positive_delay_secs = self
             .realtime
             .trip_max_positive_departure_delay_secs(self.static_data.trips.len());
@@ -2072,6 +2100,11 @@ impl Engine {
         let mut next_marked_flags = vec![false; stop_count];
         let mut best_before_round = vec![INF_TIME; stop_count];
         let mut queued_line_positions = vec![usize::MAX; line_count];
+        let mut destination_round = if from_index == to_index {
+            Some(0)
+        } else {
+            None
+        };
         let state_init_ms = state_init_started.elapsed().as_millis();
 
         global_best[from_index] = departure_secs;
@@ -2102,6 +2135,9 @@ impl Engine {
                     &mut marked_flags,
                 ) {
                     improved_round[transfer.to_stop] = Some(0);
+                    if transfer.to_stop == to_index {
+                        destination_round = Some(0);
+                    }
                 }
             }
         } else {
@@ -2122,6 +2158,9 @@ impl Engine {
                     &mut marked_flags,
                 ) {
                     improved_round[edge.to_stop] = Some(0);
+                    if edge.to_stop == to_index {
+                        destination_round = Some(0);
+                    }
                 }
             }
 
@@ -2149,6 +2188,9 @@ impl Engine {
                         &mut marked_flags,
                     ) {
                         improved_round[transfer.to_stop] = Some(0);
+                        if transfer.to_stop == to_index {
+                            destination_round = Some(0);
+                        }
                     }
                 }
             }
@@ -2158,14 +2200,14 @@ impl Engine {
 
         let mut trace_rounds = Vec::new();
         let mut round_timing_totals_us = RaptorRoundTimingBreakdownUs::default();
-        let mut destination_round = if from_index == to_index { Some(0) } else { None };
         let mut counters = QueryPerformanceCounters::default();
         let mut profile_lookups = 0usize;
         let mut profile_hits = 0usize;
         let mut profile_bound_improvements = 0usize;
         let mut flat_spatial_mask_checks = 0usize;
         let mut flat_spatial_mask_hits = 0usize;
-        let mut local_subquery_cache = HashMap::<LocalSubqueryKey, Option<LocalSubqueryResult>>::new();
+        let mut local_subquery_cache =
+            HashMap::<LocalSubqueryKey, Option<LocalSubqueryResult>>::new();
 
         if !plan.destination_egress_edges.is_empty() {
             self.apply_virtual_destination_egress(
@@ -2356,7 +2398,8 @@ impl Engine {
                 &mut round_metrics,
             );
             let transfer_relax_ms = transfer_relax_started.elapsed().as_millis();
-            round_metrics.timings_us.transfer_relax_us = transfer_relax_started.elapsed().as_micros();
+            round_metrics.timings_us.transfer_relax_us =
+                transfer_relax_started.elapsed().as_micros();
 
             if next_marked.len() > transit_frontier_len {
                 if !plan.destination_egress_edges.is_empty() {
@@ -2432,7 +2475,8 @@ impl Engine {
             counters.queued_lines_total += round_metrics.queued_lines;
             counters.chronos_bucket_lookups += round_metrics.chronos_bucket_lookups;
             counters.chronos_indirection_lookups += round_metrics.chronos_indirection_lookups;
-            counters.chronos_bucket_fallback_searches += round_metrics.chronos_bucket_fallback_searches;
+            counters.chronos_bucket_fallback_searches +=
+                round_metrics.chronos_bucket_fallback_searches;
             counters.chronos_bucket_fallback_end_of_service +=
                 round_metrics.chronos_bucket_fallback_end_of_service;
             counters.chronos_bucket_fallback_non_monotonic +=
@@ -2456,19 +2500,15 @@ impl Engine {
             counters.transfer_improvements += round_metrics.transfer_improvements;
             counters.destination_bound_prunes += round_metrics.destination_bound_prunes;
 
-            round_metrics.timings_us.line_scan_other_us = round_metrics
-                .timings_us
-                .line_scan_us
-                .saturating_sub(
+            round_metrics.timings_us.line_scan_other_us =
+                round_metrics.timings_us.line_scan_us.saturating_sub(
                     round_metrics.timings_us.line_scan_onboard_us
                         + round_metrics.timings_us.line_scan_trip_search_us
                         + round_metrics.timings_us.line_scan_candidate_compare_us,
                 );
             round_metrics.timings_us.round_total_us = round_started.elapsed().as_micros();
-            round_metrics.timings_us.round_other_us = round_metrics
-                .timings_us
-                .round_total_us
-                .saturating_sub(
+            round_metrics.timings_us.round_other_us =
+                round_metrics.timings_us.round_total_us.saturating_sub(
                     round_metrics.timings_us.best_before_clone_us
                         + round_metrics.timings_us.queue_build_us
                         + round_metrics.timings_us.line_scan_us
@@ -2538,10 +2578,8 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let spatial_profile_insertions = self.build_spatial_profile_insertions(
-            destination_cell,
-            &cacheable_raw_legs,
-        );
+        let spatial_profile_insertions =
+            self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs);
         let transit_legs = raw_legs
             .iter()
             .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
@@ -2562,7 +2600,11 @@ impl Engine {
             rayon::spawn(move || {
                 if let Some(exact_destination_stop) = exact_destination_stop {
                     if !profile_insertions.is_empty() {
-                        cache.insert_batch(service_date, exact_destination_stop, profile_insertions);
+                        cache.insert_batch(
+                            service_date,
+                            exact_destination_stop,
+                            profile_insertions,
+                        );
                     }
                 }
                 if let Some(destination_cell) = destination_cell {
@@ -2998,12 +3040,9 @@ impl Engine {
             metrics.chronos_indirection_lookups += 1;
         }
 
-        let Some(start_index) = chronos_bucket_start_index(
-            line,
-            stop_pos,
-            ready_at,
-            line_max_positive_delay_secs,
-        ) else {
+        let Some(start_index) =
+            chronos_bucket_start_index(line, stop_pos, ready_at, line_max_positive_delay_secs)
+        else {
             metrics.chronos_bucket_fallback_searches += 1;
             metrics.chronos_bucket_fallback_non_monotonic += 1;
             return self.find_earliest_trip_linear_fallback(
@@ -3057,7 +3096,8 @@ impl Engine {
         let mut best_trip = None;
         let mut best_departure = INF_TIME;
         for search_index in start_index..search_len {
-            let Some(trip_index) = line_trip_index_at_temporal_position(line, stop_pos, search_index)
+            let Some(trip_index) =
+                line_trip_index_at_temporal_position(line, stop_pos, search_index)
             else {
                 break;
             };
@@ -3249,7 +3289,11 @@ impl Engine {
 
             *profile_lookups += 1;
             *flat_spatial_mask_checks += 1;
-            let Some(true) = spatial_flat_mask.enabled_source_stops.get(stop_index).copied() else {
+            let Some(true) = spatial_flat_mask
+                .enabled_source_stops
+                .get(stop_index)
+                .copied()
+            else {
                 continue;
             };
 
@@ -3451,7 +3495,8 @@ impl Engine {
         line_max_positive_delay_secs: &[i32],
         local_subquery_cache: &mut HashMap<LocalSubqueryKey, Option<LocalSubqueryResult>>,
     ) -> Option<(i32, usize, Vec<CachedLeg>)> {
-        let remaining_after_trunk = remaining_transit_legs.saturating_sub(spatial_match.transit_legs);
+        let remaining_after_trunk =
+            remaining_transit_legs.saturating_sub(spatial_match.transit_legs);
         let mut best_match = None::<(i32, usize, Vec<CachedLeg>)>;
 
         for edge in destination_egress_edges {
@@ -3470,10 +3515,8 @@ impl Engine {
 
             let final_arrival = local_result.arrival_secs + edge.duration_secs;
             let total_transit_legs = spatial_match.transit_legs + local_result.transit_legs;
-            let mut suffix_legs = combine_cached_leg_sequences(
-                spatial_match.trunk_legs.as_ref(),
-                &local_result.legs,
-            );
+            let mut suffix_legs =
+                combine_cached_leg_sequences(spatial_match.trunk_legs.as_ref(), &local_result.legs);
             suffix_legs.push(CachedLeg::Walk {
                 from_stop: edge.from_stop,
                 to_stop: destination_stop,
@@ -3662,7 +3705,13 @@ impl Engine {
         let destination_round = destination_round?;
         let arrival_secs = round_arrivals[destination_round][to_stop];
         let raw_legs = self
-            .reconstruct_path(from_stop, to_stop, destination_round, &parents, &round_arrivals)
+            .reconstruct_path(
+                from_stop,
+                to_stop,
+                destination_round,
+                &parents,
+                &round_arrivals,
+            )
             .ok()?;
         let transit_legs = raw_legs
             .iter()
@@ -4014,10 +4063,7 @@ impl Engine {
             })
     }
 
-    fn build_deferred_hydration(
-        &self,
-        legs: &[LegResponse],
-    ) -> Result<DeferredHydrationResponse> {
+    fn build_deferred_hydration(&self, legs: &[LegResponse]) -> Result<DeferredHydrationResponse> {
         let mut entities = HydrationEntityDictionary::default();
         let mut stop_seen = HashSet::<u64>::new();
         let mut route_seen = HashSet::<u64>::new();
@@ -4199,13 +4245,15 @@ impl Engine {
                         ..
                     } => {
                         trip_indices.push(*trip_index);
-                        if let Some((cell_boundary_stop, cell_boundary_pos, cell_boundary_arrival)) =
-                            self.first_transit_stop_in_cell(
-                                *trip_index,
-                                *board_pos,
-                                destination_cell,
-                            )
-                        {
+                        if let Some((
+                            cell_boundary_stop,
+                            cell_boundary_pos,
+                            cell_boundary_arrival,
+                        )) = self.first_transit_stop_in_cell(
+                            *trip_index,
+                            *board_pos,
+                            destination_cell,
+                        ) {
                             trunk_legs.push(CachedLeg::Transit {
                                 trip_index: *trip_index,
                                 board_stop: *board_stop,
@@ -4455,12 +4503,7 @@ fn prepare_osm_pbf_source(
 ) -> Result<PreparedOsmPbfSource> {
     if is_remote_source(source_value) {
         let cache_path = remote_osm_pbf_cache_path(workspace_root, source_value);
-        sync_remote_osm_pbf(
-            source_value,
-            allow_invalid_tls,
-            &cache_path,
-            refresh_mode,
-        )?;
+        sync_remote_osm_pbf(source_value, allow_invalid_tls, &cache_path, refresh_mode)?;
         return Ok(PreparedOsmPbfSource {
             local_path: cache_path,
             source: source_value.to_owned(),
@@ -4656,12 +4699,13 @@ fn probe_remote_static_gtfs_version(
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| {
-            format!(
-                "failed to probe static GTFS feed {feed_id} metadata from {url}"
-            )
+            format!("failed to probe static GTFS feed {feed_id} metadata from {url}")
         })?;
 
-    Ok(remote_static_gtfs_version_from_headers(url, response.headers()))
+    Ok(remote_static_gtfs_version_from_headers(
+        url,
+        response.headers(),
+    ))
 }
 
 fn remote_static_gtfs_version_changed(
@@ -4734,8 +4778,10 @@ fn sync_remote_static_gtfs(
             StaticGtfsRefreshMode::Bootstrap => {
                 match probe_remote_static_gtfs_version(&client, feed_id, url) {
                     Ok(remote_version) => {
-                        if remote_static_gtfs_version_changed(cached_version.as_ref(), &remote_version)
-                        {
+                        if remote_static_gtfs_version_changed(
+                            cached_version.as_ref(),
+                            &remote_version,
+                        ) {
                             info!(
                                 feed_id,
                                 url,
@@ -4761,37 +4807,40 @@ fn sync_remote_static_gtfs(
                 }
                 return Ok(());
             }
-            StaticGtfsRefreshMode::Poll => match probe_remote_static_gtfs_version(&client, feed_id, url)
-            {
-                Ok(remote_version) => {
-                    if !remote_static_gtfs_version_changed(cached_version.as_ref(), &remote_version)
-                    {
+            StaticGtfsRefreshMode::Poll => {
+                match probe_remote_static_gtfs_version(&client, feed_id, url) {
+                    Ok(remote_version) => {
+                        if !remote_static_gtfs_version_changed(
+                            cached_version.as_ref(),
+                            &remote_version,
+                        ) {
+                            return Ok(());
+                        }
+                        info!(
+                            feed_id,
+                            url,
+                            cache = %cache_path.display(),
+                            remote_last_modified = remote_version
+                                .last_modified
+                                .as_deref()
+                                .unwrap_or("<missing>"),
+                            remote_etag = remote_version.etag.as_deref().unwrap_or("<missing>"),
+                            "detected upstream static GTFS version change"
+                        );
+                        probed_version = Some(remote_version);
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            feed_id,
+                            url,
+                            cache = %cache_path.display(),
+                            "failed to probe remote static GTFS metadata during poll; keeping cached zip"
+                        );
                         return Ok(());
                     }
-                    info!(
-                        feed_id,
-                        url,
-                        cache = %cache_path.display(),
-                        remote_last_modified = remote_version
-                            .last_modified
-                            .as_deref()
-                            .unwrap_or("<missing>"),
-                        remote_etag = remote_version.etag.as_deref().unwrap_or("<missing>"),
-                        "detected upstream static GTFS version change"
-                    );
-                    probed_version = Some(remote_version);
                 }
-                Err(error) => {
-                    warn!(
-                        %error,
-                        feed_id,
-                        url,
-                        cache = %cache_path.display(),
-                        "failed to probe remote static GTFS metadata during poll; keeping cached zip"
-                    );
-                    return Ok(());
-                }
-            },
+            }
         }
     }
 
@@ -4883,7 +4932,8 @@ fn sync_remote_static_gtfs(
         )
     })?;
 
-    if let Err(error) = store_remote_static_gtfs_version_metadata(&version_path, &version_metadata) {
+    if let Err(error) = store_remote_static_gtfs_version_metadata(&version_path, &version_metadata)
+    {
         warn!(
             %error,
             feed_id,
@@ -4936,8 +4986,10 @@ fn sync_remote_osm_pbf(
             StaticGtfsRefreshMode::Bootstrap => {
                 match probe_remote_static_gtfs_version(&client, "osm-pbf", url) {
                     Ok(remote_version) => {
-                        if remote_static_gtfs_version_changed(cached_version.as_ref(), &remote_version)
-                        {
+                        if remote_static_gtfs_version_changed(
+                            cached_version.as_ref(),
+                            &remote_version,
+                        ) {
                             info!(
                                 url,
                                 cache = %cache_path.display(),
@@ -4961,35 +5013,38 @@ fn sync_remote_osm_pbf(
                 }
                 return Ok(());
             }
-            StaticGtfsRefreshMode::Poll => match probe_remote_static_gtfs_version(&client, "osm-pbf", url)
-            {
-                Ok(remote_version) => {
-                    if !remote_static_gtfs_version_changed(cached_version.as_ref(), &remote_version)
-                    {
+            StaticGtfsRefreshMode::Poll => {
+                match probe_remote_static_gtfs_version(&client, "osm-pbf", url) {
+                    Ok(remote_version) => {
+                        if !remote_static_gtfs_version_changed(
+                            cached_version.as_ref(),
+                            &remote_version,
+                        ) {
+                            return Ok(());
+                        }
+                        info!(
+                            url,
+                            cache = %cache_path.display(),
+                            remote_last_modified = remote_version
+                                .last_modified
+                                .as_deref()
+                                .unwrap_or("<missing>"),
+                            remote_etag = remote_version.etag.as_deref().unwrap_or("<missing>"),
+                            "detected upstream OSM PBF version change"
+                        );
+                        probed_version = Some(remote_version);
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            url,
+                            cache = %cache_path.display(),
+                            "failed to probe remote OSM PBF metadata during poll; keeping cached file"
+                        );
                         return Ok(());
                     }
-                    info!(
-                        url,
-                        cache = %cache_path.display(),
-                        remote_last_modified = remote_version
-                            .last_modified
-                            .as_deref()
-                            .unwrap_or("<missing>"),
-                        remote_etag = remote_version.etag.as_deref().unwrap_or("<missing>"),
-                        "detected upstream OSM PBF version change"
-                    );
-                    probed_version = Some(remote_version);
                 }
-                Err(error) => {
-                    warn!(
-                        %error,
-                        url,
-                        cache = %cache_path.display(),
-                        "failed to probe remote OSM PBF metadata during poll; keeping cached file"
-                    );
-                    return Ok(());
-                }
-            },
+            }
         }
     }
 
@@ -5066,7 +5121,8 @@ fn sync_remote_osm_pbf(
         )
     })?;
 
-    if let Err(error) = store_remote_static_gtfs_version_metadata(&version_path, &version_metadata) {
+    if let Err(error) = store_remote_static_gtfs_version_metadata(&version_path, &version_metadata)
+    {
         warn!(
             %error,
             metadata = %version_path.display(),
@@ -5113,9 +5169,9 @@ fn stream_blocking_response_to_file(
     );
 
     loop {
-        let read = response.read(buffer.as_mut_slice()).with_context(|| {
-            format!("failed to read {artifact_name} response body")
-        })?;
+        let read = response
+            .read(buffer.as_mut_slice())
+            .with_context(|| format!("failed to read {artifact_name} response body"))?;
         if read == 0 {
             break;
         }
@@ -5295,7 +5351,10 @@ fn file_size(path: &PathBuf) -> u64 {
         .unwrap_or(0)
 }
 
-fn build_stop_cells(stops: &[StopRecord], active_stop_indices: &[usize]) -> HashMap<u64, Vec<usize>> {
+fn build_stop_cells(
+    stops: &[StopRecord],
+    active_stop_indices: &[usize],
+) -> HashMap<u64, Vec<usize>> {
     let mut stop_cells = HashMap::<u64, Vec<usize>>::new();
     for &stop_index in active_stop_indices {
         let stop = &stops[stop_index];
@@ -5435,9 +5494,18 @@ fn summarize_static_divergence(previous: &StaticData, next: &StaticCore) -> Stat
     let changed_routes = collect_changed_route_ids(previous, next);
     let changed_trips = collect_changed_trip_ids(previous, next);
     let mutated_entities = changed_stops.len() + changed_routes.len() + changed_trips.len();
-    let total_entities = previous.active_stop_indices.len().max(next.active_stop_indices.len())
-        + previous.active_route_indices.len().max(next.active_route_indices.len())
-        + previous.active_trip_indices.len().max(next.active_trip_indices.len());
+    let total_entities = previous
+        .active_stop_indices
+        .len()
+        .max(next.active_stop_indices.len())
+        + previous
+            .active_route_indices
+            .len()
+            .max(next.active_route_indices.len())
+        + previous
+            .active_trip_indices
+            .len()
+            .max(next.active_trip_indices.len());
     let divergence_ratio = if total_entities == 0 {
         0.0
     } else {
@@ -5475,12 +5543,18 @@ fn merge_append_only_core(previous: &StaticData, next: StaticCore) -> Result<Sta
     let mut routes = previous.routes.clone();
     let mut trips = previous.trips.clone();
 
-    let mut stop_global_ids = stops.iter().map(|stop| stop.global_id).collect::<HashSet<_>>();
+    let mut stop_global_ids = stops
+        .iter()
+        .map(|stop| stop.global_id)
+        .collect::<HashSet<_>>();
     let mut route_global_ids = routes
         .iter()
         .map(|route| route.global_id)
         .collect::<HashSet<_>>();
-    let mut trip_global_ids = trips.iter().map(|trip| trip.global_id).collect::<HashSet<_>>();
+    let mut trip_global_ids = trips
+        .iter()
+        .map(|trip| trip.global_id)
+        .collect::<HashSet<_>>();
 
     let previous_stop_lookup = previous
         .active_stop_indices
@@ -5509,11 +5583,7 @@ fn merge_append_only_core(previous: &StaticData, next: StaticCore) -> Result<Sta
             if stop_records_equivalent(&previous.stops[*previous_index], next_stop) {
                 *previous_index
             } else {
-                append_stop_record(
-                    &mut stops,
-                    next_stop,
-                    &mut stop_global_ids,
-                )?
+                append_stop_record(&mut stops, next_stop, &mut stop_global_ids)?
             }
         } else {
             append_stop_record(&mut stops, next_stop, &mut stop_global_ids)?
@@ -5533,11 +5603,7 @@ fn merge_append_only_core(previous: &StaticData, next: StaticCore) -> Result<Sta
             if route_records_equivalent(&previous.routes[*previous_index], next_route) {
                 *previous_index
             } else {
-                append_route_record(
-                    &mut routes,
-                    next_route,
-                    &mut route_global_ids,
-                )?
+                append_route_record(&mut routes, next_route, &mut route_global_ids)?
             }
         } else {
             append_route_record(&mut routes, next_route, &mut route_global_ids)?
@@ -5601,7 +5667,8 @@ fn merge_append_only_core(previous: &StaticData, next: StaticCore) -> Result<Sta
         }
     }
 
-    let (lines, stop_to_lines) = rebuild_lines_and_stop_to_lines(&trips, &active_trip_indices, stops.len());
+    let (lines, stop_to_lines) =
+        rebuild_lines_and_stop_to_lines(&trips, &active_trip_indices, stops.len());
 
     Ok(StaticCore {
         feeds,
@@ -5890,7 +5957,10 @@ fn collect_changed_route_ids(previous: &StaticData, next: &StaticCore) -> HashSe
     for (route_id, next_index) in &next_lookup {
         match previous_lookup.get(route_id) {
             Some(previous_index) => {
-                if !route_records_equivalent(&previous.routes[*previous_index], &next.routes[*next_index]) {
+                if !route_records_equivalent(
+                    &previous.routes[*previous_index],
+                    &next.routes[*next_index],
+                ) {
                     changed.insert(route_id.clone());
                 }
             }
@@ -5966,7 +6036,10 @@ fn collect_changed_stop_ids_from_slices(
     for (stop_id, next_index) in &next_lookup {
         match previous_lookup.get(stop_id) {
             Some(previous_index) => {
-                if !stop_records_equivalent(&previous_stops[*previous_index], &next_stops[*next_index]) {
+                if !stop_records_equivalent(
+                    &previous_stops[*previous_index],
+                    &next_stops[*next_index],
+                ) {
                     changed.insert(stop_id.clone());
                 }
             }
@@ -6008,7 +6081,10 @@ fn trip_records_equivalent(
     right_routes: &[RouteRecord],
     right_stops: &[StopRecord],
 ) -> bool {
-    if !route_records_equivalent(&left_routes[left.route_index], &right_routes[right.route_index]) {
+    if !route_records_equivalent(
+        &left_routes[left.route_index],
+        &right_routes[right.route_index],
+    ) {
         return false;
     }
     if left.shape_id != right.shape_id
@@ -6021,12 +6097,15 @@ fn trip_records_equivalent(
         return false;
     }
 
-    left.stop_times.iter().zip(&right.stop_times).all(|(left_stop, right_stop)| {
-        left_stop.arrival_secs == right_stop.arrival_secs
-            && left_stop.departure_secs == right_stop.departure_secs
-            && left_stop.stop_sequence == right_stop.stop_sequence
-            && left_stops[left_stop.stop_index].id == right_stops[right_stop.stop_index].id
-    })
+    left.stop_times
+        .iter()
+        .zip(&right.stop_times)
+        .all(|(left_stop, right_stop)| {
+            left_stop.arrival_secs == right_stop.arrival_secs
+                && left_stop.departure_secs == right_stop.departure_secs
+                && left_stop.stop_sequence == right_stop.stop_sequence
+                && left_stops[left_stop.stop_index].id == right_stops[right_stop.stop_index].id
+        })
 }
 
 fn append_stop_record(
@@ -6191,8 +6270,7 @@ fn finalize_line_temporal_indices(lines: &mut [LineRecord], trips: &[TripRecord]
             }
         }
 
-        let mut chronos_bucket_start_indices_by_stop =
-            Vec::with_capacity(line.stop_indices.len());
+        let mut chronos_bucket_start_indices_by_stop = Vec::with_capacity(line.stop_indices.len());
         let mut trip_order_indirection_by_stop = Vec::with_capacity(line.stop_indices.len());
 
         for (stop_pos, departures) in scheduled_departures_by_stop.iter_mut().enumerate() {
@@ -6280,7 +6358,12 @@ fn line_trip_index_at_temporal_position(
         .trip_order_indirection_by_stop
         .get(stop_pos)
         .filter(|order| !order.is_empty())
-        .and_then(|order| order.get(temporal_position).copied().map(|value| value as usize))
+        .and_then(|order| {
+            order
+                .get(temporal_position)
+                .copied()
+                .map(|value| value as usize)
+        })
         .unwrap_or(temporal_position);
     line.trip_indices.get(physical_position).copied()
 }
@@ -6391,9 +6474,8 @@ fn build_transfer_relax_index(
             .iter()
             .map(|cell| cell.target_stop)
             .collect::<Vec<_>>();
-        target_stop_indices.sort_unstable_by_key(|stop_index| {
-            (stop_to_hub_offset[*stop_index], *stop_index)
-        });
+        target_stop_indices
+            .sort_unstable_by_key(|stop_index| (stop_to_hub_offset[*stop_index], *stop_index));
         target_stop_indices.dedup();
         if target_stop_indices.is_empty() {
             continue;
@@ -6430,7 +6512,10 @@ fn build_transfer_relax_index(
         hub.outgoing_tiles.sort_by_key(|tile| {
             (
                 tile.target_hub,
-                tile.target_stop_indices.first().copied().unwrap_or(usize::MAX),
+                tile.target_stop_indices
+                    .first()
+                    .copied()
+                    .unwrap_or(usize::MAX),
             )
         });
     }
@@ -6616,7 +6701,11 @@ fn expand_affected_stop_indices(
     for source in previous_active_stop_indices
         .iter()
         .map(|index| &previous_stops[*index])
-        .chain(next_active_stop_indices.iter().map(|index| &next_stops[*index]))
+        .chain(
+            next_active_stop_indices
+                .iter()
+                .map(|index| &next_stops[*index]),
+        )
     {
         if !changed_stop_ids.contains(&source.id) {
             continue;
@@ -6626,8 +6715,8 @@ fn expand_affected_stop_indices(
         };
 
         let lat_delta = walk_radius_meters / 111_320.0;
-        let lon_delta = walk_radius_meters
-            / (111_320.0 * latitude.to_radians().cos().abs().max(0.25));
+        let lon_delta =
+            walk_radius_meters / (111_320.0 * latitude.to_radians().cos().abs().max(0.25));
         let envelope = AABB::from_corners(
             [longitude - lon_delta, latitude - lat_delta],
             [longitude + lon_delta, latitude + lat_delta],
@@ -6677,7 +6766,11 @@ fn polyline_fingerprint(polyline: &[PolylinePoint]) -> u64 {
 }
 
 fn route_display_name_cold(route: &ColdRouteRecord) -> String {
-    if let Some(short_name) = route.short_name.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(short_name) = route
+        .short_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         return short_name.to_owned();
     }
     if let Some(long_name) = route.long_name.as_deref().filter(|value| !value.is_empty()) {
@@ -6716,7 +6809,10 @@ fn load_static_cache(
 fn store_static_cache(cache_path: &PathBuf, cache: &StaticCache) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!("unable to create static cache directory {}", parent.display())
+            format!(
+                "unable to create static cache directory {}",
+                parent.display()
+            )
         })?;
     }
     let file = File::create(cache_path)
@@ -7104,7 +7200,9 @@ fn shape_polyline_by_distance(
     let points: Vec<_> = shape
         .iter()
         .filter(|point| {
-            point.dist_traveled.is_some_and(|distance| distance >= start_dist && distance <= end_dist)
+            point
+                .dist_traveled
+                .is_some_and(|distance| distance >= start_dist && distance <= end_dist)
         })
         .map(|point| PolylinePoint {
             lat: point.lat,
@@ -7133,11 +7231,17 @@ fn shape_polyline_by_stop_projection(
     }
 
     let mut polyline = Vec::with_capacity(end_index - start_index + 3);
-    push_stop_polyline_point(&mut polyline, stops.get(trip.stop_times.get(board_pos)?.stop_index)?);
+    push_stop_polyline_point(
+        &mut polyline,
+        stops.get(trip.stop_times.get(board_pos)?.stop_index)?,
+    );
     for point in &shape[start_index..=end_index] {
         push_polyline_point(&mut polyline, point.lat, point.lon);
     }
-    push_stop_polyline_point(&mut polyline, stops.get(trip.stop_times.get(alight_pos)?.stop_index)?);
+    push_stop_polyline_point(
+        &mut polyline,
+        stops.get(trip.stop_times.get(alight_pos)?.stop_index)?,
+    );
 
     (polyline.len() >= 2).then_some(polyline)
 }
@@ -7195,9 +7299,9 @@ fn push_stop_polyline_point(polyline: &mut Vec<PolylinePoint>, stop: &StopRecord
 }
 
 fn push_polyline_point(polyline: &mut Vec<PolylinePoint>, lat: f64, lon: f64) {
-    let should_push = polyline
-        .last()
-        .is_none_or(|point| point.lat.to_bits() != lat.to_bits() || point.lon.to_bits() != lon.to_bits());
+    let should_push = polyline.last().is_none_or(|point| {
+        point.lat.to_bits() != lat.to_bits() || point.lon.to_bits() != lon.to_bits()
+    });
     if should_push {
         polyline.push(PolylinePoint { lat, lon });
     }
@@ -7206,11 +7310,11 @@ fn push_polyline_point(polyline: &mut Vec<PolylinePoint>, lat: f64, lon: f64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHRONOS_BUCKET_SECS, LineRecord, RemoteStaticGtfsVersionMetadata, ShapePoint,
-        StopRecord, TripRecord, TripStopRecord, WalkTransfer, build_chronos_bucket_start_indices,
-        build_shape_stop_point_indices, build_transfer_relax_index,
-        finalize_line_temporal_indices, shape_polyline_segment,
-        remote_static_gtfs_version_changed, svrt_chunk_has_catchup_candidate_scalar,
+        CHRONOS_BUCKET_SECS, LineRecord, RemoteStaticGtfsVersionMetadata, ShapePoint, StopRecord,
+        TripRecord, TripStopRecord, WalkTransfer, build_chronos_bucket_start_indices,
+        build_shape_stop_point_indices, build_transfer_relax_index, finalize_line_temporal_indices,
+        remote_static_gtfs_version_changed, shape_polyline_segment,
+        svrt_chunk_has_catchup_candidate_scalar,
     };
 
     #[test]
@@ -7295,7 +7399,10 @@ mod tests {
         assert_eq!(lines[0].binary_searchable_by_stop, vec![true, false]);
         assert!(!lines[0].chronos_bucket_start_indices_by_stop[0].is_empty());
         assert!(!lines[0].chronos_bucket_start_indices_by_stop[1].is_empty());
-        assert_eq!(lines[0].trip_order_indirection_by_stop[0], Vec::<u32>::new());
+        assert_eq!(
+            lines[0].trip_order_indirection_by_stop[0],
+            Vec::<u32>::new()
+        );
         assert_eq!(lines[0].trip_order_indirection_by_stop[1], vec![1, 0]);
     }
 
@@ -7437,10 +7544,7 @@ mod tests {
 
     #[test]
     fn shape_polyline_segment_prefers_shape_distances_when_present() {
-        let stops = vec![
-            test_stop(0, "a", 41.0, 12.0),
-            test_stop(1, "b", 41.0, 12.2),
-        ];
+        let stops = vec![test_stop(0, "a", 41.0, 12.0), test_stop(1, "b", 41.0, 12.2)];
         let trip = TripRecord {
             global_id: 1,
             feed_index: 0,
@@ -7556,7 +7660,8 @@ mod tests {
             },
         ];
 
-        let indices = build_shape_stop_point_indices(&shape, &stops, &stop_times).expect("shape indices");
+        let indices =
+            build_shape_stop_point_indices(&shape, &stops, &stop_times).expect("shape indices");
 
         assert_eq!(indices, vec![0, 2, 4]);
     }

@@ -51,8 +51,8 @@ fn quantize_longitude(longitude: f64) -> u32 {
 }
 
 fn quantize_range(value: f64, minimum: f64, maximum: f64) -> u32 {
-    let normalized = ((value.clamp(minimum, maximum) - minimum) / (maximum - minimum))
-        .clamp(0.0, 1.0);
+    let normalized =
+        ((value.clamp(minimum, maximum) - minimum) / (maximum - minimum)).clamp(0.0, 1.0);
     (normalized * u32::MAX as f64).round() as u32
 }
 
