@@ -331,6 +331,14 @@ summary {
   color: #222;
 }
 
+.walk-preview {
+  padding: 6px 8px;
+  border: 1px solid #d8e4d8;
+  background: #eef6ee;
+  color: #254525;
+  font-weight: bold;
+}
+
 .walk-directions {
   display: grid;
   gap: 4px;

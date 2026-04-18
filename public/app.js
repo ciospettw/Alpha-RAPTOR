@@ -420,13 +420,22 @@ function renderQuery() {
 
   dom.legsContainer.innerHTML = summary.legs
     .map((leg) => {
+      const walkDirections = leg.kind === "walk" && Array.isArray(leg.walk_directions)
+        ? leg.walk_directions
+        : [];
+      const walkPreviewStep = walkDirections.find(
+        (step) => step.maneuver !== "depart" && step.maneuver !== "arrive",
+      ) || walkDirections[0] || null;
       const meta = leg.kind === "walk"
         ? `${Math.round(leg.walk_distance_meters || 0)} m a piedi`
         : `${escapeHtml(leg.route_label || leg.route_id || "linea")} · ${escapeHtml(leg.headsign || "")}`;
-      const directions = leg.kind === "walk" && Array.isArray(leg.walk_directions) && leg.walk_directions.length
+      const walkPreview = leg.kind === "walk" && walkPreviewStep
+        ? `<div class="walk-preview">${escapeHtml(walkPreviewStep.instruction)}</div>`
+        : "";
+      const directions = leg.kind === "walk" && walkDirections.length
         ? `
           <ol class="walk-directions">
-            ${leg.walk_directions
+            ${walkDirections
               .map(
                 (step) => `
                   <li class="walk-direction">
@@ -444,6 +453,7 @@ function renderQuery() {
           <div class="leg-badge">${escapeHtml(leg.kind)}</div>
           <div class="leg-times">${escapeHtml(leg.departure_time)} → ${escapeHtml(leg.arrival_time)}</div>
           <div class="leg-title">${escapeHtml(leg.from_stop.name)} → ${escapeHtml(leg.to_stop.name)}</div>
+          ${walkPreview}
           <div class="leg-meta">${meta}</div>
           ${directions}
         </article>

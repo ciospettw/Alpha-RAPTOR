@@ -58,6 +58,7 @@ const GLOBAL_ID_LOCAL_MASK: u64 = (1u64 << 48) - 1;
 const ENTITY_KIND_SHIFT: u64 = 44;
 const ENTITY_ORDINAL_MASK: u64 = (1u64 << ENTITY_KIND_SHIFT) - 1;
 const WALK_TURN_STRAIGHT_ANGLE_DEGREES: f64 = 20.0;
+const WALK_TURN_MIN_SPACING_METERS: f64 = 15.0;
 
 #[derive(Clone)]
 pub struct FeedConfig {
@@ -6679,6 +6680,7 @@ fn build_walk_directions(
         lat: geometry.polyline[0].lat,
         lon: geometry.polyline[0].lon,
     }];
+    let mut last_instruction_distance = 0.0;
 
     for pivot in 1..geometry.polyline.len().saturating_sub(1) {
         let previous_way_id = segment_way_ids[pivot - 1];
@@ -6696,6 +6698,14 @@ fn build_walk_directions(
             &geometry.polyline[pivot + 1],
         );
         let street_name = road_label_for_way(next_way_id, way_names).map(str::to_owned);
+        let instruction_distance = cumulative_distances[pivot];
+        let distance_since_last_instruction = instruction_distance - last_instruction_distance;
+        if maneuver == "continue" && street_name.is_none() {
+            continue;
+        }
+        if street_name.is_none() && distance_since_last_instruction < WALK_TURN_MIN_SPACING_METERS {
+            continue;
+        }
         let instruction = match maneuver {
             "turn-left" => match street_name.as_ref() {
                 Some(street_name) => format!("Svolta a sinistra su {street_name}"),
@@ -6715,10 +6725,11 @@ fn build_walk_directions(
             maneuver,
             instruction,
             street_name,
-            distance_meters: cumulative_distances[pivot],
+            distance_meters: instruction_distance,
             lat: geometry.polyline[pivot].lat,
             lon: geometry.polyline[pivot].lon,
         });
+        last_instruction_distance = instruction_distance;
     }
 
     let destination_label = destination_name.trim();
@@ -8338,6 +8349,30 @@ mod tests {
         assert_eq!(directions.len(), 2);
         assert_eq!(directions[0].maneuver, "depart");
         assert_eq!(directions[1].maneuver, "arrive");
+    }
+
+    #[test]
+    fn build_walk_directions_suppresses_tight_unnamed_micro_turns() {
+        let directions = build_walk_directions(
+            &WalkGeometry {
+                polyline: vec![
+                    test_point(41.9395, 12.5283),
+                    test_point(41.9391, 12.5281),
+                    test_point(41.93887, 12.52788),
+                    test_point(41.93885, 12.52791),
+                    test_point(41.93884, 12.52792),
+                    test_point(41.93900, 12.52805),
+                ],
+                segment_way_ids: vec![Some(10), Some(11), Some(12), Some(13), Some(14)],
+            },
+            &HashMap::new(),
+            "Destinazione",
+        );
+
+        assert_eq!(directions.len(), 3);
+        assert_eq!(directions[0].maneuver, "depart");
+        assert_eq!(directions[1].maneuver, "turn-left");
+        assert_eq!(directions[2].maneuver, "arrive");
     }
 
     fn test_stop(global_id: u64, local_id: &str, latitude: f64, longitude: f64) -> StopRecord {
