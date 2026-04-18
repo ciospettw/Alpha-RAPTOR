@@ -423,12 +423,29 @@ function renderQuery() {
       const meta = leg.kind === "walk"
         ? `${Math.round(leg.walk_distance_meters || 0)} m a piedi`
         : `${escapeHtml(leg.route_label || leg.route_id || "linea")} · ${escapeHtml(leg.headsign || "")}`;
+      const directions = leg.kind === "walk" && Array.isArray(leg.walk_directions) && leg.walk_directions.length
+        ? `
+          <ol class="walk-directions">
+            ${leg.walk_directions
+              .map(
+                (step) => `
+                  <li class="walk-direction">
+                    <span class="walk-direction-text">${escapeHtml(step.instruction)}</span>
+                    <span class="walk-direction-distance">${Math.round(step.distance_meters || 0)} m</span>
+                  </li>
+                `,
+              )
+              .join("")}
+          </ol>
+        `
+        : "";
       return `
         <article class="leg-card ${leg.kind}">
           <div class="leg-badge">${escapeHtml(leg.kind)}</div>
           <div class="leg-times">${escapeHtml(leg.departure_time)} → ${escapeHtml(leg.arrival_time)}</div>
           <div class="leg-title">${escapeHtml(leg.from_stop.name)} → ${escapeHtml(leg.to_stop.name)}</div>
           <div class="leg-meta">${meta}</div>
+          ${directions}
         </article>
       `;
     })

@@ -331,6 +331,34 @@ summary {
   color: #222;
 }
 
+.walk-directions {
+  display: grid;
+  gap: 4px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.walk-direction {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid #dfe7df;
+  background: #f6faf6;
+}
+
+.walk-direction-text {
+  color: #2f4e2f;
+}
+
+.walk-direction-distance {
+  flex: none;
+  color: #6a6a6a;
+  white-space: nowrap;
+}
+
 .trace-grid {
   width: 100%;
   border-collapse: collapse;

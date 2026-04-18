@@ -57,6 +57,7 @@ const EMPTY_TRANSFER_SLOT: u16 = u16::MAX;
 const GLOBAL_ID_LOCAL_MASK: u64 = (1u64 << 48) - 1;
 const ENTITY_KIND_SHIFT: u64 = 44;
 const ENTITY_ORDINAL_MASK: u64 = (1u64 << ENTITY_KIND_SHIFT) - 1;
+const WALK_TURN_STRAIGHT_ANGLE_DEGREES: f64 = 20.0;
 
 #[derive(Clone)]
 pub struct FeedConfig {
@@ -135,6 +136,7 @@ pub struct Engine {
     static_data: Arc<StaticData>,
     realtime: RealtimeStore,
     profile_cache: ProfileCache,
+    walk_way_names: Arc<HashMap<i64, String>>,
     hpf: Option<HolographicPedestrianForest>,
 }
 
@@ -331,6 +333,8 @@ pub struct WalkTransfer {
     pub duration_secs: i32,
     pub distance_meters: f64,
     pub polyline: Vec<PolylinePoint>,
+    #[serde(default)]
+    pub segment_way_ids: Vec<Option<i64>>,
 }
 
 #[derive(Clone)]
@@ -674,7 +678,9 @@ pub struct LegResponse {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
+    pub intermediate_stops: Vec<StopSearchResult>,
     pub polyline: Vec<PolylinePoint>,
+    pub walk_directions: Vec<WalkDirection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -696,7 +702,9 @@ pub struct DeferredLegRef {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
+    pub intermediate_stop_gids: Vec<u64>,
     pub polyline_index: usize,
+    pub walk_directions: Vec<WalkDirection>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -730,6 +738,22 @@ pub struct PolylinePoint {
     pub lon: f64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct WalkDirection {
+    pub maneuver: &'static str,
+    pub instruction: String,
+    pub street_name: Option<String>,
+    pub distance_meters: f64,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WalkGeometry {
+    polyline: Vec<PolylinePoint>,
+    segment_way_ids: Vec<Option<i64>>,
+}
+
 #[derive(Clone, Debug)]
 struct CoordinatePoint {
     latitude: f64,
@@ -758,6 +782,7 @@ struct QueryVirtualWalk {
     duration_secs: i32,
     distance_meters: f64,
     polyline: Vec<PolylinePoint>,
+    segment_way_ids: Vec<Option<i64>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1347,7 +1372,7 @@ impl Engine {
         } = static_core_result.core;
 
         let walker_started = Instant::now();
-        let walker_build = match (
+        let mut walker_build = match (
             previous,
             static_core_result.diff_summary.differential_applied,
         ) {
@@ -1368,8 +1393,14 @@ impl Engine {
             },
             _ => build_full_walker_matrix(&config, &stops),
         };
+        if walker_build.way_names.is_empty() {
+            if let Some(previous_engine) = previous {
+                walker_build.way_names = previous_engine.walk_way_names.as_ref().clone();
+            }
+        }
         let walker_millis = walker_started.elapsed().as_millis();
         let transfers = walker_build.transfers;
+        let walk_way_names = Arc::new(walker_build.way_names.clone());
         let transfer_hub_cell_meters = (config.walk_radius_meters / 3.0)
             .clamp(BTT_MIN_HUB_CELL_METERS, BTT_MAX_HUB_CELL_METERS);
         let transfer_index =
@@ -1516,6 +1547,7 @@ impl Engine {
             static_data,
             realtime: RealtimeStore::new(),
             profile_cache: ProfileCache::new(),
+            walk_way_names,
             hpf,
         })
     }
@@ -1813,8 +1845,10 @@ impl Engine {
                 .into_iter()
                 .map(|connector| {
                     let mut polyline = connector.polyline;
+                    let mut segment_way_ids = connector.segment_way_ids;
                     if !is_source {
                         polyline.reverse();
+                        segment_way_ids.reverse();
                     }
                     if connector.used_asymptotic_penalty {
                         if is_source {
@@ -1830,6 +1864,7 @@ impl Engine {
                             duration_secs: connector.duration_secs.max(1),
                             distance_meters: connector.distance_meters,
                             polyline,
+                            segment_way_ids,
                         }
                     } else {
                         QueryVirtualWalk {
@@ -1838,6 +1873,7 @@ impl Engine {
                             duration_secs: connector.duration_secs.max(1),
                             distance_meters: connector.distance_meters,
                             polyline,
+                            segment_way_ids,
                         }
                     }
                 })
@@ -1973,6 +2009,7 @@ impl Engine {
             .ceil()
             .max(1.0) as i32;
         let polyline = self.virtual_walk_polyline(point, candidate.stop_index, is_source);
+        let segment_way_ids = empty_segment_way_ids(&polyline);
 
         if is_source {
             QueryVirtualWalk {
@@ -1981,6 +2018,7 @@ impl Engine {
                 duration_secs,
                 distance_meters: candidate.distance_meters,
                 polyline,
+                segment_way_ids,
             }
         } else {
             QueryVirtualWalk {
@@ -1989,6 +2027,7 @@ impl Engine {
                 duration_secs,
                 distance_meters: candidate.distance_meters,
                 polyline,
+                segment_way_ids,
             }
         }
     }
@@ -2586,10 +2625,7 @@ impl Engine {
             .count();
 
         let hydrate_started = Instant::now();
-        let legs = raw_legs
-            .into_iter()
-            .map(|leg| self.hydrate_leg(service_date, leg, &plan.overlay))
-            .collect::<Result<Vec<_>>>()?;
+        let legs = self.hydrate_legs(service_date, &raw_legs, &plan.overlay)?;
         let deferred_hydration = self.build_deferred_hydration(&legs)?;
         let hydrate_ms = hydrate_started.elapsed().as_millis();
 
@@ -3039,7 +3075,6 @@ impl Engine {
         if uses_indirection {
             metrics.chronos_indirection_lookups += 1;
         }
-
         let Some(start_index) =
             chronos_bucket_start_index(line, stop_pos, ready_at, line_max_positive_delay_secs)
         else {
@@ -3808,6 +3843,114 @@ impl Engine {
         Ok(legs)
     }
 
+    fn hydrate_legs(
+        &self,
+        service_date: NaiveDate,
+        raw_legs: &[RawLeg],
+        overlay: &QueryOverlay,
+    ) -> Result<Vec<LegResponse>> {
+        let mut legs = Vec::with_capacity(raw_legs.len());
+        let mut index = 0usize;
+
+        while index < raw_legs.len() {
+            match &raw_legs[index] {
+                RawLeg::Walk { .. } => {
+                    let run_start = index;
+                    while index < raw_legs.len() && matches!(raw_legs[index], RawLeg::Walk { .. }) {
+                        index += 1;
+                    }
+                    legs.push(self.hydrate_walk_run(
+                        service_date,
+                        &raw_legs[run_start..index],
+                        overlay,
+                    )?);
+                }
+                _ => {
+                    legs.push(self.hydrate_leg(service_date, raw_legs[index].clone(), overlay)?);
+                    index += 1;
+                }
+            }
+        }
+
+        Ok(legs)
+    }
+
+    fn hydrate_walk_run(
+        &self,
+        service_date: NaiveDate,
+        walk_legs: &[RawLeg],
+        overlay: &QueryOverlay,
+    ) -> Result<LegResponse> {
+        let Some(RawLeg::Walk {
+            from_stop,
+            departure_secs,
+            ..
+        }) = walk_legs.first()
+        else {
+            bail!("walk hydration requires at least one walk leg");
+        };
+        let Some(RawLeg::Walk {
+            to_stop,
+            arrival_secs,
+            ..
+        }) = walk_legs.last()
+        else {
+            bail!("walk hydration requires at least one walk leg");
+        };
+
+        let distance_meters = walk_legs
+            .iter()
+            .map(|leg| match leg {
+                RawLeg::Walk {
+                    distance_meters, ..
+                } => *distance_meters,
+                RawLeg::Transit { .. } => 0.0,
+            })
+            .sum();
+
+        let geometries = walk_legs
+            .iter()
+            .map(|leg| match leg {
+                RawLeg::Walk {
+                    from_stop, to_stop, ..
+                } => self.query_walk_geometry(*from_stop, *to_stop, overlay),
+                RawLeg::Transit { .. } => WalkGeometry::default(),
+            })
+            .collect::<Vec<_>>();
+        let geometry = stitch_walk_geometries(&geometries);
+
+        let from_result = self.query_stop_result(*from_stop, overlay);
+        let to_result = self.query_stop_result(*to_stop, overlay);
+        let walk_directions = build_walk_directions(
+            &geometry,
+            self.walk_way_names.as_ref(),
+            to_result.name.as_str(),
+        );
+
+        Ok(LegResponse {
+            kind: "walk",
+            departure_time: format_service_time(service_date, *departure_secs),
+            arrival_time: format_service_time(service_date, *arrival_secs),
+            duration_seconds: *arrival_secs - *departure_secs,
+            from_stop: from_result,
+            to_stop: to_result,
+            trip_gid: None,
+            route_gid: None,
+            trip_id: None,
+            route_id: None,
+            route_label: None,
+            route_type: None,
+            route_color: None,
+            route_text_color: None,
+            headsign: None,
+            walk_distance_meters: Some(distance_meters),
+            delay_applied_seconds: None,
+            intermediate_stops: Vec::new(),
+            polyline: geometry.polyline,
+            walk_directions,
+        })
+    }
+
     fn hydrate_leg(
         &self,
         service_date: NaiveDate,
@@ -3822,26 +3965,37 @@ impl Engine {
                 arrival_secs,
                 duration_secs,
                 distance_meters,
-            } => Ok(LegResponse {
-                kind: "walk",
-                departure_time: format_service_time(service_date, departure_secs),
-                arrival_time: format_service_time(service_date, arrival_secs),
-                duration_seconds: duration_secs,
-                from_stop: self.query_stop_result(from_stop, overlay),
-                to_stop: self.query_stop_result(to_stop, overlay),
-                trip_gid: None,
-                route_gid: None,
-                trip_id: None,
-                route_id: None,
-                route_label: None,
-                route_type: None,
-                route_color: None,
-                route_text_color: None,
-                headsign: None,
-                walk_distance_meters: Some(distance_meters),
-                delay_applied_seconds: None,
-                polyline: self.query_walk_polyline(from_stop, to_stop, overlay),
-            }),
+            } => {
+                let geometry = self.query_walk_geometry(from_stop, to_stop, overlay);
+                let from_result = self.query_stop_result(from_stop, overlay);
+                let to_result = self.query_stop_result(to_stop, overlay);
+                Ok(LegResponse {
+                    kind: "walk",
+                    departure_time: format_service_time(service_date, departure_secs),
+                    arrival_time: format_service_time(service_date, arrival_secs),
+                    duration_seconds: duration_secs,
+                    from_stop: from_result,
+                    to_stop: to_result.clone(),
+                    trip_gid: None,
+                    route_gid: None,
+                    trip_id: None,
+                    route_id: None,
+                    route_label: None,
+                    route_type: None,
+                    route_color: None,
+                    route_text_color: None,
+                    headsign: None,
+                    walk_distance_meters: Some(distance_meters),
+                    delay_applied_seconds: None,
+                    intermediate_stops: Vec::new(),
+                    polyline: geometry.polyline.clone(),
+                    walk_directions: build_walk_directions(
+                        &geometry,
+                        self.walk_way_names.as_ref(),
+                        to_result.name.as_str(),
+                    ),
+                })
+            }
             RawLeg::Transit {
                 trip_index,
                 board_stop,
@@ -3857,6 +4011,7 @@ impl Engine {
                 let cold_route = self.cold_route_record(trip.route_index);
                 let scheduled_departure = trip.stop_times[board_pos].departure_secs;
                 let delay_applied_seconds = departure_secs - scheduled_departure;
+                let intermediate_stops = self.trip_intermediate_stops(trip, board_pos, alight_pos);
                 Ok(LegResponse {
                     kind: "transit",
                     departure_time: format_service_time(service_date, departure_secs),
@@ -3875,10 +4030,24 @@ impl Engine {
                     headsign: cold_trip.headsign.clone(),
                     walk_distance_meters: None,
                     delay_applied_seconds: Some(delay_applied_seconds),
+                    intermediate_stops,
                     polyline: self.trip_polyline(trip, board_pos, alight_pos),
+                    walk_directions: Vec::new(),
                 })
             }
         }
+    }
+
+    fn trip_intermediate_stops(
+        &self,
+        trip: &TripRecord,
+        board_pos: usize,
+        alight_pos: usize,
+    ) -> Vec<StopSearchResult> {
+        intermediate_trip_stop_times(trip, board_pos, alight_pos)
+            .iter()
+            .map(|stop_time| self.stop_result(stop_time.stop_index))
+            .collect()
     }
 
     fn trip_polyline(
@@ -3944,27 +4113,30 @@ impl Engine {
             .unwrap_or_else(|| self.stop_result(stop_index))
     }
 
-    fn query_walk_polyline(
+    fn query_walk_geometry(
         &self,
         from_stop: usize,
         to_stop: usize,
         overlay: &QueryOverlay,
-    ) -> Vec<PolylinePoint> {
+    ) -> WalkGeometry {
         if let Some(edge) = overlay.virtual_walks.get(&(from_stop, to_stop)) {
-            return edge.polyline.clone();
+            return WalkGeometry {
+                polyline: edge.polyline.clone(),
+                segment_way_ids: edge.segment_way_ids.clone(),
+            };
         }
         if from_stop < self.static_data.stops.len() && to_stop < self.static_data.stops.len() {
-            return self.walk_transfer_polyline(from_stop, to_stop);
+            return self.walk_transfer_geometry(from_stop, to_stop);
         }
 
         let Some((from_lat, from_lon)) = self.query_stop_coordinates(from_stop, overlay) else {
-            return Vec::new();
+            return WalkGeometry::default();
         };
         let Some((to_lat, to_lon)) = self.query_stop_coordinates(to_stop, overlay) else {
-            return Vec::new();
+            return WalkGeometry::default();
         };
 
-        vec![
+        let polyline = vec![
             PolylinePoint {
                 lat: from_lat,
                 lon: from_lon,
@@ -3973,7 +4145,11 @@ impl Engine {
                 lat: to_lat,
                 lon: to_lon,
             },
-        ]
+        ];
+        WalkGeometry {
+            segment_way_ids: empty_segment_way_ids(&polyline),
+            polyline,
+        }
     }
 
     fn query_stop_coordinates(
@@ -4016,17 +4192,24 @@ impl Engine {
         bail!("stop not found")
     }
 
-    fn walk_transfer_polyline(&self, from_stop: usize, to_stop: usize) -> Vec<PolylinePoint> {
+    fn walk_transfer_geometry(&self, from_stop: usize, to_stop: usize) -> WalkGeometry {
         self.static_data.transfers[from_stop]
             .iter()
             .find(|transfer| transfer.to_stop == to_stop)
-            .map(|transfer| transfer.polyline.clone())
-            .filter(|polyline| polyline.len() >= 2)
+            .map(|transfer| WalkGeometry {
+                polyline: transfer.polyline.clone(),
+                segment_way_ids: transfer.segment_way_ids.clone(),
+            })
+            .filter(|geometry| geometry.polyline.len() >= 2)
             .unwrap_or_else(|| {
-                straight_polyline(
+                let polyline = straight_polyline(
                     &self.static_data.stops[from_stop],
                     &self.static_data.stops[to_stop],
-                )
+                );
+                WalkGeometry {
+                    segment_way_ids: empty_segment_way_ids(&polyline),
+                    polyline,
+                }
             })
     }
 
@@ -4078,6 +4261,11 @@ impl Engine {
             if stop_seen.insert(leg.to_stop.global_id) {
                 entities.stops.push(leg.to_stop.clone());
             }
+            for stop in &leg.intermediate_stops {
+                if stop_seen.insert(stop.global_id) {
+                    entities.stops.push(stop.clone());
+                }
+            }
 
             if let (Some(route_gid), Some(route_id), Some(route_label), Some(route_type)) = (
                 leg.route_gid,
@@ -4117,6 +4305,12 @@ impl Engine {
                 index
             };
 
+            let intermediate_stop_gids = leg
+                .intermediate_stops
+                .iter()
+                .map(|stop| stop.global_id)
+                .collect();
+
             deferred_legs.push(DeferredLegRef {
                 kind: leg.kind,
                 departure_time: leg.departure_time.clone(),
@@ -4129,7 +4323,9 @@ impl Engine {
                 headsign: leg.headsign.clone(),
                 walk_distance_meters: leg.walk_distance_meters,
                 delay_applied_seconds: leg.delay_applied_seconds,
+                intermediate_stop_gids,
                 polyline_index,
+                walk_directions: leg.walk_directions.clone(),
             });
         }
 
@@ -6368,6 +6564,254 @@ fn line_trip_index_at_temporal_position(
     line.trip_indices.get(physical_position).copied()
 }
 
+fn empty_segment_way_ids(polyline: &[PolylinePoint]) -> Vec<Option<i64>> {
+    vec![None; polyline.len().saturating_sub(1)]
+}
+
+fn normalize_segment_way_ids(
+    polyline: &[PolylinePoint],
+    segment_way_ids: &[Option<i64>],
+) -> Vec<Option<i64>> {
+    let target_len = polyline.len().saturating_sub(1);
+    let mut normalized = segment_way_ids
+        .iter()
+        .copied()
+        .take(target_len)
+        .collect::<Vec<_>>();
+    if normalized.len() < target_len {
+        normalized.resize(target_len, None);
+    }
+    normalized
+}
+
+fn stitch_walk_geometries(geometries: &[WalkGeometry]) -> WalkGeometry {
+    let mut stitched = WalkGeometry::default();
+
+    for (index, geometry) in geometries.iter().enumerate() {
+        let trimmed = trim_walk_geometry_for_stitch(
+            geometry,
+            index > 0,
+            index + 1 < geometries.len(),
+        );
+        append_walk_geometry(&mut stitched, &trimmed);
+    }
+
+    stitched.segment_way_ids =
+        normalize_segment_way_ids(&stitched.polyline, &stitched.segment_way_ids);
+    stitched
+}
+
+fn trim_walk_geometry_for_stitch(
+    geometry: &WalkGeometry,
+    trim_head: bool,
+    trim_tail: bool,
+) -> WalkGeometry {
+    let mut polyline = geometry.polyline.clone();
+    let mut segment_way_ids = normalize_segment_way_ids(&polyline, &geometry.segment_way_ids);
+
+    if trim_head && polyline.len() > 1 {
+        polyline.remove(0);
+        if !segment_way_ids.is_empty() {
+            segment_way_ids.remove(0);
+        }
+    }
+    if trim_tail && polyline.len() > 1 {
+        polyline.pop();
+        segment_way_ids.pop();
+    }
+
+    WalkGeometry {
+        polyline,
+        segment_way_ids,
+    }
+}
+
+fn append_walk_geometry(target: &mut WalkGeometry, next: &WalkGeometry) {
+    if next.polyline.is_empty() {
+        return;
+    }
+
+    let next_segment_way_ids = normalize_segment_way_ids(&next.polyline, &next.segment_way_ids);
+    if target.polyline.is_empty() {
+        target.polyline = next.polyline.clone();
+        target.segment_way_ids = next_segment_way_ids;
+        return;
+    }
+
+    if points_equal(
+        target.polyline.last().expect("target polyline must be non-empty"),
+        &next.polyline[0],
+    ) {
+        target.polyline.extend(next.polyline.iter().skip(1).cloned());
+        target.segment_way_ids.extend(next_segment_way_ids);
+        return;
+    }
+
+    target.segment_way_ids.push(None);
+    target.polyline.extend(next.polyline.iter().cloned());
+    target.segment_way_ids.extend(next_segment_way_ids);
+}
+
+fn build_walk_directions(
+    geometry: &WalkGeometry,
+    way_names: &HashMap<i64, String>,
+    destination_name: &str,
+) -> Vec<WalkDirection> {
+    if geometry.polyline.len() < 2 {
+        return Vec::new();
+    }
+
+    let segment_way_ids = normalize_segment_way_ids(&geometry.polyline, &geometry.segment_way_ids);
+    let cumulative_distances = cumulative_polyline_distances(&geometry.polyline);
+    let start_street_name = segment_way_ids
+        .iter()
+        .find_map(|way_id| road_label_for_way(*way_id, way_names))
+        .map(str::to_owned);
+
+    let mut directions = vec![WalkDirection {
+        maneuver: "depart",
+        instruction: match start_street_name.as_ref() {
+            Some(street_name) => format!("Parti a piedi su {street_name}"),
+            None => "Parti a piedi".to_owned(),
+        },
+        street_name: start_street_name,
+        distance_meters: 0.0,
+        lat: geometry.polyline[0].lat,
+        lon: geometry.polyline[0].lon,
+    }];
+
+    for pivot in 1..geometry.polyline.len().saturating_sub(1) {
+        let previous_way_id = segment_way_ids[pivot - 1];
+        let next_way_id = segment_way_ids[pivot];
+        if previous_way_id.is_none()
+            || next_way_id.is_none()
+            || same_road_identity(previous_way_id, next_way_id, way_names)
+        {
+            continue;
+        }
+
+        let maneuver = classify_walk_turn(
+            &geometry.polyline[pivot - 1],
+            &geometry.polyline[pivot],
+            &geometry.polyline[pivot + 1],
+        );
+        let street_name = road_label_for_way(next_way_id, way_names).map(str::to_owned);
+        let instruction = match maneuver {
+            "turn-left" => match street_name.as_ref() {
+                Some(street_name) => format!("Svolta a sinistra su {street_name}"),
+                None => "Svolta a sinistra".to_owned(),
+            },
+            "turn-right" => match street_name.as_ref() {
+                Some(street_name) => format!("Svolta a destra su {street_name}"),
+                None => "Svolta a destra".to_owned(),
+            },
+            _ => match street_name.as_ref() {
+                Some(street_name) => format!("Continua dritto su {street_name}"),
+                None => "Continua dritto".to_owned(),
+            },
+        };
+
+        directions.push(WalkDirection {
+            maneuver,
+            instruction,
+            street_name,
+            distance_meters: cumulative_distances[pivot],
+            lat: geometry.polyline[pivot].lat,
+            lon: geometry.polyline[pivot].lon,
+        });
+    }
+
+    let destination_label = destination_name.trim();
+    directions.push(WalkDirection {
+        maneuver: "arrive",
+        instruction: if destination_label.is_empty() {
+            "Arrivo a destinazione".to_owned()
+        } else {
+            format!("Arrivo a {destination_label}")
+        },
+        street_name: None,
+        distance_meters: *cumulative_distances.last().unwrap_or(&0.0),
+        lat: geometry.polyline.last().map(|point| point.lat).unwrap_or(0.0),
+        lon: geometry.polyline.last().map(|point| point.lon).unwrap_or(0.0),
+    });
+
+    directions
+}
+
+fn cumulative_polyline_distances(polyline: &[PolylinePoint]) -> Vec<f64> {
+    let mut cumulative = Vec::with_capacity(polyline.len());
+    let mut total = 0.0;
+    cumulative.push(0.0);
+
+    for window in polyline.windows(2) {
+        total += haversine_meters(window[0].lat, window[0].lon, window[1].lat, window[1].lon);
+        cumulative.push(total);
+    }
+
+    cumulative
+}
+
+fn classify_walk_turn(
+    from: &PolylinePoint,
+    pivot: &PolylinePoint,
+    to: &PolylinePoint,
+) -> &'static str {
+    let longitude_scale = pivot.lat.to_radians().cos();
+    let v1x = (pivot.lon - from.lon) * longitude_scale;
+    let v1y = pivot.lat - from.lat;
+    let v2x = (to.lon - pivot.lon) * longitude_scale;
+    let v2y = to.lat - pivot.lat;
+
+    if (v1x.abs() + v1y.abs()) <= f64::EPSILON || (v2x.abs() + v2y.abs()) <= f64::EPSILON {
+        return "continue";
+    }
+
+    let cross = (v1x * v2y) - (v1y * v2x);
+    let dot = (v1x * v2x) + (v1y * v2y);
+    let angle_degrees = cross.abs().atan2(dot).to_degrees();
+
+    if angle_degrees < WALK_TURN_STRAIGHT_ANGLE_DEGREES {
+        "continue"
+    } else if cross > 0.0 {
+        "turn-left"
+    } else {
+        "turn-right"
+    }
+}
+
+fn road_label_for_way<'a>(
+    way_id: Option<i64>,
+    way_names: &'a HashMap<i64, String>,
+) -> Option<&'a str> {
+    way_id
+        .and_then(|way_id| way_names.get(&way_id))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn same_road_identity(
+    previous_way_id: Option<i64>,
+    next_way_id: Option<i64>,
+    way_names: &HashMap<i64, String>,
+) -> bool {
+    match (previous_way_id, next_way_id) {
+        (Some(previous), Some(next)) if previous == next => true,
+        (Some(previous), Some(next)) => match (way_names.get(&previous), way_names.get(&next)) {
+            (Some(previous_name), Some(next_name)) => {
+                previous_name.trim().eq_ignore_ascii_case(next_name.trim())
+            }
+            _ => false,
+        },
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn points_equal(left: &PolylinePoint, right: &PolylinePoint) -> bool {
+    (left.lat - right.lat).abs() <= 1e-7 && (left.lon - right.lon).abs() <= 1e-7
+}
+
 fn build_full_walker_matrix(config: &EngineConfig, stops: &[StopRecord]) -> WalkerBuildResult {
     match build_or_load_walker_transfers(
         &config.osm_pbf_path,
@@ -6662,6 +7106,7 @@ fn rebuild_differential_walker_transfers(
 
     Ok(WalkerBuildResult {
         transfers,
+        way_names: HashMap::new(),
         strategy: "osm-pbf-differential-local-rebuild",
         cache_hit: false,
         graph_nodes: subset.graph_nodes,
@@ -6929,11 +7374,13 @@ fn build_haversine_transfers(
                 candidate_stop.longitude.unwrap_or(longitude),
             );
             if distance <= walk_radius_meters {
+                let polyline = straight_polyline(origin, candidate_stop);
                 neighbours.push(WalkTransfer {
                     to_stop: candidate.index,
                     duration_secs: (distance / walk_speed_mps).ceil() as i32,
                     distance_meters: distance,
-                    polyline: straight_polyline(origin, candidate_stop),
+                    segment_way_ids: empty_segment_way_ids(&polyline),
+                    polyline,
                 });
             }
         }
@@ -7170,6 +7617,20 @@ fn straight_polyline(from: &StopRecord, to: &StopRecord) -> Vec<PolylinePoint> {
     }
 }
 
+fn intermediate_trip_stop_times(
+    trip: &TripRecord,
+    board_pos: usize,
+    alight_pos: usize,
+) -> &[TripStopRecord] {
+    let start_pos = board_pos.saturating_add(1).min(trip.stop_times.len());
+    let end_pos = alight_pos.min(trip.stop_times.len());
+    if start_pos >= end_pos {
+        return &trip.stop_times[0..0];
+    }
+
+    &trip.stop_times[start_pos..end_pos]
+}
+
 fn shape_polyline_segment(
     shape: &[ShapePoint],
     stops: &[StopRecord],
@@ -7309,11 +7770,15 @@ fn push_polyline_point(polyline: &mut Vec<PolylinePoint>, lat: f64, lon: f64) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        CHRONOS_BUCKET_SECS, LineRecord, RemoteStaticGtfsVersionMetadata, ShapePoint, StopRecord,
-        TripRecord, TripStopRecord, WalkTransfer, build_chronos_bucket_start_indices,
-        build_shape_stop_point_indices, build_transfer_relax_index, finalize_line_temporal_indices,
-        remote_static_gtfs_version_changed, shape_polyline_segment,
+        CHRONOS_BUCKET_SECS, LineRecord, PolylinePoint, RemoteStaticGtfsVersionMetadata,
+        ShapePoint, StopRecord, TripRecord, TripStopRecord, WalkGeometry, WalkTransfer,
+        build_chronos_bucket_start_indices, build_shape_stop_point_indices,
+        build_transfer_relax_index, build_walk_directions, finalize_line_temporal_indices,
+        intermediate_trip_stop_times, remote_static_gtfs_version_changed,
+        shape_polyline_segment, stitch_walk_geometries,
         svrt_chunk_has_catchup_candidate_scalar,
     };
 
@@ -7496,12 +7961,14 @@ mod tests {
                 duration_secs: 90,
                 distance_meters: 120.0,
                 polyline: Vec::new(),
+                segment_way_ids: Vec::new(),
             }],
             vec![WalkTransfer {
                 to_stop: 3,
                 duration_secs: 60,
                 distance_meters: 80.0,
                 polyline: Vec::new(),
+                segment_way_ids: Vec::new(),
             }],
             Vec::new(),
             Vec::new(),
@@ -7744,6 +8211,135 @@ mod tests {
         assert_eq!(polyline.last().unwrap().lat, 41.0101);
     }
 
+    #[test]
+    fn intermediate_trip_stop_times_return_only_stops_between_board_and_alight() {
+        let trip = TripRecord {
+            global_id: 1,
+            feed_index: 0,
+            feed_id: "feed".to_owned(),
+            local_id: "trip-3".to_owned(),
+            id: "feed:trip-3".to_owned(),
+            route_index: 0,
+            shape_id: None,
+            shape_stop_point_indices: None,
+            headsign: None,
+            stop_times: vec![
+                TripStopRecord {
+                    stop_index: 10,
+                    arrival_secs: 0,
+                    departure_secs: 0,
+                    stop_sequence: 1,
+                    shape_dist_traveled: None,
+                },
+                TripStopRecord {
+                    stop_index: 11,
+                    arrival_secs: 60,
+                    departure_secs: 60,
+                    stop_sequence: 2,
+                    shape_dist_traveled: None,
+                },
+                TripStopRecord {
+                    stop_index: 12,
+                    arrival_secs: 120,
+                    departure_secs: 120,
+                    stop_sequence: 3,
+                    shape_dist_traveled: None,
+                },
+                TripStopRecord {
+                    stop_index: 13,
+                    arrival_secs: 180,
+                    departure_secs: 180,
+                    stop_sequence: 4,
+                    shape_dist_traveled: None,
+                },
+            ],
+        };
+
+        let intermediate = intermediate_trip_stop_times(&trip, 0, 3)
+            .iter()
+            .map(|stop_time| stop_time.stop_index)
+            .collect::<Vec<_>>();
+
+        assert_eq!(intermediate, vec![11, 12]);
+        assert!(intermediate_trip_stop_times(&trip, 1, 2).is_empty());
+    }
+
+    #[test]
+    fn stitch_walk_geometries_removes_intermediate_stop_spike() {
+        let stitched = stitch_walk_geometries(&[
+            WalkGeometry {
+                polyline: vec![
+                    test_point(41.9000, 12.5000),
+                    test_point(41.9000, 12.5005),
+                    test_point(41.9000, 12.5010),
+                ],
+                segment_way_ids: vec![Some(10), None],
+            },
+            WalkGeometry {
+                polyline: vec![
+                    test_point(41.9000, 12.5010),
+                    test_point(41.9000, 12.5005),
+                    test_point(41.9005, 12.5005),
+                ],
+                segment_way_ids: vec![None, Some(20)],
+            },
+        ]);
+
+        assert_eq!(stitched.polyline.len(), 3);
+        assert_eq!(stitched.polyline[0].lon, 12.5000);
+        assert_eq!(stitched.polyline[1].lon, 12.5005);
+        assert_eq!(stitched.polyline[2].lat, 41.9005);
+        assert_eq!(stitched.segment_way_ids, vec![Some(10), Some(20)]);
+    }
+
+    #[test]
+    fn build_walk_directions_emits_left_turn_for_named_road_change() {
+        let mut way_names = HashMap::new();
+        way_names.insert(10, "Via Lambrate".to_owned());
+        way_names.insert(20, "Via D'Annunzio".to_owned());
+
+        let directions = build_walk_directions(
+            &WalkGeometry {
+                polyline: vec![
+                    test_point(41.9000, 12.5000),
+                    test_point(41.9000, 12.5010),
+                    test_point(41.9010, 12.5010),
+                ],
+                segment_way_ids: vec![Some(10), Some(20)],
+            },
+            &way_names,
+            "Destinazione",
+        );
+
+        assert_eq!(directions.len(), 3);
+        assert_eq!(directions[1].maneuver, "turn-left");
+        assert!(directions[1].instruction.contains("Via D'Annunzio"));
+    }
+
+    #[test]
+    fn build_walk_directions_ignores_same_name_way_splits() {
+        let mut way_names = HashMap::new();
+        way_names.insert(10, "Via Lambrate".to_owned());
+        way_names.insert(11, "Via Lambrate".to_owned());
+
+        let directions = build_walk_directions(
+            &WalkGeometry {
+                polyline: vec![
+                    test_point(41.9000, 12.5000),
+                    test_point(41.9000, 12.5010),
+                    test_point(41.9010, 12.5010),
+                ],
+                segment_way_ids: vec![Some(10), Some(11)],
+            },
+            &way_names,
+            "Destinazione",
+        );
+
+        assert_eq!(directions.len(), 2);
+        assert_eq!(directions[0].maneuver, "depart");
+        assert_eq!(directions[1].maneuver, "arrive");
+    }
+
     fn test_stop(global_id: u64, local_id: &str, latitude: f64, longitude: f64) -> StopRecord {
         StopRecord {
             global_id,
@@ -7757,5 +8353,9 @@ mod tests {
             longitude: Some(longitude),
             search_blob: String::new(),
         }
+    }
+
+    fn test_point(lat: f64, lon: f64) -> PolylinePoint {
+        PolylinePoint { lat, lon }
     }
 }

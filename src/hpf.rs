@@ -100,6 +100,7 @@ pub struct HpfConnector {
     pub duration_secs: i32,
     pub distance_meters: f64,
     pub polyline: Vec<PolylinePoint>,
+    pub segment_way_ids: Vec<Option<i64>>,
     pub used_asymptotic_penalty: bool,
 }
 
@@ -107,6 +108,7 @@ pub struct HpfConnector {
 pub(crate) struct HpfNode {
     morton: u64,
     parent_index: u32,
+    parent_way_id: i64,
     root_stop_index: u32,
     cost_meters: f32,
 }
@@ -228,6 +230,7 @@ struct StopAnchor {
 struct PedestrianEdge {
     to: usize,
     distance_meters: f64,
+    way_id: i64,
 }
 
 #[derive(Clone)]
@@ -240,6 +243,12 @@ struct IndexedPoint {
 struct HeapState {
     node_index: usize,
     distance_meters: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ForestParent {
+    parent_index: usize,
+    way_id: i64,
 }
 
 #[derive(Clone)]
@@ -578,13 +587,19 @@ impl HolographicPedestrianForest {
             .filter_map(|candidate| {
                 let stop = stops.get(candidate.stop_index)?;
                 let (stop_lat, stop_lon) = (stop.latitude?, stop.longitude?);
+                let (polyline, segment_way_ids) = self.reconstruct_candidate_geometry(
+                    &candidate,
+                    latitude,
+                    longitude,
+                    stop_lat,
+                    stop_lon,
+                );
                 Some(HpfConnector {
                     stop_index: candidate.stop_index,
                     duration_secs: (candidate.distance_meters / self.walk_speed_mps).ceil() as i32,
                     distance_meters: candidate.distance_meters,
-                    polyline: self.reconstruct_candidate_polyline(
-                        &candidate, latitude, longitude, stop_lat, stop_lon,
-                    ),
+                    polyline,
+                    segment_way_ids,
                     used_asymptotic_penalty: candidate.used_asymptotic_penalty,
                 })
             })
@@ -705,57 +720,107 @@ impl HolographicPedestrianForest {
         );
     }
 
-    fn reconstruct_candidate_polyline(
+    fn reconstruct_candidate_geometry(
         &self,
         candidate: &CandidateConnector,
         query_lat: f64,
         query_lon: f64,
         stop_lat: f64,
         stop_lon: f64,
-    ) -> Vec<PolylinePoint> {
-        let mut polyline = vec![PolylinePoint {
-            lat: query_lat,
-            lon: query_lon,
-        }];
+    ) -> (Vec<PolylinePoint>, Vec<Option<i64>>) {
+        let mut polyline = Vec::<PolylinePoint>::new();
+        let mut segment_way_ids = Vec::<Option<i64>>::new();
+        push_walk_geometry_point(
+            &mut polyline,
+            &mut segment_way_ids,
+            query_lat,
+            query_lon,
+            None,
+        );
 
         match candidate.location {
-            CandidateLocation::BaseNode(index) => self.reconstruct_base_tail(index, &mut polyline),
+            CandidateLocation::BaseNode(index) => {
+                self.reconstruct_base_tail(index, &mut polyline, &mut segment_way_ids)
+            }
             CandidateLocation::OverlayCell(cell) => {
-                self.reconstruct_overlay_tail(cell, &mut polyline)
+                self.reconstruct_overlay_tail(cell, &mut polyline, &mut segment_way_ids)
             }
         }
 
-        push_polyline_point(&mut polyline, stop_lat, stop_lon);
-        polyline
+        push_walk_geometry_point(
+            &mut polyline,
+            &mut segment_way_ids,
+            stop_lat,
+            stop_lon,
+            None,
+        );
+        (polyline, segment_way_ids)
     }
 
-    fn reconstruct_base_tail(&self, start_index: usize, polyline: &mut Vec<PolylinePoint>) {
+    fn reconstruct_base_tail(
+        &self,
+        start_index: usize,
+        polyline: &mut Vec<PolylinePoint>,
+        segment_way_ids: &mut Vec<Option<i64>>,
+    ) {
         let overlay = self.overlay_runtime.load_full();
         let start_cell = overlay_cell_from_morton(self.nodes[start_index].morton);
         if overlay.entry_lookup.contains_key(&start_cell) {
-            self.reconstruct_overlay_tail_from_runtime(&overlay, start_cell, polyline);
+            self.reconstruct_overlay_tail_from_runtime(
+                &overlay,
+                start_cell,
+                polyline,
+                segment_way_ids,
+            );
             return;
         }
 
-        self.reconstruct_base_tail_raw(start_index, polyline);
+        self.reconstruct_base_tail_raw(start_index, polyline, segment_way_ids);
     }
 
-    fn reconstruct_base_tail_raw(&self, start_index: usize, polyline: &mut Vec<PolylinePoint>) {
+    fn reconstruct_base_tail_raw(
+        &self,
+        start_index: usize,
+        polyline: &mut Vec<PolylinePoint>,
+        segment_way_ids: &mut Vec<Option<i64>>,
+    ) {
         let mut cursor = start_index;
+        let start = &self.nodes[cursor];
+        let (start_lat, start_lon) = decode_morton_code(start.morton);
+        push_walk_geometry_point(polyline, segment_way_ids, start_lat, start_lon, None);
+
         loop {
             let node = &self.nodes[cursor];
-            let (lat, lon) = decode_morton_code(node.morton);
-            push_polyline_point(polyline, lat, lon);
             if node.parent_index == u32::MAX {
                 break;
             }
-            cursor = node.parent_index as usize;
+
+            let parent_index = node.parent_index as usize;
+            let parent = &self.nodes[parent_index];
+            let (parent_lat, parent_lon) = decode_morton_code(parent.morton);
+            let parent_way_id = (node.parent_way_id != i64::MIN).then_some(node.parent_way_id);
+            push_walk_geometry_point(
+                polyline,
+                segment_way_ids,
+                parent_lat,
+                parent_lon,
+                parent_way_id,
+            );
+            cursor = parent_index;
+            if parent.parent_index == u32::MAX {
+                break;
+            }
         }
     }
 
-    fn reconstruct_overlay_tail(&self, start_cell: u64, polyline: &mut Vec<PolylinePoint>) {
+    fn reconstruct_overlay_tail(
+        &self,
+        start_cell: u64,
+        polyline: &mut Vec<PolylinePoint>,
+        segment_way_ids: &mut Vec<Option<i64>>,
+    ) {
         let overlay = self.overlay_runtime.load_full();
-        self.reconstruct_overlay_tail_from_runtime(&overlay, start_cell, polyline);
+        self.reconstruct_overlay_tail_from_runtime(&overlay, start_cell, polyline, segment_way_ids);
     }
 
     fn reconstruct_overlay_tail_from_runtime(
@@ -763,6 +828,7 @@ impl HolographicPedestrianForest {
         overlay: &HpfOverlayRuntime,
         start_cell: u64,
         polyline: &mut Vec<PolylinePoint>,
+        segment_way_ids: &mut Vec<Option<i64>>,
     ) {
         let mut cursor = Some(start_cell);
         let mut visited = HashSet::<u64>::new();
@@ -773,7 +839,7 @@ impl HolographicPedestrianForest {
             }
 
             let (lat, lon) = overlay_cell_center(cell);
-            push_polyline_point(polyline, lat, lon);
+            push_walk_geometry_point(polyline, segment_way_ids, lat, lon, None);
 
             let next = self
                 .overlay_entry(overlay, cell)
@@ -784,7 +850,7 @@ impl HolographicPedestrianForest {
 
             if !overlay.entry_lookup.contains_key(&next_cell) {
                 if let Some(base_index) = self.best_base_node_index_for_cell(next_cell) {
-                    self.reconstruct_base_tail_raw(base_index, polyline);
+                    self.reconstruct_base_tail_raw(base_index, polyline, segment_way_ids);
                     break;
                 }
             }
@@ -1378,6 +1444,7 @@ fn build_hpf_cache_from_data(
                     graph_coordinates[graph_index].1,
                 ),
                 parent_index: u32::MAX,
+                parent_way_id: i64::MIN,
                 root_stop_index,
                 cost_meters: best_distance as f32,
             },
@@ -1398,9 +1465,10 @@ fn build_hpf_cache_from_data(
     let nodes = nodes
         .into_iter()
         .map(|(graph_index, mut node)| {
-            if let Some(parent_graph_index) = parents.get(&graph_index).copied() {
-                if let Some(parent_hpf_index) = graph_to_hpf.get(&parent_graph_index).copied() {
+            if let Some(parent) = parents.get(&graph_index).copied() {
+                if let Some(parent_hpf_index) = graph_to_hpf.get(&parent.parent_index).copied() {
                     node.parent_index = parent_hpf_index;
+                    node.parent_way_id = parent.way_id;
                 }
             }
             node
@@ -1418,10 +1486,10 @@ fn multi_source_forest(
     graph_edges: &[Vec<PedestrianEdge>],
     stop_anchors: &[Option<StopAnchor>],
     max_distance_meters: f64,
-) -> (Vec<f64>, Vec<u32>, HashMap<usize, usize>) {
+) -> (Vec<f64>, Vec<u32>, HashMap<usize, ForestParent>) {
     let mut best_distances = vec![f64::INFINITY; graph_edges.len()];
     let mut roots = vec![u32::MAX; graph_edges.len()];
-    let mut parents = HashMap::<usize, usize>::new();
+    let mut parents = HashMap::<usize, ForestParent>::new();
     let mut heap = BinaryHeap::<HeapState>::new();
 
     for (stop_index, anchor) in stop_anchors.iter().enumerate() {
@@ -1473,7 +1541,13 @@ fn multi_source_forest(
             if should_update {
                 best_distances[edge.to] = candidate_distance;
                 roots[edge.to] = root_stop;
-                parents.insert(edge.to, state.node_index);
+                parents.insert(
+                    edge.to,
+                    ForestParent {
+                        parent_index: state.node_index,
+                        way_id: edge.way_id,
+                    },
+                );
                 heap.push(HeapState {
                     node_index: edge.to,
                     distance_meters: candidate_distance,
@@ -1530,10 +1604,12 @@ fn build_pedestrian_graph(
             graph_edges[from_index].push(PedestrianEdge {
                 to: to_index,
                 distance_meters,
+                way_id: way.id.0,
             });
             graph_edges[to_index].push(PedestrianEdge {
                 to: from_index,
                 distance_meters,
+                way_id: way.id.0,
             });
         }
     }
@@ -2520,11 +2596,20 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(array)
 }
 
-fn push_polyline_point(polyline: &mut Vec<PolylinePoint>, lat: f64, lon: f64) {
+fn push_walk_geometry_point(
+    polyline: &mut Vec<PolylinePoint>,
+    segment_way_ids: &mut Vec<Option<i64>>,
+    lat: f64,
+    lon: f64,
+    incoming_way_id: Option<i64>,
+) {
     let should_push = polyline
         .last()
         .is_none_or(|last| (last.lat - lat).abs() > 1e-7 || (last.lon - lon).abs() > 1e-7);
     if should_push {
+        if !polyline.is_empty() {
+            segment_way_ids.push(incoming_way_id);
+        }
         polyline.push(PolylinePoint { lat, lon });
     }
 }
@@ -2629,12 +2714,14 @@ mod tests {
             HpfNode {
                 morton: morton_code(41.9000, 12.5000),
                 parent_index: u32::MAX,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 100.0,
             },
             HpfNode {
                 morton: morton_code(41.9002, 12.5002),
                 parent_index: u32::MAX,
+                parent_way_id: i64::MIN,
                 root_stop_index: 1,
                 cost_meters: 80.0,
             },
@@ -2678,12 +2765,14 @@ mod tests {
             HpfNode {
                 morton: morton_code(41.9000, 12.5000),
                 parent_index: u32::MAX,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 17.79,
             },
             HpfNode {
                 morton: morton_code(41.9000, 12.5038),
                 parent_index: u32::MAX,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 527.93,
             },
@@ -2738,24 +2827,28 @@ mod tests {
             HpfNode {
                 morton: morton_code(41.9000, 12.5000),
                 parent_index: u32::MAX,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 0.0,
             },
             HpfNode {
                 morton: morton_code(41.9001, 12.5001),
                 parent_index: 0,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 12.0,
             },
             HpfNode {
                 morton: morton_code(41.9002, 12.5002),
                 parent_index: 1,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 24.0,
             },
             HpfNode {
                 morton: morton_code(41.9002, 12.5000),
                 parent_index: 0,
+                parent_way_id: i64::MIN,
                 root_stop_index: 0,
                 cost_meters: 18.0,
             },

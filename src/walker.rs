@@ -23,6 +23,7 @@ const FALLBACK_WALK_STRATEGY: &str = "fallback-radius-haversine";
 
 pub struct WalkerBuildResult {
     pub transfers: Vec<Vec<WalkTransfer>>,
+    pub way_names: HashMap<i64, String>,
     pub strategy: &'static str,
     pub cache_hit: bool,
     pub graph_nodes: usize,
@@ -34,6 +35,7 @@ impl WalkerBuildResult {
     pub fn fallback(transfers: Vec<Vec<WalkTransfer>>) -> Self {
         Self {
             transfers,
+            way_names: HashMap::new(),
             strategy: FALLBACK_WALK_STRATEGY,
             cache_hit: false,
             graph_nodes: 0,
@@ -57,6 +59,7 @@ struct WalkerCache {
     graph_edges: usize,
     anchored_stops: usize,
     transfers: Vec<Vec<WalkTransfer>>,
+    way_names: HashMap<i64, String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +82,13 @@ struct StopAnchor {
 struct PedestrianEdge {
     to: usize,
     distance_meters: f64,
+    way_id: i64,
+}
+
+#[derive(Clone, Copy)]
+struct PredecessorEdge {
+    previous: usize,
+    way_id: i64,
 }
 
 #[derive(Clone)]
@@ -161,6 +171,7 @@ pub fn build_or_load_walker_transfers(
         );
         return Ok(WalkerBuildResult {
             transfers: cache.transfers,
+            way_names: cache.way_names,
             strategy: OSM_WALK_STRATEGY,
             cache_hit: true,
             graph_nodes: cache.graph_nodes,
@@ -183,11 +194,13 @@ pub fn build_or_load_walker_transfers(
         graph_edges: built.graph_edges,
         anchored_stops: built.anchored_stops,
         transfers: built.transfers.clone(),
+        way_names: built.way_names.clone(),
     };
     store_cache(&cache_path, &cache)?;
 
     Ok(WalkerBuildResult {
         transfers: built.transfers,
+        way_names: built.way_names,
         strategy: OSM_WALK_STRATEGY,
         cache_hit: false,
         graph_nodes: built.graph_nodes,
@@ -309,6 +322,7 @@ pub fn rebuild_walker_transfers_subset(
 
 struct BuiltWalker {
     transfers: Vec<Vec<WalkTransfer>>,
+    way_names: HashMap<i64, String>,
     graph_nodes: usize,
     graph_edges: usize,
     anchored_stops: usize,
@@ -342,6 +356,7 @@ fn build_walker_from_osm(
         }
     }
 
+    let way_names = collect_way_names(&ways);
     let (graph_coordinates, graph_edges) = build_pedestrian_graph(&node_coordinates, &ways)?;
     if graph_coordinates.is_empty() {
         return Err(anyhow!(
@@ -420,6 +435,7 @@ fn build_walker_from_osm(
 
     Ok(BuiltWalker {
         transfers,
+        way_names,
         graph_nodes: graph_coordinates.len(),
         graph_edges: graph_edges.iter().map(Vec::len).sum::<usize>(),
         anchored_stops,
@@ -472,10 +488,12 @@ fn build_pedestrian_graph(
             graph_edges[from_index].push(PedestrianEdge {
                 to: to_index,
                 distance_meters,
+                way_id: way.id.0,
             });
             graph_edges[to_index].push(PedestrianEdge {
                 to: from_index,
                 distance_meters,
+                way_id: way.id.0,
             });
         }
     }
@@ -571,18 +589,21 @@ fn build_stop_transfers(
             continue;
         }
 
+        let (polyline, segment_way_ids) = build_walk_geometry(
+            source_stop,
+            &stops[target_stop],
+            source_anchor,
+            target_anchor,
+            graph_coordinates,
+            &predecessors,
+        );
+
         transfers.push(WalkTransfer {
             to_stop: target_stop,
             duration_secs: (total_distance / walk_speed_mps).ceil() as i32,
             distance_meters: total_distance,
-            polyline: build_walk_polyline(
-                source_stop,
-                &stops[target_stop],
-                source_anchor,
-                target_anchor,
-                graph_coordinates,
-                &predecessors,
-            ),
+            polyline,
+            segment_way_ids,
         });
     }
 
@@ -600,9 +621,9 @@ fn bounded_dijkstra(
     graph_edges: &[Vec<PedestrianEdge>],
     max_distance_meters: f64,
     target_nodes: &HashSet<usize>,
-) -> (HashMap<usize, f64>, HashMap<usize, usize>) {
+) -> (HashMap<usize, f64>, HashMap<usize, PredecessorEdge>) {
     let mut best_distances = HashMap::<usize, f64>::new();
-    let mut predecessors = HashMap::<usize, usize>::new();
+    let mut predecessors = HashMap::<usize, PredecessorEdge>::new();
     let mut remaining_targets = target_nodes.clone();
     let mut heap = BinaryHeap::<HeapState>::new();
 
@@ -640,7 +661,13 @@ fn bounded_dijkstra(
             };
             if should_update {
                 best_distances.insert(edge.to, candidate_distance);
-                predecessors.insert(edge.to, state.node_index);
+                predecessors.insert(
+                    edge.to,
+                    PredecessorEdge {
+                        previous: state.node_index,
+                        way_id: edge.way_id,
+                    },
+                );
                 heap.push(HeapState {
                     node_index: edge.to,
                     distance_meters: candidate_distance,
@@ -652,55 +679,100 @@ fn bounded_dijkstra(
     (best_distances, predecessors)
 }
 
-fn build_walk_polyline(
+fn build_walk_geometry(
     source_stop: &StopRecord,
     target_stop: &StopRecord,
     source_anchor: StopAnchor,
     target_anchor: StopAnchor,
     graph_coordinates: &[(f64, f64)],
-    predecessors: &HashMap<usize, usize>,
-) -> Vec<PolylinePoint> {
+    predecessors: &HashMap<usize, PredecessorEdge>,
+) -> (Vec<PolylinePoint>, Vec<Option<i64>>) {
     let mut polyline = Vec::<PolylinePoint>::new();
+    let mut segment_way_ids = Vec::<Option<i64>>::new();
 
     if let (Some(lat), Some(lon)) = (source_stop.latitude, source_stop.longitude) {
-        push_polyline_point(&mut polyline, lat, lon);
+        push_walk_geometry_point(&mut polyline, &mut segment_way_ids, lat, lon, None);
     }
 
     let mut node_path = Vec::<usize>::new();
+    let mut node_way_ids = Vec::<Option<i64>>::new();
     let mut cursor = target_anchor.node_index;
     node_path.push(cursor);
     while cursor != source_anchor.node_index {
-        let Some(previous) = predecessors.get(&cursor).copied() else {
-            return straight_polyline(source_stop, target_stop);
+        let Some(predecessor) = predecessors.get(&cursor).copied() else {
+            let polyline = straight_polyline(source_stop, target_stop);
+            return (polyline.clone(), empty_segment_way_ids(&polyline));
         };
-        cursor = previous;
+        cursor = predecessor.previous;
         node_path.push(cursor);
+        node_way_ids.push(Some(predecessor.way_id));
     }
     node_path.reverse();
+    node_way_ids.reverse();
 
-    for node_index in node_path {
+    for (offset, node_index) in node_path.into_iter().enumerate() {
         let (lat, lon) = graph_coordinates[node_index];
-        push_polyline_point(&mut polyline, lat, lon);
+        let incoming_way_id = if offset == 0 {
+            None
+        } else {
+            node_way_ids.get(offset - 1).copied().flatten()
+        };
+        push_walk_geometry_point(
+            &mut polyline,
+            &mut segment_way_ids,
+            lat,
+            lon,
+            incoming_way_id,
+        );
     }
 
     if let (Some(lat), Some(lon)) = (target_stop.latitude, target_stop.longitude) {
-        push_polyline_point(&mut polyline, lat, lon);
+        push_walk_geometry_point(&mut polyline, &mut segment_way_ids, lat, lon, None);
     }
 
     if polyline.len() >= 2 {
-        polyline
+        (polyline, segment_way_ids)
     } else {
-        straight_polyline(source_stop, target_stop)
+        let polyline = straight_polyline(source_stop, target_stop);
+        (polyline.clone(), empty_segment_way_ids(&polyline))
     }
 }
 
-fn push_polyline_point(polyline: &mut Vec<PolylinePoint>, lat: f64, lon: f64) {
+fn push_walk_geometry_point(
+    polyline: &mut Vec<PolylinePoint>,
+    segment_way_ids: &mut Vec<Option<i64>>,
+    lat: f64,
+    lon: f64,
+    incoming_way_id: Option<i64>,
+) {
     let should_push = polyline
         .last()
         .is_none_or(|last| (last.lat - lat).abs() > 1e-7 || (last.lon - lon).abs() > 1e-7);
     if should_push {
+        if !polyline.is_empty() {
+            segment_way_ids.push(incoming_way_id);
+        }
         polyline.push(PolylinePoint { lat, lon });
     }
+}
+
+fn empty_segment_way_ids(polyline: &[PolylinePoint]) -> Vec<Option<i64>> {
+    vec![None; polyline.len().saturating_sub(1)]
+}
+
+fn collect_way_names(ways: &[Way]) -> HashMap<i64, String> {
+    ways.iter()
+        .filter_map(|way| way_display_name(way).map(|name| (way.id.0, name)))
+        .collect()
+}
+
+fn way_display_name(way: &Way) -> Option<String> {
+    ["name", "official_name", "ref"]
+        .iter()
+        .find_map(|tag| way.tags.get(*tag))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn nearby_stop_candidates(
