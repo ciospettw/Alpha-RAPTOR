@@ -7,6 +7,7 @@ const state = {
   vehicleLayer: null,
   endpointLayer: null,
   mapSelectionTarget: "from",
+  selectedItineraryId: null,
   selectedEndpoints: {
     from: null,
     to: null,
@@ -35,6 +36,7 @@ const dom = {
   realtimeContainer: document.getElementById("realtimeContainer"),
   refreshRealtimeButton: document.getElementById("refreshRealtimeButton"),
   refreshStatus: document.getElementById("refreshStatus"),
+  itineraryOptions: document.getElementById("itineraryOptions"),
 };
 
 initialize();
@@ -145,11 +147,14 @@ async function onSubmitQuery(event) {
   try {
     const payload = await fetchJson(`/api/query?${search.toString()}`);
     state.query = payload;
+    state.selectedItineraryId = null;
     renderQuery();
   } catch (error) {
     state.query = null;
+    state.selectedItineraryId = null;
     dom.itinerarySummary.textContent = error.message;
     dom.itinerarySummary.className = "summary-strip error-strip";
+    dom.itineraryOptions.innerHTML = '<div class="empty-state">Nessuna alternativa.</div>';
     dom.legsContainer.innerHTML = '<div class="empty-state">Nessun itinerario.</div>';
     dom.traceContainer.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
     clearMapLayers();
@@ -411,14 +416,56 @@ function renderQuery() {
   }
 
   const summary = state.query;
+  const itineraries = normalizeQueryItineraries(summary);
+  const selected = selectActiveItinerary(itineraries);
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.innerHTML = `
     <div><strong>${escapeHtml(summary.from.name)}</strong> → <strong>${escapeHtml(summary.to.name)}</strong></div>
-    <div>${escapeHtml(summary.departure_time)} → ${escapeHtml(summary.arrival_time)}</div>
-    <div>${Math.round(summary.duration_seconds / 60)} min / ${summary.transfers} cambi / ${summary.trace.query_runtime_ms} ms</div>
+    <div>${escapeHtml(selected.departure_time)} → ${escapeHtml(selected.arrival_time)}</div>
+    <div>${Math.round(selected.duration_seconds / 60)} min / ${selected.transfers} cambi / ${summary.trace.query_runtime_ms} ms / ${itineraries.length} opzioni</div>
   `;
 
-  dom.legsContainer.innerHTML = summary.legs
+  dom.itineraryOptions.innerHTML = itineraries
+    .map((itinerary, index) => {
+      const badges = Array.isArray(itinerary.badges) && itinerary.badges.length
+        ? itinerary.badges
+            .map((badge, badgeIndex) => {
+              const badgeClass = badgeIndex === 0 ? "itinerary-badge" : "itinerary-badge secondary";
+              return `<span class="${badgeClass}">${escapeHtml(badge)}</span>`;
+            })
+            .join("")
+        : `<span class="itinerary-badge secondary">Alternativa ${index + 1}</span>`;
+      return `
+        <button
+          class="itinerary-option-card ${itinerary.id === selected.id ? "is-active" : ""}"
+          type="button"
+          data-itinerary-id="${escapeHtml(itinerary.id)}"
+        >
+          <div class="itinerary-option-head">
+            <div class="itinerary-option-title">
+              <strong>${escapeHtml(itinerary.label || `Alternativa ${index + 1}`)}</strong>
+              <div class="itinerary-option-badges">${badges}</div>
+            </div>
+            <strong>${Math.round(itinerary.duration_seconds / 60)} min</strong>
+          </div>
+          <div class="itinerary-option-metrics">
+            <span>${escapeHtml(itinerary.departure_time)} → ${escapeHtml(itinerary.arrival_time)}</span>
+            <span>${itinerary.transfers} cambi</span>
+            <span>${itinerary.legs.length} leg</span>
+          </div>
+        </button>
+      `;
+    })
+    .join("");
+
+  Array.from(dom.itineraryOptions.querySelectorAll(".itinerary-option-card")).forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedItineraryId = button.dataset.itineraryId || null;
+      renderQuery();
+    });
+  });
+
+  dom.legsContainer.innerHTML = selected.legs
     .map((leg) => {
       const walkDirections = leg.kind === "walk" && Array.isArray(leg.walk_directions)
         ? leg.walk_directions
@@ -505,7 +552,7 @@ function renderQuery() {
     </table>
   `;
 
-  drawQueryOnMap(summary);
+  drawQueryOnMap(selected);
 }
 
 function renderRealtime() {
@@ -553,11 +600,11 @@ function renderRealtime() {
   drawVehicles(payload.vehicles);
 }
 
-function drawQueryOnMap(query) {
+function drawQueryOnMap(itinerary) {
   clearMapLayers();
 
   const bounds = [];
-  query.legs.forEach((leg) => {
+  itinerary.legs.forEach((leg) => {
     if (leg.polyline.length < 2) {
       return;
     }
@@ -604,11 +651,56 @@ function clearMapLayers() {
 
 function markRouteStale(message) {
   state.query = null;
+  state.selectedItineraryId = null;
   clearMapLayers();
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.textContent = message || "Parametri aggiornati. Premi Route.";
+  dom.itineraryOptions.innerHTML = '<div class="empty-state">Nessuna alternativa.</div>';
   dom.legsContainer.innerHTML = '<div class="empty-state">Nessun itinerario.</div>';
   dom.traceContainer.innerHTML = '<div class="empty-state">Nessun trace disponibile.</div>';
+}
+
+function normalizeQueryItineraries(query) {
+  if (Array.isArray(query.itineraries) && query.itineraries.length) {
+    return query.itineraries;
+  }
+
+  return [
+    {
+      id: "primary",
+      label: "Piu veloce",
+      badges: ["Piu veloce"],
+      is_recommended: true,
+      is_fastest: true,
+      is_fewest_transfers: true,
+      departure_time: query.departure_time,
+      arrival_time: query.arrival_time,
+      duration_seconds: query.duration_seconds,
+      transfers: query.transfers,
+      legs: query.legs,
+      deferred_hydration: query.deferred_hydration,
+    },
+  ];
+}
+
+function selectActiveItinerary(itineraries) {
+  if (!itineraries.length) {
+    return {
+      id: "empty",
+      label: "Nessun itinerario",
+      badges: [],
+      departure_time: "-",
+      arrival_time: "-",
+      duration_seconds: 0,
+      transfers: 0,
+      legs: [],
+    };
+  }
+
+  const selected = itineraries.find((itinerary) => itinerary.id === state.selectedItineraryId);
+  const active = selected || itineraries[0];
+  state.selectedItineraryId = active.id;
+  return active;
 }
 
 function setRefreshStatus(text, busy) {

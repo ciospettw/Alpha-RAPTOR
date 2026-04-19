@@ -51,6 +51,8 @@ const DEFAULT_HPF_SNAP_TOLERANCE_METERS: f64 = 140.0;
 const DEFAULT_HPF_SNAP_QUADRATIC_KAPPA_METERS: f64 = 40.0;
 const DEFAULT_HPF_SEARCH_WINDOW: usize = 512;
 const DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS: u64 = 30 * 60;
+const DEFAULT_QUERY_ITINERARY_COUNT: usize = 5;
+const MAX_QUERY_ITINERARY_COUNT: usize = 6;
 const SVRT_WIDTH: usize = 8;
 const BTT_MIN_HUB_CELL_METERS: f64 = 120.0;
 const BTT_MAX_HUB_CELL_METERS: f64 = 220.0;
@@ -404,6 +406,7 @@ pub struct QueryRequest {
     pub date: String,
     pub time: String,
     pub max_transfers: Option<usize>,
+    pub num_itineraries: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,8 +511,25 @@ pub struct QueryResponse {
     pub duration_seconds: i32,
     pub transfers: usize,
     pub legs: Vec<LegResponse>,
+    pub itineraries: Vec<QueryItineraryResponse>,
     pub deferred_hydration: DeferredHydrationResponse,
     pub trace: QueryTrace,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryItineraryResponse {
+    pub id: String,
+    pub label: String,
+    pub badges: Vec<String>,
+    pub is_recommended: bool,
+    pub is_fastest: bool,
+    pub is_fewest_transfers: bool,
+    pub departure_time: String,
+    pub arrival_time: String,
+    pub duration_seconds: i32,
+    pub transfers: usize,
+    pub legs: Vec<LegResponse>,
+    pub deferred_hydration: DeferredHydrationResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -709,13 +729,13 @@ pub struct LegResponse {
     pub walk_directions: Vec<WalkDirection>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeferredHydrationResponse {
     pub legs: Vec<DeferredLegRef>,
     pub entities: HydrationEntityDictionary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeferredLegRef {
     pub kind: &'static str,
     pub departure_time: String,
@@ -733,7 +753,7 @@ pub struct DeferredLegRef {
     pub walk_directions: Vec<WalkDirection>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct HydrationEntityDictionary {
     pub stops: Vec<StopSearchResult>,
     pub routes: Vec<RouteHydration>,
@@ -741,7 +761,7 @@ pub struct HydrationEntityDictionary {
     pub polylines: Vec<Vec<PolylinePoint>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RouteHydration {
     pub global_id: u64,
     pub id: String,
@@ -751,7 +771,7 @@ pub struct RouteHydration {
     pub text_color: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TripHydration {
     pub global_id: u64,
     pub id: String,
@@ -901,6 +921,14 @@ enum RawLeg {
         departure_secs: i32,
         arrival_secs: i32,
     },
+}
+
+#[derive(Clone)]
+struct QueryItineraryCandidate {
+    round: usize,
+    arrival_secs: i32,
+    transit_legs: usize,
+    raw_legs: Vec<RawLeg>,
 }
 
 #[derive(Clone)]
@@ -2271,6 +2299,10 @@ impl Engine {
             .max_transfers
             .unwrap_or(self.config.default_max_transfers)
             .clamp(0, 8);
+        let requested_itinerary_count = request
+            .num_itineraries
+            .unwrap_or(DEFAULT_QUERY_ITINERARY_COUNT)
+            .clamp(1, MAX_QUERY_ITINERARY_COUNT);
         let (plan, plan_metrics) = self.resolve_query_plan(&request).await?;
         let from_index = plan.from_index;
         let to_index = plan.to_index;
@@ -2783,26 +2815,30 @@ impl Engine {
         }
         let rounds_ms = rounds_started.elapsed().as_millis();
 
-        let destination_round = destination_round.ok_or_else(|| {
-            anyhow!(
+        if destination_round.is_none() {
+            bail!(
                 "no itinerary found from {} to {} after {} transfers",
                 plan.display_from.name,
                 plan.display_to.name,
                 max_transfers
-            )
-        })?;
-        let arrival_secs = round_arrivals[destination_round][to_index];
+            );
+        }
+        let itinerary_limit = requested_itinerary_count.min(rounds + 1);
 
         let reconstruct_started = Instant::now();
-        let raw_legs = self.reconstruct_path(
+        let itinerary_candidates = self.collect_query_itinerary_candidates(
             from_index,
             to_index,
-            destination_round,
+            itinerary_limit,
             &parents,
             &round_arrivals,
         )?;
         let reconstruct_ms = reconstruct_started.elapsed().as_millis();
-        let cacheable_raw_legs = self.cacheable_raw_legs(&raw_legs, static_stop_count);
+        let primary_candidate = itinerary_candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no itinerary candidates reconstructed"))?;
+        let cacheable_raw_legs = self.cacheable_raw_legs(&primary_candidate.raw_legs, static_stop_count);
         let profile_insertions = if let Some(destination_stop) = plan.exact_destination_stop {
             self.build_profile_insertions(destination_stop, &cacheable_raw_legs)
         } else {
@@ -2810,14 +2846,19 @@ impl Engine {
         };
         let spatial_profile_insertions =
             self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs);
-        let transit_legs = raw_legs
-            .iter()
-            .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
-            .count();
+        let transit_legs = primary_candidate.transit_legs;
 
         let hydrate_started = Instant::now();
-        let legs = self.hydrate_legs(service_date, &raw_legs, &plan.overlay)?;
-        let deferred_hydration = self.build_deferred_hydration(&legs)?;
+        let itineraries = self.hydrate_query_itinerary_candidates(
+            service_date,
+            departure_secs,
+            &itinerary_candidates,
+            &plan.overlay,
+        )?;
+        let primary_itinerary = itineraries
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no hydrated itinerary candidates"))?;
         let hydrate_ms = hydrate_started.elapsed().as_millis();
 
         if !profile_insertions.is_empty() || !spatial_profile_insertions.is_empty() {
@@ -2856,12 +2897,13 @@ impl Engine {
         Ok(QueryResponse {
             from: plan.display_from,
             to: plan.display_to,
-            departure_time: format_service_time(service_date, departure_secs),
-            arrival_time: format_service_time(service_date, arrival_secs),
-            duration_seconds: arrival_secs - departure_secs,
+            departure_time: primary_itinerary.departure_time.clone(),
+            arrival_time: primary_itinerary.arrival_time.clone(),
+            duration_seconds: primary_itinerary.duration_seconds,
             transfers: transit_legs.saturating_sub(1),
-            legs,
-            deferred_hydration,
+            legs: primary_itinerary.legs.clone(),
+            itineraries,
+            deferred_hydration: primary_itinerary.deferred_hydration.clone(),
             trace: QueryTrace {
                 service_date: service_date.to_string(),
                 query_runtime_ms,
@@ -2898,6 +2940,143 @@ impl Engine {
                 rounds: trace_rounds,
             },
         })
+    }
+
+    fn collect_query_itinerary_candidates(
+        &self,
+        from_index: usize,
+        to_index: usize,
+        limit: usize,
+        parents: &[Vec<Option<ParentStep>>],
+        round_arrivals: &[Vec<i32>],
+    ) -> Result<Vec<QueryItineraryCandidate>> {
+        let mut candidates = Vec::<QueryItineraryCandidate>::new();
+        let mut seen_signatures = HashSet::<String>::new();
+
+        for round in 0..round_arrivals.len() {
+            let arrival_secs = round_arrivals[round][to_index];
+            if arrival_secs >= INF_TIME || parents[round][to_index].is_none() {
+                continue;
+            }
+
+            let raw_legs = self.reconstruct_path(from_index, to_index, round, parents, round_arrivals)?;
+            let signature = raw_leg_signature(&raw_legs);
+            if !seen_signatures.insert(signature) {
+                continue;
+            }
+
+            let transit_legs = raw_legs
+                .iter()
+                .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
+                .count();
+            candidates.push(QueryItineraryCandidate {
+                round,
+                arrival_secs,
+                transit_legs,
+                raw_legs,
+            });
+        }
+
+        candidates.sort_by(|left, right| {
+            left.arrival_secs
+                .cmp(&right.arrival_secs)
+                .then_with(|| left.transit_legs.cmp(&right.transit_legs))
+                .then_with(|| left.round.cmp(&right.round))
+        });
+
+        let fastest_index = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| (candidate.arrival_secs, candidate.transit_legs, candidate.round))
+            .map(|(index, _)| index);
+        let fewest_transfers_index = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| {
+                (
+                    candidate.transit_legs.saturating_sub(1),
+                    candidate.arrival_secs,
+                    candidate.round,
+                )
+            })
+            .map(|(index, _)| index);
+
+        let mut ordered = Vec::<QueryItineraryCandidate>::with_capacity(candidates.len());
+        let mut used_indices = HashSet::<usize>::new();
+
+        if let Some(index) = fastest_index {
+            used_indices.insert(index);
+            ordered.push(candidates[index].clone());
+        }
+        if let Some(index) = fewest_transfers_index {
+            if used_indices.insert(index) {
+                ordered.push(candidates[index].clone());
+            }
+        }
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if used_indices.insert(index) {
+                ordered.push(candidate);
+            }
+        }
+
+        ordered.truncate(limit.max(1));
+        Ok(ordered)
+    }
+
+    fn hydrate_query_itinerary_candidates(
+        &self,
+        service_date: NaiveDate,
+        departure_secs: i32,
+        candidates: &[QueryItineraryCandidate],
+        overlay: &QueryOverlay,
+    ) -> Result<Vec<QueryItineraryResponse>> {
+        let fastest_arrival = candidates
+            .iter()
+            .map(|candidate| candidate.arrival_secs)
+            .min()
+            .unwrap_or(departure_secs);
+        let fewest_transfers = candidates
+            .iter()
+            .map(|candidate| candidate.transit_legs.saturating_sub(1))
+            .min()
+            .unwrap_or(0);
+        let mut itineraries = Vec::with_capacity(candidates.len());
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            let transfers = candidate.transit_legs.saturating_sub(1);
+            let is_recommended = index == 0;
+            let is_fastest = candidate.arrival_secs == fastest_arrival;
+            let is_fewest_transfers = transfers == fewest_transfers;
+            let legs = self.hydrate_legs(service_date, &candidate.raw_legs, overlay)?;
+            let deferred_hydration = self.build_deferred_hydration(&legs)?;
+
+            itineraries.push(QueryItineraryResponse {
+                id: format!(
+                    "round-{}-{}-{}",
+                    candidate.round,
+                    candidate.arrival_secs,
+                    transfers
+                ),
+                label: build_itinerary_label(index, is_fastest, is_fewest_transfers),
+                badges: build_itinerary_badges(
+                    index,
+                    is_recommended,
+                    is_fastest,
+                    is_fewest_transfers,
+                ),
+                is_recommended,
+                is_fastest,
+                is_fewest_transfers,
+                departure_time: format_service_time(service_date, departure_secs),
+                arrival_time: format_service_time(service_date, candidate.arrival_secs),
+                duration_seconds: candidate.arrival_secs - departure_secs,
+                transfers,
+                legs,
+                deferred_hydration,
+            });
+        }
+
+        Ok(itineraries)
     }
 
     fn scan_line(
@@ -7613,6 +7792,72 @@ fn record_stop_improvement(
     }
     true
 }
+
+    fn raw_leg_signature(raw_legs: &[RawLeg]) -> String {
+        raw_legs
+            .iter()
+            .map(|leg| match leg {
+                RawLeg::Walk {
+                    from_stop,
+                    to_stop,
+                    departure_secs,
+                    arrival_secs,
+                    ..
+                } => format!(
+                    "walk:{from_stop}:{to_stop}:{departure_secs}:{arrival_secs}"
+                ),
+                RawLeg::Transit {
+                    trip_index,
+                    board_stop,
+                    alight_stop,
+                    departure_secs,
+                    arrival_secs,
+                    ..
+                } => format!(
+                    "transit:{trip_index}:{board_stop}:{alight_stop}:{departure_secs}:{arrival_secs}"
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn build_itinerary_label(
+        index: usize,
+        is_fastest: bool,
+        is_fewest_transfers: bool,
+    ) -> String {
+        if is_fastest && is_fewest_transfers {
+            "Piu veloce e meno cambi".to_owned()
+        } else if is_fastest {
+            "Piu veloce".to_owned()
+        } else if is_fewest_transfers {
+            "Meno cambi".to_owned()
+        } else {
+            format!("Alternativa {}", index + 1)
+        }
+    }
+
+    fn build_itinerary_badges(
+        index: usize,
+        is_recommended: bool,
+        is_fastest: bool,
+        is_fewest_transfers: bool,
+    ) -> Vec<String> {
+        let mut badges = Vec::new();
+        if is_recommended {
+            badges.push("Consigliato".to_owned());
+        }
+        if is_fastest {
+            badges.push("Piu veloce".to_owned());
+        }
+        if is_fewest_transfers {
+            badges.push("Meno cambi".to_owned());
+        }
+        if badges.is_empty() {
+            badges.push(format!("Alternativa {}", index + 1));
+        }
+        badges
+    }
 
 fn record_memoized_destination_improvement(
     destination_stop: usize,

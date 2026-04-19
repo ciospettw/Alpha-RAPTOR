@@ -303,6 +303,77 @@ summary {
   gap: 6px;
 }
 
+.itinerary-options {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.itinerary-option-card {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #d5d5d5;
+  background: #ffffff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.itinerary-option-card.is-active {
+  border-color: #3f62b7;
+  box-shadow: inset 3px 0 0 #3f62b7;
+  background: #f4f7ff;
+}
+
+.itinerary-option-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.itinerary-option-title {
+  display: grid;
+  gap: 4px;
+}
+
+.itinerary-option-title strong {
+  color: #222;
+}
+
+.itinerary-option-metrics {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: #555;
+}
+
+.itinerary-option-badges {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.itinerary-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: 1px solid #ccd5f6;
+  background: #eef3ff;
+  color: #294a8a;
+  font-size: 10px;
+  font-weight: bold;
+  text-transform: uppercase;
+}
+
+.itinerary-badge.secondary {
+  border-color: #d7d7d7;
+  background: #f3f3f3;
+  color: #666;
+}
+
 .leg-card {
   display: grid;
   gap: 4px;
