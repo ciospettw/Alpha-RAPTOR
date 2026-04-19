@@ -23,7 +23,7 @@ The repository also contains the architecture notes for the core subsystems unde
 
 ## Requirements
 
-- Rust toolchain with Cargo
+- Rust 1.88+ toolchain with Cargo
 - A static GTFS ZIP for each feed you want to load
 - An OSM `.osm.pbf` extract for the pedestrian graph
 - Network access only if you use remote GTFS or remote OSM sources
