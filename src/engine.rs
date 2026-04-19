@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
@@ -12,6 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration, NaiveDate, NaiveTime, Timelike};
 use gtfs_structures::{Exception, Gtfs};
+use gtfs_rt::{trip_descriptor, vehicle_position};
 use reqwest::{
     blocking::Client as BlockingHttpClient,
     header::{ETAG, LAST_MODIFIED},
@@ -34,7 +36,7 @@ use crate::profile_cache::{
     CachedLeg, PreparedSpatialLookup, ProfileCache, ProfileCacheStats, ProfileInsertionPoint,
     ProfileLookupDecision, SpatialProfileInsertionPoint,
 };
-use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore};
+use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore, TripRealtimeMetrics};
 use crate::walker::{
     WalkerBuildResult, build_or_load_walker_transfers, rebuild_walker_transfers_subset,
 };
@@ -524,10 +526,20 @@ pub struct QueryItineraryResponse {
     pub is_recommended: bool,
     pub is_fastest: bool,
     pub is_fewest_transfers: bool,
+    pub is_best_realtime: bool,
+    pub is_least_crowded: bool,
+    pub has_canceled_legs: bool,
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
     pub transfers: usize,
+    pub realtime_score: usize,
+    pub transit_leg_count: usize,
+    pub transit_legs_with_gtfs_rt: usize,
+    pub crowding_score: Option<u16>,
+    pub crowding_level: &'static str,
+    pub occupancy_covered_transit_legs: usize,
+    pub canceled_transit_legs: usize,
     pub legs: Vec<LegResponse>,
     pub deferred_hydration: DeferredHydrationResponse,
 }
@@ -724,6 +736,13 @@ pub struct LegResponse {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
+    pub has_gtfs_rt: bool,
+    pub has_trip_update: bool,
+    pub has_vehicle_position: bool,
+    pub schedule_relationship: Option<String>,
+    pub occupancy_status: Option<String>,
+    pub occupancy_percentage: Option<u32>,
+    pub occupancy_score: Option<u16>,
     pub intermediate_stops: Vec<StopSearchResult>,
     pub polyline: Vec<PolylinePoint>,
     pub walk_directions: Vec<WalkDirection>,
@@ -748,6 +767,13 @@ pub struct DeferredLegRef {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
+    pub has_gtfs_rt: bool,
+    pub has_trip_update: bool,
+    pub has_vehicle_position: bool,
+    pub schedule_relationship: Option<String>,
+    pub occupancy_status: Option<String>,
+    pub occupancy_percentage: Option<u32>,
+    pub occupancy_score: Option<u16>,
     pub intermediate_stop_gids: Vec<u64>,
     pub polyline_index: usize,
     pub walk_directions: Vec<WalkDirection>,
@@ -929,6 +955,16 @@ struct QueryItineraryCandidate {
     arrival_secs: i32,
     transit_legs: usize,
     raw_legs: Vec<RawLeg>,
+}
+
+struct ItineraryPassiveMetrics {
+    transit_leg_count: usize,
+    transit_legs_with_gtfs_rt: usize,
+    occupancy_covered_transit_legs: usize,
+    crowding_score: Option<u16>,
+    crowding_level: &'static str,
+    canceled_transit_legs: usize,
+    has_canceled_legs: bool,
 }
 
 #[derive(Clone)]
@@ -3030,24 +3066,12 @@ impl Engine {
         candidates: &[QueryItineraryCandidate],
         overlay: &QueryOverlay,
     ) -> Result<Vec<QueryItineraryResponse>> {
-        let fastest_arrival = candidates
-            .iter()
-            .map(|candidate| candidate.arrival_secs)
-            .min()
-            .unwrap_or(departure_secs);
-        let fewest_transfers = candidates
-            .iter()
-            .map(|candidate| candidate.transit_legs.saturating_sub(1))
-            .min()
-            .unwrap_or(0);
         let mut itineraries = Vec::with_capacity(candidates.len());
 
-        for (index, candidate) in candidates.iter().enumerate() {
+        for candidate in candidates {
             let transfers = candidate.transit_legs.saturating_sub(1);
-            let is_recommended = index == 0;
-            let is_fastest = candidate.arrival_secs == fastest_arrival;
-            let is_fewest_transfers = transfers == fewest_transfers;
             let legs = self.hydrate_legs(service_date, &candidate.raw_legs, overlay)?;
+            let passive_metrics = score_itinerary_passive_metrics(&legs);
             let deferred_hydration = self.build_deferred_hydration(&legs)?;
 
             itineraries.push(QueryItineraryResponse {
@@ -3057,23 +3081,98 @@ impl Engine {
                     candidate.arrival_secs,
                     transfers
                 ),
-                label: build_itinerary_label(index, is_fastest, is_fewest_transfers),
-                badges: build_itinerary_badges(
-                    index,
-                    is_recommended,
-                    is_fastest,
-                    is_fewest_transfers,
-                ),
-                is_recommended,
-                is_fastest,
-                is_fewest_transfers,
+                label: String::new(),
+                badges: Vec::new(),
+                is_recommended: false,
+                is_fastest: false,
+                is_fewest_transfers: false,
+                is_best_realtime: false,
+                is_least_crowded: false,
+                has_canceled_legs: passive_metrics.has_canceled_legs,
                 departure_time: format_service_time(service_date, departure_secs),
                 arrival_time: format_service_time(service_date, candidate.arrival_secs),
                 duration_seconds: candidate.arrival_secs - departure_secs,
                 transfers,
+                realtime_score: passive_metrics.transit_legs_with_gtfs_rt,
+                transit_leg_count: passive_metrics.transit_leg_count,
+                transit_legs_with_gtfs_rt: passive_metrics.transit_legs_with_gtfs_rt,
+                crowding_score: passive_metrics.crowding_score,
+                crowding_level: passive_metrics.crowding_level,
+                occupancy_covered_transit_legs: passive_metrics.occupancy_covered_transit_legs,
+                canceled_transit_legs: passive_metrics.canceled_transit_legs,
                 legs,
                 deferred_hydration,
             });
+        }
+
+        let fastest_duration = itineraries
+            .iter()
+            .map(|itinerary| itinerary.duration_seconds)
+            .min()
+            .unwrap_or(0);
+        let fewest_transfers = itineraries
+            .iter()
+            .map(|itinerary| itinerary.transfers)
+            .min()
+            .unwrap_or(0);
+        let best_realtime_score = itineraries
+            .iter()
+            .map(|itinerary| itinerary.transit_legs_with_gtfs_rt)
+            .max()
+            .unwrap_or(0);
+        let best_crowding_score = itineraries
+            .iter()
+            .filter(|itinerary| itinerary.occupancy_covered_transit_legs > 0)
+            .filter_map(|itinerary| itinerary.crowding_score)
+            .min();
+
+        itineraries.sort_by(|left, right| {
+            left.has_canceled_legs
+                .cmp(&right.has_canceled_legs)
+                .then_with(|| left.duration_seconds.cmp(&right.duration_seconds))
+                .then_with(|| left.transfers.cmp(&right.transfers))
+                .then_with(|| right.transit_legs_with_gtfs_rt.cmp(&left.transit_legs_with_gtfs_rt))
+                .then_with(|| compare_optional_crowding(left.crowding_score, right.crowding_score))
+                .then_with(|| {
+                    right
+                        .occupancy_covered_transit_legs
+                        .cmp(&left.occupancy_covered_transit_legs)
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        for (index, itinerary) in itineraries.iter_mut().enumerate() {
+            let is_recommended = index == 0;
+            let is_fastest = itinerary.duration_seconds == fastest_duration;
+            let is_fewest_transfers = itinerary.transfers == fewest_transfers;
+            let is_best_realtime = best_realtime_score > 0
+                && itinerary.transit_legs_with_gtfs_rt == best_realtime_score;
+            let is_least_crowded = best_crowding_score.is_some()
+                && itinerary.occupancy_covered_transit_legs > 0
+                && itinerary.crowding_score == best_crowding_score;
+
+            itinerary.is_recommended = is_recommended;
+            itinerary.is_fastest = is_fastest;
+            itinerary.is_fewest_transfers = is_fewest_transfers;
+            itinerary.is_best_realtime = is_best_realtime;
+            itinerary.is_least_crowded = is_least_crowded;
+            itinerary.label = build_itinerary_label(
+                index,
+                is_recommended,
+                is_fastest,
+                is_fewest_transfers,
+                is_best_realtime,
+                is_least_crowded,
+            );
+            itinerary.badges = build_itinerary_badges(
+                index,
+                is_recommended,
+                is_fastest,
+                is_fewest_transfers,
+                is_best_realtime,
+                is_least_crowded,
+                itinerary.has_canceled_legs,
+            );
         }
 
         Ok(itineraries)
@@ -4315,6 +4414,13 @@ impl Engine {
             headsign: None,
             walk_distance_meters: Some(distance_meters),
             delay_applied_seconds: None,
+            has_gtfs_rt: false,
+            has_trip_update: false,
+            has_vehicle_position: false,
+            schedule_relationship: None,
+            occupancy_status: None,
+            occupancy_percentage: None,
+            occupancy_score: None,
             intermediate_stops: Vec::new(),
             polyline: geometry.polyline,
             walk_directions,
@@ -4357,6 +4463,13 @@ impl Engine {
                     headsign: None,
                     walk_distance_meters: Some(distance_meters),
                     delay_applied_seconds: None,
+                    has_gtfs_rt: false,
+                    has_trip_update: false,
+                    has_vehicle_position: false,
+                    schedule_relationship: None,
+                    occupancy_status: None,
+                    occupancy_percentage: None,
+                    occupancy_score: None,
                     intermediate_stops: Vec::new(),
                     polyline: geometry.polyline.clone(),
                     walk_directions: build_walk_directions(
@@ -4379,6 +4492,7 @@ impl Engine {
                 let route = &self.static_data.routes[trip.route_index];
                 let cold_trip = self.cold_trip_record(trip_index);
                 let cold_route = self.cold_route_record(trip.route_index);
+                let passive_realtime = self.passive_realtime_fields(trip_index, board_pos);
                 let scheduled_departure = trip.stop_times[board_pos].departure_secs;
                 let delay_applied_seconds = departure_secs - scheduled_departure;
                 let intermediate_stops = self.trip_intermediate_stops(trip, board_pos, alight_pos);
@@ -4400,6 +4514,24 @@ impl Engine {
                     headsign: cold_trip.headsign.clone(),
                     walk_distance_meters: None,
                     delay_applied_seconds: Some(delay_applied_seconds),
+                    has_gtfs_rt: passive_realtime.has_gtfs_rt(),
+                    has_trip_update: passive_realtime.has_trip_update,
+                    has_vehicle_position: passive_realtime.has_vehicle_position,
+                    schedule_relationship: schedule_relationship_string(
+                        passive_realtime.schedule_relationship,
+                    ),
+                    occupancy_status: occupancy_status_string(
+                        passive_realtime
+                            .stop_departure_occupancy_status
+                            .or(passive_realtime.vehicle_occupancy_status),
+                    ),
+                    occupancy_percentage: passive_realtime.vehicle_occupancy_percentage,
+                    occupancy_score: passive_occupancy_score(
+                        passive_realtime
+                            .stop_departure_occupancy_status
+                            .or(passive_realtime.vehicle_occupancy_status),
+                        passive_realtime.vehicle_occupancy_percentage,
+                    ),
                     intermediate_stops,
                     polyline: self.trip_polyline(trip, board_pos, alight_pos),
                     walk_directions: Vec::new(),
@@ -4520,6 +4652,10 @@ impl Engine {
             segment_way_ids: empty_segment_way_ids(&polyline),
             polyline,
         }
+    }
+
+    fn passive_realtime_fields(&self, trip_index: usize, board_pos: usize) -> TripRealtimeMetrics {
+        self.realtime.trip_realtime_metrics(trip_index, board_pos)
     }
 
     fn query_stop_coordinates(
@@ -4693,6 +4829,13 @@ impl Engine {
                 headsign: leg.headsign.clone(),
                 walk_distance_meters: leg.walk_distance_meters,
                 delay_applied_seconds: leg.delay_applied_seconds,
+                has_gtfs_rt: leg.has_gtfs_rt,
+                has_trip_update: leg.has_trip_update,
+                has_vehicle_position: leg.has_vehicle_position,
+                schedule_relationship: leg.schedule_relationship.clone(),
+                occupancy_status: leg.occupancy_status.clone(),
+                occupancy_percentage: leg.occupancy_percentage,
+                occupancy_score: leg.occupancy_score,
                 intermediate_stop_gids,
                 polyline_index,
                 walk_directions: leg.walk_directions.clone(),
@@ -7823,15 +7966,22 @@ fn record_stop_improvement(
 
     fn build_itinerary_label(
         index: usize,
+        is_recommended: bool,
         is_fastest: bool,
         is_fewest_transfers: bool,
+        is_best_realtime: bool,
+        is_least_crowded: bool,
     ) -> String {
-        if is_fastest && is_fewest_transfers {
-            "Piu veloce e meno cambi".to_owned()
-        } else if is_fastest {
+        if is_fastest {
             "Piu veloce".to_owned()
+        } else if is_best_realtime {
+            "Migliori dati RT".to_owned()
+        } else if is_least_crowded {
+            "Meno affollato".to_owned()
         } else if is_fewest_transfers {
             "Meno cambi".to_owned()
+        } else if is_recommended {
+            "Consigliato".to_owned()
         } else {
             format!("Alternativa {}", index + 1)
         }
@@ -7842,6 +7992,9 @@ fn record_stop_improvement(
         is_recommended: bool,
         is_fastest: bool,
         is_fewest_transfers: bool,
+        is_best_realtime: bool,
+        is_least_crowded: bool,
+        has_canceled_legs: bool,
     ) -> Vec<String> {
         let mut badges = Vec::new();
         if is_recommended {
@@ -7853,11 +8006,122 @@ fn record_stop_improvement(
         if is_fewest_transfers {
             badges.push("Meno cambi".to_owned());
         }
+        if is_best_realtime {
+            badges.push("Migliori dati RT".to_owned());
+        }
+        if is_least_crowded {
+            badges.push("Meno affollato".to_owned());
+        }
+        if has_canceled_legs {
+            badges.push("Contiene CANCELED".to_owned());
+        }
         if badges.is_empty() {
             badges.push(format!("Alternativa {}", index + 1));
         }
         badges
     }
+
+fn compare_optional_crowding(left: Option<u16>, right: Option<u16>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn score_itinerary_passive_metrics(legs: &[LegResponse]) -> ItineraryPassiveMetrics {
+    let mut transit_leg_count = 0usize;
+    let mut transit_legs_with_gtfs_rt = 0usize;
+    let mut occupancy_covered_transit_legs = 0usize;
+    let mut crowding_score_total = 0u16;
+    let mut canceled_transit_legs = 0usize;
+
+    for leg in legs {
+        if leg.kind != "transit" {
+            continue;
+        }
+
+        transit_leg_count += 1;
+        if leg.has_gtfs_rt {
+            transit_legs_with_gtfs_rt += 1;
+        }
+        if let Some(score) = leg.occupancy_score {
+            occupancy_covered_transit_legs += 1;
+            crowding_score_total = crowding_score_total.saturating_add(score);
+        }
+        if leg.schedule_relationship.as_deref() == Some("CANCELED") {
+            canceled_transit_legs += 1;
+        }
+    }
+
+    let crowding_score = (occupancy_covered_transit_legs > 0)
+        .then_some(crowding_score_total / occupancy_covered_transit_legs as u16);
+    let crowding_level = passive_occupancy_level(crowding_score, occupancy_covered_transit_legs);
+
+    ItineraryPassiveMetrics {
+        transit_leg_count,
+        transit_legs_with_gtfs_rt,
+        occupancy_covered_transit_legs,
+        crowding_score,
+        crowding_level,
+        canceled_transit_legs,
+        has_canceled_legs: canceled_transit_legs > 0,
+    }
+}
+
+fn passive_occupancy_level(score: Option<u16>, covered_legs: usize) -> &'static str {
+    let Some(score) = score else {
+        return "unknown";
+    };
+    if covered_legs == 0 {
+        return "unknown";
+    }
+
+    if score <= 35 {
+        "low"
+    } else if score <= 70 {
+        "medium"
+    } else {
+        "high"
+    }
+}
+
+fn passive_occupancy_score(
+    occupancy_status: Option<i32>,
+    occupancy_percentage: Option<u32>,
+) -> Option<u16> {
+    if let Some(occupancy_percentage) = occupancy_percentage {
+        return Some(occupancy_percentage.min(150) as u16);
+    }
+
+    occupancy_status.and_then(|value| match vehicle_position::OccupancyStatus::from_i32(value) {
+        Some(vehicle_position::OccupancyStatus::Empty) => Some(0),
+        Some(vehicle_position::OccupancyStatus::ManySeatsAvailable) => Some(20),
+        Some(vehicle_position::OccupancyStatus::FewSeatsAvailable) => Some(45),
+        Some(vehicle_position::OccupancyStatus::StandingRoomOnly) => Some(75),
+        Some(vehicle_position::OccupancyStatus::CrushedStandingRoomOnly) => Some(90),
+        Some(vehicle_position::OccupancyStatus::Full) => Some(100),
+        Some(vehicle_position::OccupancyStatus::NotAcceptingPassengers) => Some(110),
+        Some(vehicle_position::OccupancyStatus::NotBoardable) => Some(120),
+        Some(vehicle_position::OccupancyStatus::NoDataAvailable) => None,
+        None => None,
+    })
+}
+
+fn schedule_relationship_string(value: Option<i32>) -> Option<String> {
+    value.and_then(|value| {
+        trip_descriptor::ScheduleRelationship::from_i32(value)
+            .map(|relationship| relationship.as_str_name().to_owned())
+    })
+}
+
+fn occupancy_status_string(value: Option<i32>) -> Option<String> {
+    value.and_then(|value| {
+        vehicle_position::OccupancyStatus::from_i32(value)
+            .map(|status| status.as_str_name().to_owned())
+    })
+}
 
 fn record_memoized_destination_improvement(
     destination_stop: usize,
