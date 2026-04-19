@@ -20,6 +20,7 @@ use rstar::{AABB, PointDistance, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::control::{descriptor_url_from_env, maybe_add_internal_token_blocking};
 use crate::cold_storage::{ColdRouteRecord, ColdStore, ColdTripRecord, cold_store_paths};
 use crate::geo::{
     destination_cell as geo_destination_cell,
@@ -73,14 +74,13 @@ pub struct FeedConfig {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawEngineManifest {
     osm_pbf: Option<String>,
     osm_pbf_allow_invalid_tls: Option<bool>,
     walk_radius_meters: Option<f64>,
     walk_speed_mps: Option<f64>,
     max_transfer_candidates: Option<usize>,
-    refresh_interval_secs: Option<u64>,
     static_reload_interval_secs: Option<u64>,
     static_diff_tolerance: Option<f64>,
     default_max_transfers: Option<usize>,
@@ -90,13 +90,13 @@ struct RawEngineManifest {
     feeds: Vec<RawFeedConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawDvniConfig {
     knn_candidates: Option<usize>,
     max_walk_radius_meters: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawHpfConfig {
     max_distance_meters: Option<f64>,
     snap_tolerance_meters: Option<f64>,
@@ -104,7 +104,7 @@ struct RawHpfConfig {
     search_window: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawOsmDiffConfig {
     state_url: String,
     diff_base_url: Option<String>,
@@ -112,7 +112,7 @@ struct RawOsmDiffConfig {
     allow_invalid_tls: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawFeedConfig {
     id: String,
     static_gtfs: String,
@@ -122,6 +122,31 @@ struct RawFeedConfig {
     vehicle_positions_url: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingDescriptor {
+    static_feeds: Vec<RoutingStaticFeedDescriptor>,
+    realtime_feeds: Vec<RoutingRealtimeFeedDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingStaticFeedDescriptor {
+    id: Option<String>,
+    namespace: Option<String>,
+    feed_id: Option<String>,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingRealtimeFeedDescriptor {
+    namespace: Option<String>,
+    feed_id: Option<String>,
+    trip_updates_url: Option<String>,
+    vehicle_positions_url: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -145,6 +170,7 @@ pub struct Engine {
 pub struct EngineConfig {
     pub workspace_root: PathBuf,
     pub manifest_path: Option<PathBuf>,
+    pub source_manifest_path: Option<PathBuf>,
     pub feeds: Vec<FeedConfig>,
     pub osm_pbf_path: PathBuf,
     pub osm_pbf_source: String,
@@ -153,7 +179,6 @@ pub struct EngineConfig {
     pub walk_radius_meters: f64,
     pub walk_speed_mps: f64,
     pub max_transfer_candidates: usize,
-    pub refresh_interval_secs: u64,
     pub static_reload_interval_secs: u64,
     pub static_diff_tolerance: f64,
     pub default_max_transfers: usize,
@@ -937,7 +962,7 @@ impl PointDistance for IndexedStopPoint {
 impl EngineConfig {
     pub fn from_env(workspace_root: PathBuf) -> Result<Self> {
         if let Some(manifest_override) = env::var("ALPHA_CONFIG").ok() {
-            return Self::from_manifest(
+            return Self::from_manifest_source(
                 &workspace_root,
                 resolve_path(
                     &workspace_root,
@@ -950,7 +975,7 @@ impl EngineConfig {
 
         let default_manifest = workspace_root.join(DEFAULT_MANIFEST_NAME);
         if default_manifest.exists() {
-            return Self::from_manifest(
+            return Self::from_manifest_source(
                 &workspace_root,
                 default_manifest,
                 StaticGtfsRefreshMode::Bootstrap,
@@ -961,10 +986,10 @@ impl EngineConfig {
     }
 
     pub fn reload_from_source(&self) -> Result<Self> {
-        if let Some(manifest_path) = &self.manifest_path {
-            return Self::from_manifest(
+        if let Some(source_manifest_path) = &self.source_manifest_path {
+            return Self::from_manifest_source(
                 &self.workspace_root,
-                manifest_path.clone(),
+                source_manifest_path.clone(),
                 StaticGtfsRefreshMode::Poll,
             );
         }
@@ -976,8 +1001,23 @@ impl EngineConfig {
         self.static_inputs_metadata != other.static_inputs_metadata
     }
 
+    fn from_manifest_source(
+        workspace_root: &PathBuf,
+        source_manifest_path: PathBuf,
+        refresh_mode: StaticGtfsRefreshMode,
+    ) -> Result<Self> {
+        let runtime_manifest_path = materialize_runtime_manifest(workspace_root, &source_manifest_path)?;
+        Self::from_manifest(
+            workspace_root,
+            source_manifest_path,
+            runtime_manifest_path,
+            refresh_mode,
+        )
+    }
+
     fn from_manifest(
         workspace_root: &PathBuf,
+        source_manifest_path: PathBuf,
         manifest_path: PathBuf,
         refresh_mode: StaticGtfsRefreshMode,
     ) -> Result<Self> {
@@ -1044,6 +1084,7 @@ impl EngineConfig {
         let mut config = Self {
             workspace_root: workspace_root.clone(),
             manifest_path: Some(manifest_path),
+            source_manifest_path: Some(source_manifest_path),
             feeds,
             osm_pbf_path: prepared_osm_pbf.local_path,
             osm_pbf_source: prepared_osm_pbf.source,
@@ -1052,7 +1093,6 @@ impl EngineConfig {
             walk_radius_meters: manifest.walk_radius_meters.unwrap_or(450.0),
             walk_speed_mps: manifest.walk_speed_mps.unwrap_or(1.35),
             max_transfer_candidates: manifest.max_transfer_candidates.unwrap_or(12),
-            refresh_interval_secs: manifest.refresh_interval_secs.unwrap_or(45),
             static_reload_interval_secs: manifest.static_reload_interval_secs.unwrap_or(600),
             static_diff_tolerance: manifest
                 .static_diff_tolerance
@@ -1171,6 +1211,7 @@ impl EngineConfig {
         let mut config = Self {
             workspace_root: workspace_root.clone(),
             manifest_path: None,
+            source_manifest_path: None,
             feeds: vec![FeedConfig {
                 feed_index: 0,
                 id: feed_id,
@@ -1206,10 +1247,6 @@ impl EngineConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(12),
-            refresh_interval_secs: env::var("ALPHA_RT_REFRESH_SECS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(45),
             static_reload_interval_secs: env::var("ALPHA_STATIC_POLL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1329,6 +1366,159 @@ impl EngineConfig {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+fn materialize_runtime_manifest(
+    workspace_root: &Path,
+    source_manifest_path: &Path,
+) -> Result<PathBuf> {
+    if descriptor_url_from_env().is_none() {
+        return Ok(source_manifest_path.to_path_buf());
+    }
+
+    let generated_manifest_path = runtime_root(workspace_root)
+        .join("generated")
+        .join("busone-descriptor.toml");
+
+    match write_descriptor_manifest(source_manifest_path, &generated_manifest_path) {
+        Ok(()) => Ok(generated_manifest_path),
+        Err(error) if generated_manifest_path.exists() => {
+            warn!(
+                %error,
+                manifest = %generated_manifest_path.display(),
+                "descriptor refresh failed; reusing cached generated manifest"
+            );
+            Ok(generated_manifest_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_descriptor_manifest(
+    source_manifest_path: &Path,
+    generated_manifest_path: &Path,
+) -> Result<()> {
+    let descriptor_url = descriptor_url_from_env()
+        .context("ALPHA_DESCRIPTOR_URL is required when descriptor bootstrap is enabled")?;
+    let source_manifest_body = fs::read_to_string(source_manifest_path).with_context(|| {
+        format!(
+            "unable to read descriptor template manifest {}",
+            source_manifest_path.display()
+        )
+    })?;
+    let mut manifest: RawEngineManifest = toml::from_str(&source_manifest_body).with_context(|| {
+        format!(
+            "invalid descriptor template manifest TOML at {}",
+            source_manifest_path.display()
+        )
+    })?;
+
+    manifest.feeds = fetch_descriptor_feeds(&descriptor_url, &manifest)?;
+
+    let rendered = toml::to_string_pretty(&manifest)
+        .context("failed to render generated descriptor manifest")?;
+    if let Ok(existing) = fs::read_to_string(generated_manifest_path) {
+        if existing == rendered {
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = generated_manifest_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create generated manifest directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(generated_manifest_path, rendered).with_context(|| {
+        format!(
+            "failed to write generated descriptor manifest {}",
+            generated_manifest_path.display()
+        )
+    })
+}
+
+fn fetch_descriptor_feeds(
+    descriptor_url: &str,
+    base_manifest: &RawEngineManifest,
+) -> Result<Vec<RawFeedConfig>> {
+    let client = BlockingHttpClient::builder()
+        .user_agent("alpha-raptor-engine/0.1")
+        .build()
+        .context("failed to build HTTP client for descriptor bootstrap")?;
+    let response = maybe_add_internal_token_blocking(client.get(descriptor_url), descriptor_url)?
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("failed to fetch routing descriptor from {descriptor_url}"))?;
+    let descriptor: RoutingDescriptor = response
+        .json()
+        .with_context(|| format!("failed to parse routing descriptor from {descriptor_url}"))?;
+
+    let mut depends_on_by_id = HashMap::<String, Vec<String>>::new();
+    for feed in &base_manifest.feeds {
+        depends_on_by_id.insert(feed.id.clone(), feed.depends_on.clone());
+    }
+
+    let mut realtime_by_key = HashMap::<String, RoutingRealtimeFeedDescriptor>::new();
+    for realtime in descriptor.realtime_feeds {
+        if let Some(key) = descriptor_feed_key(realtime.feed_id.as_ref(), realtime.namespace.as_ref()) {
+            realtime_by_key.insert(key, realtime);
+        }
+    }
+
+    let mut feeds = Vec::with_capacity(descriptor.static_feeds.len());
+    for static_feed in descriptor.static_feeds {
+        let feed_id = descriptor_feed_key(
+            static_feed.feed_id.as_ref(),
+            static_feed.namespace.as_ref().or(static_feed.id.as_ref()),
+        )
+        .context("routing descriptor static feed is missing feedId/namespace/id")?;
+        let realtime = realtime_by_key
+            .get(&feed_id)
+            .or_else(|| {
+                static_feed
+                    .namespace
+                    .as_ref()
+                    .and_then(|namespace| realtime_by_key.get(namespace))
+            });
+
+        let depends_on = depends_on_by_id
+            .get(&feed_id)
+            .cloned()
+            .or_else(|| {
+                static_feed
+                    .namespace
+                    .as_ref()
+                    .and_then(|namespace| depends_on_by_id.get(namespace).cloned())
+            })
+            .unwrap_or_default();
+
+        feeds.push(RawFeedConfig {
+            id: feed_id,
+            static_gtfs: static_feed.url,
+            static_gtfs_allow_invalid_tls: false,
+            trip_updates_url: realtime.and_then(|value| value.trip_updates_url.clone()),
+            vehicle_positions_url: realtime.and_then(|value| value.vehicle_positions_url.clone()),
+            depends_on,
+        });
+    }
+
+    if feeds.is_empty() {
+        bail!("routing descriptor at {descriptor_url} does not define any static feeds");
+    }
+
+    Ok(feeds)
+}
+
+fn descriptor_feed_key(primary: Option<&String>, fallback: Option<&String>) -> Option<String> {
+    primary
+        .map(String::as_str)
+        .or(fallback.map(String::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 impl Engine {
@@ -4891,8 +5081,7 @@ fn probe_remote_static_gtfs_version(
     feed_id: &str,
     url: &str,
 ) -> Result<RemoteStaticGtfsVersionMetadata> {
-    let response = client
-        .head(url)
+    let response = maybe_add_internal_token_blocking(client.head(url), url)?
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| {
@@ -5041,8 +5230,7 @@ fn sync_remote_static_gtfs(
         }
     }
 
-    let response = client
-        .get(url)
+    let response = maybe_add_internal_token_blocking(client.get(url), url)?
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download static GTFS feed {feed_id} from {url}"));
@@ -5245,8 +5433,7 @@ fn sync_remote_osm_pbf(
         }
     }
 
-    let response = client
-        .get(url)
+    let response = maybe_add_internal_token_blocking(client.get(url), url)?
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download OSM PBF from {url}"));

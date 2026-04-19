@@ -1,8 +1,10 @@
+# When ALPHA_DESCRIPTOR_URL is set, this file is used as the base template:
+# root runtime settings stay here, while [[feeds]] is regenerated from the
+# BusO-Api descriptor into .alpha-raptor/generated/busone-descriptor.toml.
 osm_pbf = "https://download.geofabrik.de/europe/italy/centro-latest.osm.pbf"
 walk_radius_meters = 450.0
 walk_speed_mps = 1.35
 max_transfer_candidates = 12
-refresh_interval_secs = 45
 static_reload_interval_secs = 600
 static_diff_tolerance = 0.05
 default_max_transfers = 4

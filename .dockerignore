@@ -1,0 +1,9 @@
+.git
+.vscode
+.alpha-raptor
+target
+data
+paper-figures/png
+paper-figures/png-it
+**/*.osm.pbf
+**/*.zip

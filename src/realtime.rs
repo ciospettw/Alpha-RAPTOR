@@ -8,6 +8,7 @@ use prost::Message;
 use reqwest::Client;
 use serde::Serialize;
 
+use crate::control::maybe_add_internal_token_async;
 use crate::engine::{EngineConfig, FeedConfig, StaticData, TripRecord, route_display_name};
 
 const MAX_REASONABLE_DELAY_SECS: i32 = 6 * 60 * 60;
@@ -416,10 +417,10 @@ impl RealtimeStore {
             .trip_updates_url
             .as_ref()
             .ok_or_else(|| anyhow!("trip updates URL not configured"))?;
+        let request = maybe_add_internal_token_async(self.client.get(url), url)?;
         let bytes = self
             .client
-            .get(url)
-            .send()
+            .execute(request.build().context("failed to build trip updates request")?)
             .await
             .context("trip updates request failed")?
             .error_for_status()
@@ -526,10 +527,10 @@ impl RealtimeStore {
             .vehicle_positions_url
             .as_ref()
             .ok_or_else(|| anyhow!("vehicle positions URL not configured"))?;
+        let request = maybe_add_internal_token_async(self.client.get(url), url)?;
         let bytes = self
             .client
-            .get(url)
-            .send()
+            .execute(request.build().context("failed to build vehicle positions request")?)
             .await
             .context("vehicle positions request failed")?
             .error_for_status()
