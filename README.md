@@ -1,12 +1,13 @@
-# Alpha-RAPTOR
+# α-RAPTOR
 
 [![Rust](https://img.shields.io/badge/Rust-2024%20edition-black?logo=rust)](https://www.rust-lang.org/)
 [![HTTP API](https://img.shields.io/badge/API-Axum-0f766e)](https://github.com/tokio-rs/axum)
 [![Config](https://img.shields.io/badge/config-TOML-blue)](./alpha-raptor.toml)
 [![OSM](https://img.shields.io/badge/OSM-GeoFabrik%20diffs%20supported-3b82f6)](https://download.geofabrik.de/)
 [![GTFS](https://img.shields.io/badge/feeds-GTFS%20%2B%20GTFS--RT-orange)](https://gtfs.org/)
+[![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](./LICENSE)
 
-Alpha-RAPTOR is a local multimodal routing engine for GTFS, GTFS-Realtime, and OSM-based pedestrian access. It exposes an HTTP API, a small built-in web UI, and a manifest-driven runtime that can hot-reload static GTFS sources and refresh realtime feeds in background.
+α-RAPTOR is a local multimodal routing engine for GTFS, GTFS-Realtime, and OSM-based pedestrian access. It exposes an HTTP API, a small built-in web UI, and a manifest-driven runtime that can hot-reload static GTFS sources and refresh realtime feeds in background.
 
 The repository also contains the architecture notes for the core subsystems under [docs/btt.md](docs/btt.md), [docs/hpf.md](docs/hpf.md), [docs/hydra-slab.md](docs/hydra-slab.md), [docs/svrt.md](docs/svrt.md), and [docs/temporal-indirection.md](docs/temporal-indirection.md).
 
@@ -30,7 +31,7 @@ The repository also contains the architecture notes for the core subsystems unde
 Notes:
 
 - The preferred configuration mode is the manifest file [alpha-raptor.toml](alpha-raptor.toml).
-- If [alpha-raptor.toml](alpha-raptor.toml) exists in the workspace root, Alpha-RAPTOR uses it automatically.
+- If [alpha-raptor.toml](alpha-raptor.toml) exists in the workspace root, α-RAPTOR uses it automatically.
 - You can override the manifest path with the environment variable `ALPHA_CONFIG`.
 - If no manifest exists, the runtime falls back to legacy environment variables.
 
@@ -237,7 +238,7 @@ Boolean environment variables accept values such as `1`, `true`, `yes`, and `on`
 
 ## OSM Inputs And Periodic Updates
 
-Alpha-RAPTOR accepts two different OSM workflows:
+α-RAPTOR accepts two different OSM workflows:
 
 1. Any regular local `.osm.pbf` file can be used as the base OSM input.
 2. Periodic automatic OSM updates require a replication source compatible with the `[osm_diff]` mechanism.
@@ -245,7 +246,7 @@ Alpha-RAPTOR accepts two different OSM workflows:
 Important limitation:
 
 - The periodic OSM update flow is intended for GeoFabrik replication endpoints, for example `https://download.geofabrik.de/...-updates/state.txt`.
-- If you upload or point the engine to a normal standalone OSM extract that is not backed by GeoFabrik replication diffs, Alpha-RAPTOR can still build and answer queries, but it will not have automatic periodic OSM updates.
+- If you upload or point the engine to a normal standalone OSM extract that is not backed by GeoFabrik replication diffs, α-RAPTOR can still build and answer queries, but it will not have automatic periodic OSM updates.
 
 In practice:
 
@@ -348,4 +349,4 @@ Subsystem notes live in [docs](docs):
 
 ## License
 
-No license file is currently present in the repository. Add one before publishing publicly if you want downstream users to have explicit usage rights.
+This repository is licensed under CC BY-NC 4.0. See [LICENSE](LICENSE).
