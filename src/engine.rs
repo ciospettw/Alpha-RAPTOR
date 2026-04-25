@@ -1,20 +1,21 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Read, Write, copy},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Duration, NaiveDate, NaiveTime, Timelike};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use gtfs_structures::{Exception, Gtfs};
 use reqwest::{
     blocking::Client as BlockingHttpClient,
-    header::{ETAG, LAST_MODIFIED},
+    header::{ETAG, LAST_MODIFIED, RANGE},
+    StatusCode,
 };
 use rstar::{AABB, PointDistance, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,9 @@ const DEFAULT_HPF_SNAP_TOLERANCE_METERS: f64 = 140.0;
 const DEFAULT_HPF_SNAP_QUADRATIC_KAPPA_METERS: f64 = 40.0;
 const DEFAULT_HPF_SEARCH_WINDOW: usize = 512;
 const DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS: u64 = 30 * 60;
+const ARRIVE_BY_INITIAL_LOOKBACK_SECS: i64 = 15 * 60;
+const ARRIVE_BY_MAX_LOOKBACK_SECS: i64 = 6 * 60 * 60;
+const ARRIVE_BY_BINARY_SEARCH_TOLERANCE_SECS: i64 = 60;
 const SVRT_WIDTH: usize = 8;
 const BTT_MIN_HUB_CELL_METERS: f64 = 120.0;
 const BTT_MAX_HUB_CELL_METERS: f64 = 220.0;
@@ -366,7 +370,7 @@ pub struct ShapePoint {
     pub dist_traveled: Option<f32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct QueryRequest {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -379,6 +383,77 @@ pub struct QueryRequest {
     pub date: String,
     pub time: String,
     pub max_transfers: Option<usize>,
+    pub arrive_by: Option<bool>,
+    pub transport_modes: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitLineKind {
+    Bus,
+    Tram,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllowedTransitModes {
+    allow_bus: bool,
+    allow_tram: bool,
+}
+
+impl AllowedTransitModes {
+    fn from_query(request: &QueryRequest) -> Result<Self> {
+        let raw_modes = request.transport_modes.as_deref().unwrap_or("bus,tram");
+        let mut allow_bus = false;
+        let mut allow_tram = false;
+
+        for raw_mode in raw_modes.split(',') {
+            let mode = raw_mode.trim().to_ascii_lowercase();
+            if mode.is_empty() {
+                continue;
+            }
+
+            match mode.as_str() {
+                "bus" => allow_bus = true,
+                "tram" => allow_tram = true,
+                unsupported => bail!("unsupported transport mode filter '{unsupported}'"),
+            }
+        }
+
+        if !allow_bus && !allow_tram {
+            bail!("select at least one transit mode");
+        }
+
+        Ok(Self {
+            allow_bus,
+            allow_tram,
+        })
+    }
+
+    fn filter_active(self) -> bool {
+        !(self.allow_bus && self.allow_tram)
+    }
+
+    fn matches_route_type(self, route_type: &str) -> bool {
+        match classify_transit_line_kind(route_type) {
+            TransitLineKind::Bus => self.allow_bus,
+            TransitLineKind::Tram => self.allow_tram,
+            TransitLineKind::Other => self.allow_bus && self.allow_tram,
+        }
+    }
+}
+
+fn classify_transit_line_kind(route_type: &str) -> TransitLineKind {
+    let normalized = route_type.trim().to_ascii_lowercase();
+    if normalized.contains("tram") || normalized.contains("streetcar") {
+        return TransitLineKind::Tram;
+    }
+    if normalized.contains("bus")
+        || normalized.contains("coach")
+        || normalized.contains("trolley")
+    {
+        return TransitLineKind::Bus;
+    }
+    TransitLineKind::Other
 }
 
 #[derive(Debug, Serialize)]
@@ -666,6 +741,7 @@ pub struct LegResponse {
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
+    pub has_realtime_update: bool,
     pub from_stop: StopSearchResult,
     pub to_stop: StopSearchResult,
     pub trip_gid: Option<u64>,
@@ -696,6 +772,7 @@ pub struct DeferredLegRef {
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
+    pub has_realtime_update: bool,
     pub from_stop_gid: u64,
     pub to_stop_gid: u64,
     pub trip_gid: Option<u64>,
@@ -1146,7 +1223,7 @@ impl EngineConfig {
             &workspace_root,
             &feed_id,
             static_gtfs_value,
-            "data/gtfs/rome_static_gtfs.zip",
+            "https://romamobilita.it/sites/default/files/rome_static_gtfs.zip",
             static_gtfs_allow_invalid_tls,
             refresh_mode,
         )?;
@@ -2070,8 +2147,18 @@ impl Engine {
     }
 
     pub async fn run_query(&self, request: QueryRequest) -> Result<QueryResponse> {
+        if request.arrive_by.unwrap_or(false) {
+            return self.run_arrive_by_query(request).await;
+        }
+
+        self.run_depart_after_query(request).await
+    }
+
+    async fn run_depart_after_query(&self, request: QueryRequest) -> Result<QueryResponse> {
         let query_started = Instant::now();
         let request_setup_started = Instant::now();
+        let allowed_transit_modes = AllowedTransitModes::from_query(&request)?;
+        let route_filter_active = allowed_transit_modes.filter_active();
         let service_date = NaiveDate::parse_from_str(&request.date, "%Y-%m-%d")
             .with_context(|| format!("invalid date {}", request.date))?;
         let departure_time = parse_clock_time(&request.time)
@@ -2098,6 +2185,8 @@ impl Engine {
         let request_setup_ms = request_setup_started.elapsed().as_millis();
         let destination_cell = plan.destination_cell_for_insert;
         let destination_cells = plan.destination_cells.clone();
+        let allowed_line_mask = route_filter_active
+            .then(|| self.build_allowed_line_mask(allowed_transit_modes));
 
         let trip_mask_started = Instant::now();
         let trip_is_available = self.build_trip_availability(active_services);
@@ -2119,11 +2208,15 @@ impl Engine {
         let trip_mask_ms = trip_mask_started.elapsed().as_millis();
 
         let flat_spatial_mask_started = Instant::now();
-        let spatial_flat_mask = self.profile_cache.materialize_spatial_query_surface(
-            service_date,
-            &destination_cells,
-            static_stop_count,
-        );
+        let spatial_flat_mask = if route_filter_active {
+            PreparedSpatialLookup::default()
+        } else {
+            self.profile_cache.materialize_spatial_query_surface(
+                service_date,
+                &destination_cells,
+                static_stop_count,
+            )
+        };
         let flat_spatial_mask_ms = flat_spatial_mask_started.elapsed().as_millis();
 
         let state_init_started = Instant::now();
@@ -2262,32 +2355,34 @@ impl Engine {
             );
         }
 
-        let initial_profile_lookup_started = Instant::now();
-        self.apply_profile_lookahead(
-            service_date,
-            to_index,
-            plan.exact_destination_stop,
-            &spatial_flat_mask,
-            &plan.destination_egress_edges,
-            0,
-            rounds,
-            &marked_stops,
-            &trip_is_available,
-            &trip_has_realtime_update,
-            &line_max_positive_delay_secs,
-            &mut global_best,
-            &mut round_arrivals,
-            &mut parents,
-            &mut destination_round,
-            &mut profile_lookups,
-            &mut profile_hits,
-            &mut profile_bound_improvements,
-            &mut counters.destination_bound_prunes,
-            &mut flat_spatial_mask_checks,
-            &mut flat_spatial_mask_hits,
-            &mut local_subquery_cache,
-        );
-        profile_lookup_ms += initial_profile_lookup_started.elapsed().as_millis();
+        if !route_filter_active {
+            let initial_profile_lookup_started = Instant::now();
+            self.apply_profile_lookahead(
+                service_date,
+                to_index,
+                plan.exact_destination_stop,
+                &spatial_flat_mask,
+                &plan.destination_egress_edges,
+                0,
+                rounds,
+                &marked_stops,
+                &trip_is_available,
+                &trip_has_realtime_update,
+                &line_max_positive_delay_secs,
+                &mut global_best,
+                &mut round_arrivals,
+                &mut parents,
+                &mut destination_round,
+                &mut profile_lookups,
+                &mut profile_hits,
+                &mut profile_bound_improvements,
+                &mut counters.destination_bound_prunes,
+                &mut flat_spatial_mask_checks,
+                &mut flat_spatial_mask_hits,
+                &mut local_subquery_cache,
+            );
+            profile_lookup_ms += initial_profile_lookup_started.elapsed().as_millis();
+        }
 
         let rounds_started = Instant::now();
 
@@ -2316,6 +2411,11 @@ impl Engine {
                     continue;
                 }
                 for line_ref in &self.static_data.stop_to_lines[stop_index] {
+                    if let Some(mask) = allowed_line_mask.as_ref() {
+                        if !mask[line_ref.line_index] {
+                            continue;
+                        }
+                    }
                     let queued_pos = &mut queued_line_positions[line_ref.line_index];
                     if line_ref.stop_pos < *queued_pos {
                         *queued_pos = line_ref.stop_pos;
@@ -2378,7 +2478,7 @@ impl Engine {
                 round_metrics.timings_us.destination_egress_pre_transfer_us +=
                     destination_egress_started.elapsed().as_micros();
             }
-            if transit_frontier_len > 0 {
+            if !route_filter_active && transit_frontier_len > 0 {
                 let profile_lookup_started = Instant::now();
                 let profile_lookups_before = profile_lookups;
                 let profile_hits_before = profile_hits;
@@ -2457,50 +2557,52 @@ impl Engine {
                     round_metrics.timings_us.destination_egress_post_transfer_us +=
                         destination_egress_started.elapsed().as_micros();
                 }
-                let profile_lookup_started = Instant::now();
-                let profile_lookups_before = profile_lookups;
-                let profile_hits_before = profile_hits;
-                let profile_bound_improvements_before = profile_bound_improvements;
-                let destination_bound_prunes_before = counters.destination_bound_prunes;
-                let flat_spatial_mask_checks_before = flat_spatial_mask_checks;
-                let flat_spatial_mask_hits_before = flat_spatial_mask_hits;
-                self.apply_profile_lookahead(
-                    service_date,
-                    to_index,
-                    plan.exact_destination_stop,
-                    &spatial_flat_mask,
-                    &plan.destination_egress_edges,
-                    round,
-                    rounds,
-                    &next_marked[transit_frontier_len..],
-                    &trip_is_available,
-                    &trip_has_realtime_update,
-                    &line_max_positive_delay_secs,
-                    &mut global_best,
-                    &mut round_arrivals,
-                    &mut parents,
-                    &mut destination_round,
-                    &mut profile_lookups,
-                    &mut profile_hits,
-                    &mut profile_bound_improvements,
-                    &mut counters.destination_bound_prunes,
-                    &mut flat_spatial_mask_checks,
-                    &mut flat_spatial_mask_hits,
-                    &mut local_subquery_cache,
-                );
-                profile_lookup_ms += profile_lookup_started.elapsed().as_millis();
-                round_metrics.timings_us.profile_lookup_post_transfer_us +=
-                    profile_lookup_started.elapsed().as_micros();
-                round_metrics.profile_lookups += profile_lookups - profile_lookups_before;
-                round_metrics.profile_hits += profile_hits - profile_hits_before;
-                round_metrics.profile_bound_improvements +=
-                    profile_bound_improvements - profile_bound_improvements_before;
-                round_metrics.destination_bound_prunes +=
-                    counters.destination_bound_prunes - destination_bound_prunes_before;
-                round_metrics.flat_spatial_mask_checks +=
-                    flat_spatial_mask_checks - flat_spatial_mask_checks_before;
-                round_metrics.flat_spatial_mask_hits +=
-                    flat_spatial_mask_hits - flat_spatial_mask_hits_before;
+                if !route_filter_active {
+                    let profile_lookup_started = Instant::now();
+                    let profile_lookups_before = profile_lookups;
+                    let profile_hits_before = profile_hits;
+                    let profile_bound_improvements_before = profile_bound_improvements;
+                    let destination_bound_prunes_before = counters.destination_bound_prunes;
+                    let flat_spatial_mask_checks_before = flat_spatial_mask_checks;
+                    let flat_spatial_mask_hits_before = flat_spatial_mask_hits;
+                    self.apply_profile_lookahead(
+                        service_date,
+                        to_index,
+                        plan.exact_destination_stop,
+                        &spatial_flat_mask,
+                        &plan.destination_egress_edges,
+                        round,
+                        rounds,
+                        &next_marked[transit_frontier_len..],
+                        &trip_is_available,
+                        &trip_has_realtime_update,
+                        &line_max_positive_delay_secs,
+                        &mut global_best,
+                        &mut round_arrivals,
+                        &mut parents,
+                        &mut destination_round,
+                        &mut profile_lookups,
+                        &mut profile_hits,
+                        &mut profile_bound_improvements,
+                        &mut counters.destination_bound_prunes,
+                        &mut flat_spatial_mask_checks,
+                        &mut flat_spatial_mask_hits,
+                        &mut local_subquery_cache,
+                    );
+                    profile_lookup_ms += profile_lookup_started.elapsed().as_millis();
+                    round_metrics.timings_us.profile_lookup_post_transfer_us +=
+                        profile_lookup_started.elapsed().as_micros();
+                    round_metrics.profile_lookups += profile_lookups - profile_lookups_before;
+                    round_metrics.profile_hits += profile_hits - profile_hits_before;
+                    round_metrics.profile_bound_improvements +=
+                        profile_bound_improvements - profile_bound_improvements_before;
+                    round_metrics.destination_bound_prunes +=
+                        counters.destination_bound_prunes - destination_bound_prunes_before;
+                    round_metrics.flat_spatial_mask_checks +=
+                        flat_spatial_mask_checks - flat_spatial_mask_checks_before;
+                    round_metrics.flat_spatial_mask_hits +=
+                        flat_spatial_mask_hits - flat_spatial_mask_hits_before;
+                }
             }
 
             for stop_index in &next_marked {
@@ -2613,13 +2715,20 @@ impl Engine {
         )?;
         let reconstruct_ms = reconstruct_started.elapsed().as_millis();
         let cacheable_raw_legs = self.cacheable_raw_legs(&raw_legs, static_stop_count);
-        let profile_insertions = if let Some(destination_stop) = plan.exact_destination_stop {
-            self.build_profile_insertions(destination_stop, &cacheable_raw_legs)
+        let profile_insertions = if !route_filter_active {
+            if let Some(destination_stop) = plan.exact_destination_stop {
+                self.build_profile_insertions(destination_stop, &cacheable_raw_legs)
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
-        let spatial_profile_insertions =
-            self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs);
+        let spatial_profile_insertions = if route_filter_active {
+            Vec::new()
+        } else {
+            self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs)
+        };
         let transit_legs = raw_legs
             .iter()
             .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
@@ -2708,6 +2817,103 @@ impl Engine {
                 rounds: trace_rounds,
             },
         })
+    }
+
+    async fn run_arrive_by_query(&self, request: QueryRequest) -> Result<QueryResponse> {
+        let service_date = NaiveDate::parse_from_str(&request.date, "%Y-%m-%d")
+            .with_context(|| format!("invalid date {}", request.date))?;
+        let arrival_time = parse_clock_time(&request.time)
+            .with_context(|| format!("invalid arrival time {}", request.time))?;
+        let target_arrival = service_date.and_time(arrival_time);
+
+        let latest_departure_request = request_with_departure_datetime(&request, target_arrival);
+        match self.run_depart_after_query(latest_departure_request).await {
+            Ok(result) if query_response_arrives_by(&result, target_arrival)? => {
+                return Ok(result);
+            }
+            Ok(_) => {}
+            Err(error) if is_no_itinerary_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut lower_bound = None::<(NaiveDateTime, QueryResponse)>;
+        let mut upper_bound = target_arrival;
+        let mut lookback = ARRIVE_BY_INITIAL_LOOKBACK_SECS;
+
+        while lookback <= ARRIVE_BY_MAX_LOOKBACK_SECS {
+            let probe_departure = target_arrival - Duration::seconds(lookback);
+            let probe_request = request_with_departure_datetime(&request, probe_departure);
+
+            match self.run_depart_after_query(probe_request).await {
+                Ok(result) => {
+                    if query_response_arrives_by(&result, target_arrival)? {
+                        lower_bound = Some((probe_departure, result));
+                        break;
+                    }
+                    upper_bound = probe_departure;
+                }
+                Err(error) if is_no_itinerary_error(&error) => {
+                    upper_bound = probe_departure;
+                }
+                Err(error) => return Err(error),
+            }
+
+            lookback *= 2;
+        }
+
+        let Some((mut best_departure, mut best_result)) = lower_bound else {
+            bail!("no itinerary found before the requested arrival time");
+        };
+
+        while (upper_bound - best_departure).num_seconds() > ARRIVE_BY_BINARY_SEARCH_TOLERANCE_SECS
+        {
+            let midpoint_delta = (upper_bound - best_departure).num_seconds() / 2;
+            let probe_departure = best_departure + Duration::seconds(midpoint_delta);
+            if probe_departure <= best_departure || probe_departure >= upper_bound {
+                break;
+            }
+
+            let probe_request = request_with_departure_datetime(&request, probe_departure);
+            match self.run_depart_after_query(probe_request).await {
+                Ok(result) => {
+                    if query_response_arrives_by(&result, target_arrival)? {
+                        best_departure = probe_departure;
+                        best_result = result;
+                    } else {
+                        upper_bound = probe_departure;
+                    }
+                }
+                Err(error) if is_no_itinerary_error(&error) => {
+                    upper_bound = probe_departure;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(best_result)
+    }
+
+    fn build_allowed_line_mask(&self, allowed_transit_modes: AllowedTransitModes) -> Vec<bool> {
+        self.static_data
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(line_index, _)| {
+                self.line_matches_allowed_transit_modes(line_index, allowed_transit_modes)
+            })
+            .collect()
+    }
+
+    fn line_matches_allowed_transit_modes(
+        &self,
+        line_index: usize,
+        allowed_transit_modes: AllowedTransitModes,
+    ) -> bool {
+        let Some(&trip_index) = self.static_data.lines[line_index].trip_indices.first() else {
+            return false;
+        };
+        let route = &self.static_data.routes[self.static_data.trips[trip_index].route_index];
+        allowed_transit_modes.matches_route_type(&route.route_type)
     }
 
     fn scan_line(
@@ -3933,6 +4139,7 @@ impl Engine {
             departure_time: format_service_time(service_date, *departure_secs),
             arrival_time: format_service_time(service_date, *arrival_secs),
             duration_seconds: *arrival_secs - *departure_secs,
+            has_realtime_update: false,
             from_stop: from_result,
             to_stop: to_result,
             trip_gid: None,
@@ -3975,6 +4182,7 @@ impl Engine {
                     departure_time: format_service_time(service_date, departure_secs),
                     arrival_time: format_service_time(service_date, arrival_secs),
                     duration_seconds: duration_secs,
+                    has_realtime_update: false,
                     from_stop: from_result,
                     to_stop: to_result.clone(),
                     trip_gid: None,
@@ -4012,12 +4220,14 @@ impl Engine {
                 let cold_route = self.cold_route_record(trip.route_index);
                 let scheduled_departure = trip.stop_times[board_pos].departure_secs;
                 let delay_applied_seconds = departure_secs - scheduled_departure;
+                let has_realtime_update = self.realtime.has_trip_update(trip_index);
                 let intermediate_stops = self.trip_intermediate_stops(trip, board_pos, alight_pos);
                 Ok(LegResponse {
                     kind: "transit",
                     departure_time: format_service_time(service_date, departure_secs),
                     arrival_time: format_service_time(service_date, arrival_secs),
                     duration_seconds: arrival_secs - departure_secs,
+                    has_realtime_update,
                     from_stop: self.query_stop_result(board_stop, overlay),
                     to_stop: self.query_stop_result(alight_stop, overlay),
                     trip_gid: Some(trip.global_id),
@@ -4317,6 +4527,7 @@ impl Engine {
                 departure_time: leg.departure_time.clone(),
                 arrival_time: leg.arrival_time.clone(),
                 duration_seconds: leg.duration_seconds,
+                has_realtime_update: leg.has_realtime_update,
                 from_stop_gid: leg.from_stop.global_id,
                 to_stop_gid: leg.to_stop.global_id,
                 trip_gid: leg.trip_gid,
@@ -4617,6 +4828,30 @@ impl Engine {
             || route.route_type.contains("Rail")
             || route.route_type.contains("Metro")
     }
+}
+
+fn request_with_departure_datetime(
+    request: &QueryRequest,
+    departure: NaiveDateTime,
+) -> QueryRequest {
+    let mut next_request = request.clone();
+    next_request.date = departure.date().format("%Y-%m-%d").to_string();
+    next_request.time = departure.time().format("%H:%M").to_string();
+    next_request.arrive_by = Some(false);
+    next_request
+}
+
+fn query_response_arrives_by(
+    response: &QueryResponse,
+    deadline: NaiveDateTime,
+) -> Result<bool> {
+    let arrival = NaiveDateTime::parse_from_str(&response.arrival_time, "%Y-%m-%d %H:%M:%S")
+        .with_context(|| format!("invalid service timestamp {}", response.arrival_time))?;
+    Ok(arrival <= deadline)
+}
+
+fn is_no_itinerary_error(error: &anyhow::Error) -> bool {
+    error.to_string().to_ascii_lowercase().contains("no itinerary found")
 }
 
 fn resolve_path(
@@ -5245,12 +5480,6 @@ fn sync_remote_osm_pbf(
         }
     }
 
-    let response = client
-        .get(url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .with_context(|| format!("failed to download OSM PBF from {url}"));
-
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -5260,24 +5489,56 @@ fn sync_remote_osm_pbf(
         })?;
     }
 
-    let unique_suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    let tmp_path = cache_path.with_extension(format!("download-{unique_suffix}.tmp"));
+    let tmp_path = cache_path.with_extension("download.tmp");
+    let resume_from_bytes = if cache_path.exists() {
+        if tmp_path.exists() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        0
+    } else {
+        fs::metadata(&tmp_path).map(|metadata| metadata.len()).unwrap_or(0)
+    };
+
+    let mut request = client.get(url);
+    if resume_from_bytes > 0 {
+        request = request.header(RANGE, format!("bytes={resume_from_bytes}-"));
+    }
+
+    let response = request
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("failed to download OSM PBF from {url}"));
 
     let (downloaded_bytes, version_metadata) = match response {
         Ok(response) => {
+            let response_status = response.status();
+            let append_mode = resume_from_bytes > 0 && response_status == StatusCode::PARTIAL_CONTENT;
+            if resume_from_bytes > 0 && !append_mode {
+                warn!(
+                    url,
+                    cache = %cache_path.display(),
+                    tmp = %tmp_path.display(),
+                    resume_from_bytes,
+                    response_status = %response_status,
+                    "remote OSM PBF server did not honor range request; restarting download from byte zero"
+                );
+            }
             let response_version = merged_remote_static_gtfs_version_metadata(
                 url,
                 remote_static_gtfs_version_from_headers(url, response.headers()),
                 probed_version.as_ref(),
             );
-            match stream_blocking_response_to_file(response, &tmp_path, "OSM PBF") {
+            match stream_blocking_response_to_file(
+                response,
+                &tmp_path,
+                "OSM PBF",
+                if append_mode { resume_from_bytes } else { 0 },
+                append_mode,
+            ) {
                 Ok(downloaded_bytes) => (downloaded_bytes, response_version),
                 Err(error) => {
-                    let _ = fs::remove_file(&tmp_path);
                     if cache_path.exists() {
+                        let _ = fs::remove_file(&tmp_path);
                         warn!(
                             %error,
                             url,
@@ -5286,6 +5547,12 @@ fn sync_remote_osm_pbf(
                         );
                         return Ok(());
                     }
+                    warn!(
+                        %error,
+                        url,
+                        tmp = %tmp_path.display(),
+                        "remote OSM PBF download interrupted; keeping partial file for next resume attempt"
+                    );
                     return Err(error);
                 }
             }
@@ -5344,8 +5611,16 @@ fn stream_blocking_response_to_file(
     mut response: reqwest::blocking::Response,
     destination_path: &Path,
     artifact_name: &str,
+    resume_from_bytes: u64,
+    append: bool,
 ) -> Result<u64> {
-    let file = File::create(destination_path).with_context(|| {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(!append)
+        .append(append)
+        .open(destination_path)
+        .with_context(|| {
         format!(
             "failed to create temporary {} file {}",
             artifact_name,
@@ -5353,14 +5628,22 @@ fn stream_blocking_response_to_file(
         )
     })?;
     let mut writer = BufWriter::new(file);
-    let total_bytes = response.content_length();
-    let mut downloaded_bytes = 0u64;
-    let mut next_progress_log = 64_u64 * 1024 * 1024;
+    let total_bytes = response
+        .content_length()
+        .map(|content_length| content_length + resume_from_bytes);
+    let mut downloaded_bytes = resume_from_bytes;
+    let progress_chunk_bytes = 64_u64 * 1024 * 1024;
+    let mut next_progress_log = if downloaded_bytes == 0 {
+        progress_chunk_bytes
+    } else {
+        ((downloaded_bytes / progress_chunk_bytes) + 1) * progress_chunk_bytes
+    };
     let mut buffer = vec![0u8; 1024 * 1024];
 
     info!(
         artifact = artifact_name,
         destination = %destination_path.display(),
+        resumed_bytes = resume_from_bytes,
         total_bytes = total_bytes.unwrap_or(0),
         "starting streamed remote download"
     );
@@ -5390,7 +5673,7 @@ fn stream_blocking_response_to_file(
                 total_bytes = total_bytes.unwrap_or(0),
                 "streamed remote download progress"
             );
-            next_progress_log += 64_u64 * 1024 * 1024;
+            next_progress_log += progress_chunk_bytes;
         }
     }
 
@@ -5495,13 +5778,38 @@ fn capture_static_inputs_metadata(
 
     let mut feed_sources = Vec::with_capacity(config.feeds.len());
     for feed in &config.feeds {
-        let metadata = std::fs::metadata(&feed.static_gtfs_path).with_context(|| {
-            format!(
-                "unable to stat GTFS zip for feed {} at {}",
-                feed.id,
-                feed.static_gtfs_path.display()
-            )
-        })?;
+        let metadata = match std::fs::metadata(&feed.static_gtfs_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if feed.static_gtfs_remote_url.is_none() {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "unable to stat GTFS zip for feed {} at {}. The configured source '{}' is treated as a local path; place the ZIP there or switch feeds[].static_gtfs to an http(s) URL so Alpha-RAPTOR downloads and polls it automatically",
+                            feed.id,
+                            feed.static_gtfs_path.display(),
+                            feed.static_gtfs_source
+                        )
+                    });
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "unable to stat cached GTFS zip for feed {} at {} after syncing remote source {}",
+                        feed.id,
+                        feed.static_gtfs_path.display(),
+                        feed.static_gtfs_remote_url.as_deref().unwrap_or("<unknown>")
+                    )
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "unable to stat GTFS zip for feed {} at {}",
+                        feed.id,
+                        feed.static_gtfs_path.display()
+                    )
+                });
+            }
+        };
         feed_sources.push(StaticFeedSourceMetadata {
             feed_id: feed.id.clone(),
             static_gtfs_source: feed.static_gtfs_source.clone(),
@@ -5616,13 +5924,7 @@ fn load_or_build_static_core(
     let gtfs_parse_started = Instant::now();
     let mut parsed_feeds = Vec::<(FeedConfig, Gtfs)>::with_capacity(config.feeds.len());
     for feed in &config.feeds {
-        let gtfs = Gtfs::from_path(&feed.static_gtfs_path).with_context(|| {
-            format!(
-                "unable to read GTFS for feed {} from {}",
-                feed.id,
-                feed.static_gtfs_path.display()
-            )
-        })?;
+        let gtfs = load_gtfs_with_calendar_dates_fallback(feed)?;
         parsed_feeds.push((feed.clone(), gtfs));
     }
     timings.gtfs_parse_ms = gtfs_parse_started.elapsed().as_millis();
@@ -5684,6 +5986,211 @@ fn load_or_build_static_core(
         update_strategy,
         diff_summary,
     })
+}
+
+fn load_gtfs_with_calendar_dates_fallback(feed: &FeedConfig) -> Result<Gtfs> {
+    let parse_error = match Gtfs::from_path(&feed.static_gtfs_path) {
+        Ok(gtfs) => return Ok(gtfs),
+        Err(error) => anyhow!(error).context(format!(
+            "unable to read GTFS for feed {} from {}",
+            feed.id,
+            feed.static_gtfs_path.display()
+        )),
+    };
+
+    if !should_sanitize_calendar_dates(&parse_error, &feed.static_gtfs_path) {
+        return Err(parse_error);
+    }
+
+    warn!(
+        %parse_error,
+        feed_id = %feed.id,
+        path = %feed.static_gtfs_path.display(),
+        "invalid calendar_dates.txt exception_type values detected; retrying with sanitized GTFS"
+    );
+
+    let sanitized_path = write_sanitized_gtfs_zip(feed)?;
+    let parsed = Gtfs::from_path(&sanitized_path).with_context(|| {
+        format!(
+            "unable to read sanitized GTFS for feed {} from {}",
+            feed.id,
+            sanitized_path.display()
+        )
+    });
+    let _ = fs::remove_file(&sanitized_path);
+    parsed
+}
+
+fn should_sanitize_calendar_dates(error: &anyhow::Error, source_path: &Path) -> bool {
+    if source_path.extension().and_then(|ext| ext.to_str()) != Some("zip") {
+        return false;
+    }
+
+    let mut saw_calendar_dates = false;
+    let mut saw_unknown_zero = false;
+    let mut saw_expected_variants = false;
+
+    for cause in error.chain() {
+        let message = cause.to_string();
+        saw_calendar_dates |= message.contains("calendar_dates.txt");
+        saw_unknown_zero |= message.contains("unknown variant `0`");
+        saw_expected_variants |= message.contains("expected `1` or `2`");
+    }
+
+    saw_calendar_dates && saw_unknown_zero && saw_expected_variants
+}
+
+fn write_sanitized_gtfs_zip(feed: &FeedConfig) -> Result<PathBuf> {
+    let source_file = File::open(&feed.static_gtfs_path).with_context(|| {
+        format!(
+            "unable to open GTFS zip for sanitization {}",
+            feed.static_gtfs_path.display()
+        )
+    })?;
+    let mut source_zip = zip::ZipArchive::new(source_file).with_context(|| {
+        format!(
+            "unable to inspect GTFS zip for feed {} at {}",
+            feed.id,
+            feed.static_gtfs_path.display()
+        )
+    })?;
+
+    let sanitized_path = feed
+        .static_gtfs_path
+        .with_extension(format!("{}.sanitized.zip", feed.id));
+    let sanitized_file = File::create(&sanitized_path).with_context(|| {
+        format!(
+            "unable to create sanitized GTFS zip for feed {} at {}",
+            feed.id,
+            sanitized_path.display()
+        )
+    })?;
+    let mut writer = zip::ZipWriter::new(sanitized_file);
+    let mut rewritten_rows = 0usize;
+    let mut sanitized_calendar_dates = false;
+
+    for index in 0..source_zip.len() {
+        let mut entry = source_zip.by_index(index).with_context(|| {
+            format!(
+                "unable to read entry #{index} from GTFS zip for feed {}",
+                feed.id
+            )
+        })?;
+        let name = entry.name().to_owned();
+        let mut options = zip::write::FileOptions::default()
+            .compression_method(entry.compression());
+        if let Some(mode) = entry.unix_mode() {
+            options = options.unix_permissions(mode);
+        }
+
+        if entry.is_dir() {
+            writer.add_directory(name, options).with_context(|| {
+                format!("unable to write directory entry into sanitized GTFS for {}", feed.id)
+            })?;
+            continue;
+        }
+
+        writer.start_file(name.clone(), options).with_context(|| {
+            format!(
+                "unable to start file {} in sanitized GTFS for {}",
+                name,
+                feed.id
+            )
+        })?;
+
+        let entry_name = name.rsplit('/').next().unwrap_or(name.as_str());
+        if entry_name.eq_ignore_ascii_case("calendar_dates.txt") {
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).with_context(|| {
+                format!(
+                    "unable to read calendar_dates.txt from GTFS zip for {}",
+                    feed.id
+                )
+            })?;
+            let (sanitized, rewritten) = sanitize_calendar_dates_contents(&contents);
+            rewritten_rows += rewritten;
+            sanitized_calendar_dates = true;
+            writer.write_all(sanitized.as_bytes()).with_context(|| {
+                format!(
+                    "unable to write sanitized calendar_dates.txt for {}",
+                    feed.id
+                )
+            })?;
+        } else {
+            copy(&mut entry, &mut writer).with_context(|| {
+                format!(
+                    "unable to copy GTFS entry {} into sanitized archive for {}",
+                    name,
+                    feed.id
+                )
+            })?;
+        }
+    }
+
+    writer.finish().with_context(|| {
+        format!(
+            "unable to finalize sanitized GTFS zip for feed {} at {}",
+            feed.id,
+            sanitized_path.display()
+        )
+    })?;
+
+    if !sanitized_calendar_dates {
+        bail!(
+            "calendar_dates.txt was not found in GTFS zip for feed {} while sanitizing {}",
+            feed.id,
+            feed.static_gtfs_path.display()
+        );
+    }
+
+    warn!(
+        feed_id = %feed.id,
+        path = %sanitized_path.display(),
+        rewritten_rows,
+        "wrote sanitized GTFS zip after normalizing invalid calendar_dates rows"
+    );
+
+    Ok(sanitized_path)
+}
+
+fn sanitize_calendar_dates_contents(contents: &str) -> (String, usize) {
+    let mut lines = contents.lines();
+    let mut sanitized = String::new();
+    let mut rewritten_rows = 0usize;
+
+    if let Some(header) = lines.next() {
+        sanitized.push_str(header);
+        sanitized.push('\n');
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let exception_type = trimmed
+            .rsplit(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"');
+
+        if matches!(exception_type, "1" | "2") {
+            sanitized.push_str(line);
+            sanitized.push('\n');
+            continue;
+        }
+
+        if exception_type == "0" {
+            let split_at = line.rfind(',').unwrap_or(line.len());
+            sanitized.push_str(&line[..split_at]);
+            sanitized.push_str(",2\n");
+            rewritten_rows += 1;
+        }
+    }
+
+    (sanitized, rewritten_rows)
 }
 
 fn summarize_static_divergence(previous: &StaticData, next: &StaticCore) -> StaticDiffSummary {

@@ -379,6 +379,14 @@ impl RealtimeStore {
             .unwrap_or(false)
     }
 
+    pub fn has_trip_update(&self, trip_index: usize) -> bool {
+        self.canceled_trips.contains_key(&trip_index)
+            || self
+                .stop_deltas
+                .iter()
+                .any(|entry| entry.key().0 == trip_index)
+    }
+
     pub fn actual_arrival(&self, trips: &[TripRecord], trip_index: usize, stop_pos: usize) -> i32 {
         let trip = &trips[trip_index];
         let scheduled = trip.stop_times[stop_pos].arrival_secs;

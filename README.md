@@ -120,7 +120,7 @@ poll_interval_secs = 1800
 
 [[feeds]]
 id = "roma"
-static_gtfs = "data/gtfs/rome_static_gtfs.zip"
+static_gtfs = "https://romamobilita.it/sites/default/files/rome_static_gtfs.zip"
 trip_updates_url = "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
 vehicle_positions_url = "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
 depends_on = []

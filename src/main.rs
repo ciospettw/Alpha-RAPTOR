@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
 
     let workspace_root = env::current_dir().context("unable to resolve workspace root")?;
     let bind = env::var("ALPHA_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:7878".to_owned())
+        .unwrap_or_else(|_| "0.0.0.0:7878".to_owned())
         .parse::<SocketAddr>()
         .context("ALPHA_BIND must be a valid socket address")?;
     let engine_load_started = std::time::Instant::now();
