@@ -1,4 +1,4 @@
-osm_pbf = "https://download.geofabrik.de/europe/italy/centro-latest.osm.pbf"
+osm_pbf = "https://download.geofabrik.de/europe/italy/nord-est-latest.osm.pbf"
 walk_radius_meters = 450.0
 walk_speed_mps = 1.35
 max_transfer_candidates = 12
@@ -18,20 +18,14 @@ snap_quadratic_kappa_meters = 40.0
 search_window = 512
 
 [osm_diff]
-state_url = "https://download.geofabrik.de/europe/italy/centro-updates/state.txt"
+state_url = "https://download.geofabrik.de/europe/italy/nord-est-updates/state.txt"
 poll_interval_secs = 1800
 
 [[feeds]]
-id = "roma"
-static_gtfs = "data/gtfs/rome_static_gtfs.zip"
-trip_updates_url = "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
-vehicle_positions_url = "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
-depends_on = []
-
-[[feeds]]
-id = "cotral"
-static_gtfs = "https://travel.mob.cotralspa.it:4443/GTFS/GTFS_COTRAL.zip"
-static_gtfs_allow_invalid_tls = true
+id = "padova"
+static_gtfs = "http://51.91.97.210:560/gtfs.zip"
+trip_updates_url = "http://127.0.0.1:8080/trip-updates"
+vehicle_positions_url = "http://127.0.0.1:8080/vehicle-positions"
 depends_on = []
 
 # Example for a second tenant/feed:
