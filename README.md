@@ -121,8 +121,8 @@ poll_interval_secs = 1800
 [[feeds]]
 id = "roma"
 static_gtfs = "https://romamobilita.it/sites/default/files/rome_static_gtfs.zip"
-trip_updates_url = "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
-vehicle_positions_url = "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
+trip_updates_url = "${ALPHA_TRIP_UPDATES_URL:-https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb}"
+vehicle_positions_url = "${ALPHA_VEHICLE_POSITIONS_URL:-https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb}"
 depends_on = []
 
 [[feeds]]
@@ -190,6 +190,7 @@ Operational notes:
 
 - Feed ids must be unique and must not contain `:` because the runtime uses `feed_id:local_id` namespacing.
 - Relative paths in the manifest are resolved from the manifest directory.
+- `trip_updates_url` and `vehicle_positions_url` also accept `${ENV_NAME}` or `${ENV_NAME:-fallback}` placeholders, so Docker Compose can inject realtime endpoints without rewriting the manifest.
 - Remote GTFS ZIPs are cached locally and probed with `HEAD` during polling.
 - If upstream metadata changes, Alpha-RAPTOR downloads the new ZIP and hot-swaps the rebuilt engine in background.
 
@@ -201,6 +202,8 @@ Operational notes:
 | --- | --- |
 | `ALPHA_CONFIG` | Overrides the manifest path instead of the default [alpha-raptor.toml](alpha-raptor.toml). |
 | `ALPHA_BIND` | Bind address for the HTTP server, for example `127.0.0.1:7878` or `0.0.0.0:7878`. |
+| `ALPHA_TRIP_UPDATES_URL` | Overrides `feeds[].trip_updates_url`, including when the manifest uses placeholders. |
+| `ALPHA_VEHICLE_POSITIONS_URL` | Overrides `feeds[].vehicle_positions_url`, including when the manifest uses placeholders. |
 | `RUST_LOG` | Standard tracing filter used by the runtime logger. |
 
 ### Legacy Environment-Only Configuration

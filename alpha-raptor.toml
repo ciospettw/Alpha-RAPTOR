@@ -24,8 +24,8 @@ poll_interval_secs = 1800
 [[feeds]]
 id = "padova"
 static_gtfs = "http://51.91.97.210:560/gtfs.zip"
-trip_updates_url = "http://127.0.0.1:8080/trip-updates"
-vehicle_positions_url = "http://127.0.0.1:8080/vehicle-positions"
+trip_updates_url = "${ALPHA_TRIP_UPDATES_URL:-http://127.0.0.1:8080/trip-updates}"
+vehicle_positions_url = "${ALPHA_VEHICLE_POSITIONS_URL:-http://127.0.0.1:8080/vehicle-positions}"
 depends_on = []
 
 # Example for a second tenant/feed:

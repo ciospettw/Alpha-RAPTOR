@@ -3,6 +3,8 @@
 /target-*/
 /.vscode/
 /*.code-workspace
+/Dockerfile
+/docker-compose.yml
 /paper-figures/
 
 /data/osm/*.pbf

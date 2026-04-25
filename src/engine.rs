@@ -1111,8 +1111,14 @@ impl EngineConfig {
                 static_gtfs_source: prepared_static_gtfs.source,
                 static_gtfs_remote_url: prepared_static_gtfs.remote_url,
                 static_gtfs_allow_invalid_tls: prepared_static_gtfs.allow_invalid_tls,
-                trip_updates_url: raw_feed.trip_updates_url,
-                vehicle_positions_url: raw_feed.vehicle_positions_url,
+                trip_updates_url: resolve_feed_endpoint(
+                    raw_feed.trip_updates_url,
+                    "ALPHA_TRIP_UPDATES_URL",
+                )?,
+                vehicle_positions_url: resolve_feed_endpoint(
+                    raw_feed.vehicle_positions_url,
+                    "ALPHA_VEHICLE_POSITIONS_URL",
+                )?,
                 depends_on: raw_feed.depends_on,
             });
         }
@@ -4913,6 +4919,44 @@ struct PreparedStaticGtfsSource {
     allow_invalid_tls: bool,
 }
 
+fn resolve_manifest_env_value(raw_value: &str) -> Result<String> {
+    let Some(body) = raw_value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Ok(raw_value.to_owned());
+    };
+
+    if let Some((var_name, default_value)) = body.split_once(":-") {
+        return Ok(env::var(var_name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default_value.to_owned()));
+    }
+
+    env::var(body).with_context(|| {
+        format!(
+            "manifest placeholder {raw_value} requires environment variable {body}"
+        )
+    })
+}
+
+fn resolve_feed_endpoint(
+    configured_value: Option<String>,
+    override_env_var: &str,
+) -> Result<Option<String>> {
+    if let Ok(override_value) = env::var(override_env_var) {
+        if !override_value.is_empty() {
+            return Ok(Some(override_value));
+        }
+    }
+
+    configured_value
+        .as_deref()
+        .map(resolve_manifest_env_value)
+        .transpose()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StaticGtfsRefreshMode {
     Bootstrap,
@@ -8292,10 +8336,11 @@ mod tests {
 
     use super::{
         CHRONOS_BUCKET_SECS, LineRecord, PolylinePoint, RemoteStaticGtfsVersionMetadata,
-        ShapePoint, StopRecord, TripRecord, TripStopRecord, WalkGeometry, WalkTransfer,
-        build_chronos_bucket_start_indices, build_shape_stop_point_indices,
-        build_transfer_relax_index, build_walk_directions, finalize_line_temporal_indices,
-        intermediate_trip_stop_times, remote_static_gtfs_version_changed,
+        ShapePoint, StopRecord, SystemTime, TripRecord, TripStopRecord, UNIX_EPOCH,
+        WalkGeometry, WalkTransfer, build_chronos_bucket_start_indices,
+        build_shape_stop_point_indices, build_transfer_relax_index, build_walk_directions,
+        finalize_line_temporal_indices, intermediate_trip_stop_times,
+        remote_static_gtfs_version_changed, resolve_manifest_env_value,
         shape_polyline_segment, stitch_walk_geometries,
         svrt_chunk_has_catchup_candidate_scalar,
     };
@@ -8307,6 +8352,40 @@ mod tests {
 
         let gap_bucket = ((10 * 3600) + (15 * 60)) / CHRONOS_BUCKET_SECS;
         assert_eq!(indices[gap_bucket as usize], 1);
+    }
+
+    #[test]
+    fn manifest_endpoint_placeholders_use_defaults_and_env_overrides() {
+        let unique_suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before UNIX_EPOCH")
+                .as_nanos()
+        );
+        let env_name = format!("ALPHA_TEST_RT_URL_{unique_suffix}");
+        let placeholder = format!("${{{env_name}:-http://127.0.0.1:8080/trip-updates}}");
+
+        assert_eq!(
+            resolve_manifest_env_value(&placeholder).unwrap(),
+            "http://127.0.0.1:8080/trip-updates"
+        );
+
+        // SAFETY: this test uses a process-unique variable name and restores it before exit.
+        unsafe {
+            std::env::set_var(&env_name, "https://example.com/trip-updates");
+        }
+
+        assert_eq!(
+            resolve_manifest_env_value(&placeholder).unwrap(),
+            "https://example.com/trip-updates"
+        );
+
+        // SAFETY: this removes only the process-unique variable created by this test.
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
     }
 
     #[test]
