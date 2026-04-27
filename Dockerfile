@@ -19,4 +19,4 @@ ENV ALPHA_BIND=0.0.0.0:7878
 
 EXPOSE 7878
 
-CMD ["cargo", "run", "--release", "--locked"]
+CMD ["/app/target/release/alpha_raptor_engine"]

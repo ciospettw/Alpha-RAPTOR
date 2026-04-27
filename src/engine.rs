@@ -106,6 +106,7 @@ struct RawHpfConfig {
     snap_tolerance_meters: Option<f64>,
     snap_quadratic_kappa_meters: Option<f64>,
     search_window: Option<usize>,
+    defer_rebuild_on_bootstrap: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +193,7 @@ pub struct EngineConfig {
     pub hpf_snap_tolerance_meters: f64,
     pub hpf_snap_quadratic_kappa_meters: f64,
     pub hpf_search_window: usize,
+    pub hpf_defer_rebuild_on_bootstrap: bool,
     pub osm_diff: Option<HpfDiffConfig>,
     static_inputs_metadata: StaticCacheMetadata,
 }
@@ -1198,6 +1200,11 @@ impl EngineConfig {
                 .and_then(|hpf| hpf.search_window)
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
+            hpf_defer_rebuild_on_bootstrap: manifest
+                .hpf
+                .as_ref()
+                .and_then(|hpf| hpf.defer_rebuild_on_bootstrap)
+                .unwrap_or(false),
             osm_diff: manifest.osm_diff.as_ref().map(|diff| HpfDiffConfig {
                 state_url: diff.state_url.clone(),
                 diff_base_url: diff.diff_base_url.clone(),
@@ -1353,6 +1360,15 @@ impl EngineConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
+            hpf_defer_rebuild_on_bootstrap: matches!(
+                env::var("ALPHA_HPF_DEFER_REBUILD_ON_BOOTSTRAP")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            ),
             osm_diff: env::var("ALPHA_OSM_DIFF_STATE_URL")
                 .ok()
                 .map(|state_url| HpfDiffConfig {
@@ -1680,6 +1696,7 @@ impl Engine {
             config.hpf_snap_tolerance_meters,
             config.hpf_snap_quadratic_kappa_meters,
             config.hpf_search_window,
+            previous.is_none() && config.hpf_defer_rebuild_on_bootstrap,
             config.osm_diff.clone(),
         );
         let hpf_millis = hpf_started.elapsed().as_millis();
