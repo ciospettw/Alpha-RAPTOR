@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use crate::{
     engine::{PolylinePoint, StopRecord},
     geo::{decode_morton_code, decode_morton_components, morton_code, morton_code_from_components},
+    progress::{progress_bar, progress_percent},
 };
 
 const OSM_HPF_STRATEGY: &str = "osm-pbf-cached-hpf";
@@ -1404,17 +1405,26 @@ fn build_hpf_cache_from_data(
     );
 
     let max_snap_distance_meters = max_distance_meters.min(250.0).max(80.0);
-    let stop_anchors = stops
-        .iter()
-        .map(|stop| {
-            snap_stop_to_graph(
-                stop,
-                &graph_index,
-                &graph_coordinates,
-                max_snap_distance_meters,
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut stop_anchors = Vec::with_capacity(stops.len());
+    for (stop_index, stop) in stops.iter().enumerate() {
+        stop_anchors.push(snap_stop_to_graph(
+            stop,
+            &graph_index,
+            &graph_coordinates,
+            max_snap_distance_meters,
+        ));
+        let completed = stop_index + 1;
+        if completed % 512 == 0 || completed == stops.len() {
+            info!(
+                phase = "hpf-anchor-stops",
+                progress = %progress_bar(completed, stops.len()),
+                percent = progress_percent(completed, stops.len()),
+                completed,
+                total = stops.len(),
+                "HPF stop anchor progress"
+            );
+        }
+    }
     let anchored_stops = stop_anchors
         .iter()
         .filter(|anchor| anchor.is_some())
@@ -1428,6 +1438,7 @@ fn build_hpf_cache_from_data(
 
     let mut graph_to_hpf = HashMap::<usize, u32>::new();
     let mut nodes = Vec::<(usize, HpfNode)>::new();
+    let graph_total = best_distances.len().max(1);
     for (graph_index, best_distance) in best_distances.iter().copied().enumerate() {
         let root_stop_index = roots[graph_index];
         if !best_distance.is_finite()
@@ -1449,6 +1460,18 @@ fn build_hpf_cache_from_data(
                 cost_meters: best_distance as f32,
             },
         ));
+
+        let completed = graph_index + 1;
+        if completed % 16384 == 0 || completed == best_distances.len() {
+            info!(
+                phase = "hpf-node-pack",
+                progress = %progress_bar(completed, graph_total),
+                percent = progress_percent(completed, graph_total),
+                completed,
+                total = graph_total,
+                "HPF node packing progress"
+            );
+        }
     }
 
     nodes.sort_by(|left, right| {

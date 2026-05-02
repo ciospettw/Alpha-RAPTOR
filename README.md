@@ -18,6 +18,7 @@ The repository also contains the architecture notes for the core subsystems unde
 - GTFS-Realtime trip updates and vehicle positions refresh in background
 - Coordinate-to-coordinate queries with local OSM-backed walking connectors
 - Built-in HPF cache for first/last mile routing without an external walking service
+- Street-only walk and drive queries over cached local OSM graphs
 - OSM differential overlay support for periodic pedestrian-network updates
 - Built-in HTTP server with JSON endpoints and static UI assets
 
@@ -263,6 +264,7 @@ The server exposes these endpoints:
 | `/api/stats` | `GET` | Build, realtime, memoization, and overlay metrics |
 | `/api/stops` | `GET` | Stop search |
 | `/api/query` | `GET` | Journey planning query |
+| `/api/street` | `GET` | Street-only walk or drive routing |
 | `/api/realtime` | `GET` | Current realtime snapshot |
 | `/api/realtime/refresh` | `POST` | Force an immediate realtime refresh |
 
@@ -290,12 +292,20 @@ GET /api/query?from_gid=123456789&to_gid=987654321&date=2026-04-19&time=09:05
 GET /api/query?from_lat=41.94048&from_lon=12.52909&to_lat=41.82647&to_lon=12.48104&date=2026-04-19&time=09:05
 ```
 
+### Street-Only Routing Example
+
+```text
+GET /api/street?mode=drive&from_lat=41.90085&from_lon=12.48354&to_lat=41.89025&to_lon=12.49223
+GET /api/street?mode=walk&from_lat=41.90212&from_lon=12.49611&to_lat=41.89802&to_lon=12.48391
+```
+
 ### cURL Examples
 
 ```bash
 curl "http://127.0.0.1:7878/api/health"
 curl "http://127.0.0.1:7878/api/stops?q=termini&limit=8"
 curl "http://127.0.0.1:7878/api/query?from=roma:70378&to=roma:71404&date=2026-04-19&time=09:05&max_transfers=3"
+curl "http://127.0.0.1:7878/api/street?mode=drive&from_lat=41.90085&from_lon=12.48354&to_lat=41.89025&to_lon=12.49223"
 curl -X POST "http://127.0.0.1:7878/api/realtime/refresh"
 ```
 
@@ -318,6 +328,8 @@ curl -X POST "http://127.0.0.1:7878/api/realtime/refresh"
 | `max_transfers` | no | Overrides the runtime default transfer limit. |
 
 Use either stop identifiers or coordinates. Coordinate queries inject virtual source/destination walking connectors into the routing search.
+
+`/api/street` accepts `from_lat`, `from_lon`, `to_lat`, `to_lon`, and an optional `mode` parameter (`drive` by default, `walk` also supported). The response contains distance, duration, polyline geometry, turn-by-turn directions, and snap/query trace metrics.
 
 ## Repository Layout
 

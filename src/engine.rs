@@ -33,7 +33,11 @@ use crate::profile_cache::{
     CachedLeg, PreparedSpatialLookup, ProfileCache, ProfileCacheStats, ProfileInsertionPoint,
     ProfileLookupDecision, SpatialProfileInsertionPoint,
 };
+use crate::progress::{progress_bar, progress_bar_u64, progress_percent, progress_percent_u64};
 use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore};
+use crate::street::{
+    StreetMode, StreetRouter, StreetRouterOverlaySnapshot, build_or_load_street_router,
+};
 use crate::walker::{
     WalkerBuildResult, build_or_load_walker_transfers, rebuild_walker_transfers_subset,
 };
@@ -139,6 +143,7 @@ pub struct Engine {
     profile_cache: ProfileCache,
     walk_way_names: Arc<HashMap<i64, String>>,
     hpf: Option<HolographicPedestrianForest>,
+    street_router: Option<Arc<StreetRouter>>,
 }
 
 #[derive(Clone)]
@@ -381,12 +386,22 @@ pub struct QueryRequest {
     pub max_transfers: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StreetRouteRequest {
+    pub mode: Option<String>,
+    pub from_lat: Option<f64>,
+    pub from_lon: Option<f64>,
+    pub to_lat: Option<f64>,
+    pub to_lon: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EngineStats {
     pub build: BuildStats,
     pub realtime: RealtimeDebugSnapshot,
     pub memoization: ProfileCacheStats,
     pub hpf_overlay: Option<HpfOverlaySnapshot>,
+    pub street_overlay: Option<StreetRouterOverlaySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -485,6 +500,34 @@ pub struct QueryResponse {
     pub legs: Vec<LegResponse>,
     pub deferred_hydration: DeferredHydrationResponse,
     pub trace: QueryTrace,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreetRouteResponse {
+    pub mode: &'static str,
+    pub from: StreetCoordinatePoint,
+    pub to: StreetCoordinatePoint,
+    pub duration_seconds: i32,
+    pub distance_meters: f64,
+    pub polyline: Vec<PolylinePoint>,
+    pub directions: Vec<WalkDirection>,
+    pub trace: StreetRouteTrace,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreetCoordinatePoint {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreetRouteTrace {
+    pub strategy: &'static str,
+    pub query_runtime_ms: u128,
+    pub source_snap_distance_meters: f64,
+    pub destination_snap_distance_meters: f64,
+    pub explored_forward_nodes: usize,
+    pub explored_backward_nodes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1343,6 +1386,14 @@ impl Engine {
     fn load_internal(config: EngineConfig, previous: Option<&Engine>) -> Result<Self> {
         let started = Instant::now();
         let static_core_result = load_or_build_static_core(&config, previous)?;
+        info!(
+            phase = "engine-bootstrap",
+            step = 1,
+            total_steps = 5,
+            progress = %progress_bar(1, 5),
+            percent = progress_percent(1, 5),
+            "bootstrap progress"
+        );
         let cold_store_started = Instant::now();
         let cold_generation = static_metadata_generation_token(&config.static_inputs_metadata);
         let cold_store = Arc::new(ColdStore::load_or_build(
@@ -1354,6 +1405,15 @@ impl Engine {
             &static_core_result.core.shapes,
         )?);
         let cold_store_ms = cold_store_started.elapsed().as_millis();
+        info!(
+            phase = "engine-bootstrap",
+            step = 2,
+            total_steps = 5,
+            progress = %progress_bar(2, 5),
+            percent = progress_percent(2, 5),
+            cold_store_ms,
+            "bootstrap progress"
+        );
         let StaticCore {
             feeds,
             stops,
@@ -1400,6 +1460,15 @@ impl Engine {
             }
         }
         let walker_millis = walker_started.elapsed().as_millis();
+        info!(
+            phase = "engine-bootstrap",
+            step = 3,
+            total_steps = 5,
+            progress = %progress_bar(3, 5),
+            percent = progress_percent(3, 5),
+            walker_ms = walker_millis,
+            "bootstrap progress"
+        );
         let transfers = walker_build.transfers;
         let walk_way_names = Arc::new(walker_build.way_names.clone());
         let transfer_hub_cell_meters = (config.walk_radius_meters / 3.0)
@@ -1443,6 +1512,35 @@ impl Engine {
                     (None, "hpf-unavailable-stop-knn-fallback", false, 0, 0)
                 }
             };
+        info!(
+            phase = "engine-bootstrap",
+            step = 4,
+            total_steps = 5,
+            progress = %progress_bar(4, 5),
+            percent = progress_percent(4, 5),
+            hpf_ms = hpf_millis,
+            "bootstrap progress"
+        );
+
+        let street_router = match build_or_load_street_router(
+            &config.osm_pbf_path,
+            &runtime_cache_dir(&config.workspace_root, "osm"),
+            config.osm_diff.clone(),
+        ) {
+            Ok(router) => Some(Arc::new(router)),
+            Err(error) => {
+                warn!(%error, "failed to build street router; /api/street will be unavailable");
+                None
+            }
+        };
+        info!(
+            phase = "engine-bootstrap",
+            step = 5,
+            total_steps = 5,
+            progress = %progress_bar(5, 5),
+            percent = progress_percent(5, 5),
+            "bootstrap progress"
+        );
 
         let stop_cells = build_stop_cells(&stops, &active_stop_indices);
         let coordinate_query_strategy = if hpf.is_some() {
@@ -1550,6 +1648,7 @@ impl Engine {
             profile_cache: ProfileCache::new(),
             walk_way_names,
             hpf,
+            street_router,
         })
     }
 
@@ -1584,6 +1683,7 @@ impl Engine {
             realtime: self.realtime.snapshot(&self.static_data, 16),
             memoization: self.profile_cache.snapshot(),
             hpf_overlay: self.hpf.as_ref().map(|hpf| hpf.overlay_snapshot()),
+            street_overlay: self.street_router.as_ref().map(|router| router.overlay_snapshot()),
         }
     }
 
@@ -1598,8 +1698,72 @@ impl Engine {
             .map(Some)
     }
 
+    pub async fn refresh_street_overlay(&self) -> Result<Option<StreetRouterOverlaySnapshot>> {
+        let Some(router) = self.street_router.clone() else {
+            return Ok(None);
+        };
+
+        tokio::task::spawn_blocking(move || router.poll_remote_updates())
+            .await
+            .context("street overlay refresh task panicked")?
+            .map(Some)
+    }
+
     pub fn realtime_snapshot(&self, limit: usize) -> RealtimeDebugSnapshot {
         self.realtime.snapshot(&self.static_data, limit)
+    }
+
+    pub async fn run_street_route(
+        &self,
+        request: StreetRouteRequest,
+    ) -> Result<StreetRouteResponse> {
+        let mode = StreetMode::parse(request.mode.as_deref())?;
+        let from_lat = validate_query_latitude("from_lat", request.from_lat)?;
+        let from_lon = validate_query_longitude("from_lon", request.from_lon)?;
+        let to_lat = validate_query_latitude("to_lat", request.to_lat)?;
+        let to_lon = validate_query_longitude("to_lon", request.to_lon)?;
+        let router = self
+            .street_router
+            .clone()
+            .ok_or_else(|| anyhow!("street router unavailable for the current OSM extract"))?;
+
+        let route_started = Instant::now();
+        let path = tokio::task::spawn_blocking(move || {
+            router.route(mode, (from_lat, from_lon), (to_lat, to_lon))
+        })
+        .await
+        .context("street routing task panicked")??;
+
+        let geometry = WalkGeometry {
+            polyline: path.polyline.clone(),
+            segment_way_ids: path.segment_way_ids.clone(),
+        };
+        let directions = build_road_directions(&geometry, path.way_names.as_ref(), "");
+
+        Ok(StreetRouteResponse {
+            mode: mode.as_str(),
+            from: StreetCoordinatePoint {
+                lat: from_lat,
+                lon: from_lon,
+            },
+            to: StreetCoordinatePoint {
+                lat: to_lat,
+                lon: to_lon,
+            },
+            duration_seconds: i32::try_from(path.duration_seconds)
+                .unwrap_or(i32::MAX.saturating_sub(1)),
+            distance_meters: path.distance_meters,
+            polyline: path.polyline,
+            directions,
+            trace: StreetRouteTrace {
+                strategy: path.strategy,
+                query_runtime_ms: route_started.elapsed().as_millis(),
+                source_snap_distance_meters: path.source_snap_distance_meters,
+                destination_snap_distance_meters: path.destination_snap_distance_meters,
+                explored_forward_nodes: path.explored_forward_nodes,
+                explored_backward_nodes: path.explored_backward_nodes,
+            },
+        })
     }
 
     pub fn search_stops(&self, query: &str, limit: usize) -> Vec<StopSearchResult> {
@@ -5383,13 +5547,25 @@ fn stream_blocking_response_to_file(
         downloaded_bytes += read as u64;
 
         if downloaded_bytes >= next_progress_log {
-            info!(
-                artifact = artifact_name,
-                destination = %destination_path.display(),
-                downloaded_bytes,
-                total_bytes = total_bytes.unwrap_or(0),
-                "streamed remote download progress"
-            );
+            if let Some(total_bytes) = total_bytes {
+                info!(
+                    artifact = artifact_name,
+                    destination = %destination_path.display(),
+                    downloaded_bytes,
+                    total_bytes,
+                    progress = %progress_bar_u64(downloaded_bytes, total_bytes),
+                    percent = progress_percent_u64(downloaded_bytes, total_bytes),
+                    "streamed remote download progress"
+                );
+            } else {
+                info!(
+                    artifact = artifact_name,
+                    destination = %destination_path.display(),
+                    downloaded_bytes,
+                    total_bytes = 0,
+                    "streamed remote download progress"
+                );
+            }
             next_progress_log += 64_u64 * 1024 * 1024;
         }
     }
@@ -5615,7 +5791,8 @@ fn load_or_build_static_core(
 
     let gtfs_parse_started = Instant::now();
     let mut parsed_feeds = Vec::<(FeedConfig, Gtfs)>::with_capacity(config.feeds.len());
-    for feed in &config.feeds {
+    let feed_total = config.feeds.len().max(1);
+    for (feed_index, feed) in config.feeds.iter().enumerate() {
         let gtfs = Gtfs::from_path(&feed.static_gtfs_path).with_context(|| {
             format!(
                 "unable to read GTFS for feed {} from {}",
@@ -5624,6 +5801,15 @@ fn load_or_build_static_core(
             )
         })?;
         parsed_feeds.push((feed.clone(), gtfs));
+        info!(
+            phase = "gtfs-parse",
+            progress = %progress_bar(feed_index + 1, feed_total),
+            percent = progress_percent(feed_index + 1, feed_total),
+            completed = feed_index + 1,
+            total = feed_total,
+            feed_id = %feed.id,
+            "GTFS parse progress"
+        );
     }
     timings.gtfs_parse_ms = gtfs_parse_started.elapsed().as_millis();
     info!(
@@ -5905,7 +6091,8 @@ fn build_static_core(parsed_feeds: &[(FeedConfig, Gtfs)]) -> Result<StaticCore> 
     let mut service_by_date = HashMap::<NaiveDate, HashSet<String>>::new();
     let mut shapes = HashMap::new();
 
-    for (feed, gtfs) in parsed_feeds {
+    let feed_total = parsed_feeds.len().max(1);
+    for (feed_index, (feed, gtfs)) in parsed_feeds.iter().enumerate() {
         feeds.push(FeedRecord {
             feed_index: feed.feed_index,
             id: feed.id.clone(),
@@ -6070,6 +6257,18 @@ fn build_static_core(parsed_feeds: &[(FeedConfig, Gtfs)]) -> Result<StaticCore> 
         }
 
         merge_service_calendar(&mut service_by_date, &feed.id, gtfs);
+        info!(
+            phase = "transit-core",
+            progress = %progress_bar(feed_index + 1, feed_total),
+            percent = progress_percent(feed_index + 1, feed_total),
+            completed = feed_index + 1,
+            total = feed_total,
+            feed_id = %feed.id,
+            stops = gtfs.stops.len(),
+            routes = gtfs.routes.len(),
+            trips = gtfs.trips.len(),
+            "transit core feed normalization progress"
+        );
     }
 
     let mut lines = Vec::<LineRecord>::new();
@@ -6658,6 +6857,39 @@ fn build_walk_directions(
     way_names: &HashMap<i64, String>,
     destination_name: &str,
 ) -> Vec<WalkDirection> {
+    build_turn_directions(
+        geometry,
+        way_names,
+        destination_name,
+        TurnDirectionNarrative::Walk,
+    )
+}
+
+fn build_road_directions(
+    geometry: &WalkGeometry,
+    way_names: &HashMap<i64, String>,
+    destination_name: &str,
+) -> Vec<WalkDirection> {
+    build_turn_directions(
+        geometry,
+        way_names,
+        destination_name,
+        TurnDirectionNarrative::Drive,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TurnDirectionNarrative {
+    Walk,
+    Drive,
+}
+
+fn build_turn_directions(
+    geometry: &WalkGeometry,
+    way_names: &HashMap<i64, String>,
+    destination_name: &str,
+    narrative: TurnDirectionNarrative,
+) -> Vec<WalkDirection> {
     if geometry.polyline.len() < 2 {
         return Vec::new();
     }
@@ -6671,10 +6903,7 @@ fn build_walk_directions(
 
     let mut directions = vec![WalkDirection {
         maneuver: "depart",
-        instruction: match start_street_name.as_ref() {
-            Some(street_name) => format!("Parti a piedi su {street_name}"),
-            None => "Parti a piedi".to_owned(),
-        },
+        instruction: departure_instruction(narrative, start_street_name.as_deref()),
         street_name: start_street_name,
         distance_meters: 0.0,
         lat: geometry.polyline[0].lat,
@@ -6749,6 +6978,22 @@ fn build_walk_directions(
     directions
 }
 
+fn departure_instruction(
+    narrative: TurnDirectionNarrative,
+    street_name: Option<&str>,
+) -> String {
+    match (narrative, street_name) {
+        (TurnDirectionNarrative::Walk, Some(street_name)) => {
+            format!("Parti a piedi su {street_name}")
+        }
+        (TurnDirectionNarrative::Walk, None) => "Parti a piedi".to_owned(),
+        (TurnDirectionNarrative::Drive, Some(street_name)) => {
+            format!("Parti in auto su {street_name}")
+        }
+        (TurnDirectionNarrative::Drive, None) => "Parti in auto".to_owned(),
+    }
+}
+
 fn cumulative_polyline_distances(polyline: &[PolylinePoint]) -> Vec<f64> {
     let mut cumulative = Vec::with_capacity(polyline.len());
     let mut total = 0.0;
@@ -6821,6 +7066,22 @@ fn same_road_identity(
 
 fn points_equal(left: &PolylinePoint, right: &PolylinePoint) -> bool {
     (left.lat - right.lat).abs() <= 1e-7 && (left.lon - right.lon).abs() <= 1e-7
+}
+
+fn validate_query_latitude(label: &str, value: Option<f64>) -> Result<f64> {
+    let value = value.ok_or_else(|| anyhow!("missing {label}"))?;
+    if !value.is_finite() || !(-90.0..=90.0).contains(&value) {
+        bail!("invalid {label}");
+    }
+    Ok(value)
+}
+
+fn validate_query_longitude(label: &str, value: Option<f64>) -> Result<f64> {
+    let value = value.ok_or_else(|| anyhow!("missing {label}"))?;
+    if !value.is_finite() || !(-180.0..=180.0).contains(&value) {
+        bail!("invalid {label}");
+    }
+    Ok(value)
 }
 
 fn build_full_walker_matrix(config: &EngineConfig, stops: &[StopRecord]) -> WalkerBuildResult {
@@ -8373,6 +8634,27 @@ mod tests {
         assert_eq!(directions[0].maneuver, "depart");
         assert_eq!(directions[1].maneuver, "turn-left");
         assert_eq!(directions[2].maneuver, "arrive");
+    }
+
+    #[test]
+    fn build_road_directions_uses_driving_departure_copy() {
+        let mut way_names = HashMap::new();
+        way_names.insert(10, "Tangenziale Est".to_owned());
+
+        let directions = super::build_road_directions(
+            &WalkGeometry {
+                polyline: vec![
+                    test_point(41.9000, 12.5000),
+                    test_point(41.9000, 12.5010),
+                ],
+                segment_way_ids: vec![Some(10)],
+            },
+            &way_names,
+            "",
+        );
+
+        assert_eq!(directions[0].maneuver, "depart");
+        assert!(directions[0].instruction.contains("Parti in auto"));
     }
 
     fn test_stop(global_id: u64, local_id: &str, latitude: f64, longitude: f64) -> StopRecord {

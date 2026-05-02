@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::engine::{PolylinePoint, StopRecord, WalkTransfer};
+use crate::progress::{progress_bar, progress_percent};
 
 const OSM_WALK_STRATEGY: &str = "osm-pbf-cached-dijkstra";
 const FALLBACK_WALK_STRATEGY: &str = "fallback-radius-haversine";
@@ -276,17 +277,26 @@ pub fn rebuild_walker_transfers_subset(
     );
 
     let max_snap_distance_meters = walk_radius_meters.min(250.0).max(80.0);
-    let stop_anchors: Vec<_> = stops
-        .iter()
-        .map(|stop| {
-            snap_stop_to_graph(
-                stop,
-                &graph_index,
-                &graph_coordinates,
-                max_snap_distance_meters,
-            )
-        })
-        .collect();
+    let mut stop_anchors = Vec::with_capacity(stops.len());
+    for (stop_index, stop) in stops.iter().enumerate() {
+        stop_anchors.push(snap_stop_to_graph(
+            stop,
+            &graph_index,
+            &graph_coordinates,
+            max_snap_distance_meters,
+        ));
+        let completed = stop_index + 1;
+        if completed % 512 == 0 || completed == stops.len() {
+            info!(
+                phase = "walker-anchor-stops",
+                progress = %progress_bar(completed, stops.len()),
+                percent = progress_percent(completed, stops.len()),
+                completed,
+                total = stops.len(),
+                "walker stop anchor progress"
+            );
+        }
+    }
     let anchored_stops = stop_anchors
         .iter()
         .filter(|anchor| anchor.is_some())
@@ -388,17 +398,26 @@ fn build_walker_from_osm(
     );
 
     let max_snap_distance_meters = walk_radius_meters.min(250.0).max(80.0);
-    let stop_anchors: Vec<_> = stops
-        .iter()
-        .map(|stop| {
-            snap_stop_to_graph(
-                stop,
-                &graph_index,
-                &graph_coordinates,
-                max_snap_distance_meters,
-            )
-        })
-        .collect();
+    let mut stop_anchors = Vec::with_capacity(stops.len());
+    for (stop_index, stop) in stops.iter().enumerate() {
+        stop_anchors.push(snap_stop_to_graph(
+            stop,
+            &graph_index,
+            &graph_coordinates,
+            max_snap_distance_meters,
+        ));
+        let completed = stop_index + 1;
+        if completed % 512 == 0 || completed == stops.len() {
+            info!(
+                phase = "walker-anchor-stops",
+                progress = %progress_bar(completed, stops.len()),
+                percent = progress_percent(completed, stops.len()),
+                completed,
+                total = stops.len(),
+                "walker stop anchor progress"
+            );
+        }
+    }
     let anchored_stops = stop_anchors
         .iter()
         .filter(|anchor| anchor.is_some())
@@ -427,7 +446,14 @@ fn build_walker_from_osm(
             );
             let completed = processed.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             if completed % 512 == 0 || completed == stops.len() {
-                info!(completed, total = stops.len(), "walker precompute progress");
+                info!(
+                    phase = "walker-precompute",
+                    progress = %progress_bar(completed, stops.len()),
+                    percent = progress_percent(completed, stops.len()),
+                    completed,
+                    total = stops.len(),
+                    "walker precompute progress"
+                );
             }
             neighbours
         })
@@ -450,7 +476,8 @@ fn build_pedestrian_graph(
     let mut graph_edges = Vec::<Vec<PedestrianEdge>>::new();
     let mut node_lookup = HashMap::<NodeId, usize>::new();
 
-    for way in ways {
+    let total_ways = ways.len().max(1);
+    for (way_index, way) in ways.iter().enumerate() {
         for window in way.nodes.windows(2) {
             let from_id = window[0];
             let to_id = window[1];
@@ -495,6 +522,18 @@ fn build_pedestrian_graph(
                 distance_meters,
                 way_id: way.id.0,
             });
+        }
+
+        let completed = way_index + 1;
+        if completed % 4096 == 0 || completed == ways.len() {
+            info!(
+                phase = "walker-graph-build",
+                progress = %progress_bar(completed, total_ways),
+                percent = progress_percent(completed, total_ways),
+                completed,
+                total = total_ways,
+                "walker graph build progress"
+            );
         }
     }
 

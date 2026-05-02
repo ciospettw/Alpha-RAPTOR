@@ -2,8 +2,10 @@ mod cold_storage;
 mod engine;
 mod geo;
 mod hpf;
+mod progress;
 mod profile_cache;
 mod realtime;
+mod street;
 mod walker;
 
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -22,7 +24,7 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::engine::{Engine, EngineConfig, QueryRequest};
+use crate::engine::{Engine, EngineConfig, QueryRequest, StreetRouteRequest};
 
 #[derive(Clone)]
 struct AppState {
@@ -110,6 +112,7 @@ async fn main() -> Result<()> {
     spawn_realtime_refresh(shared_engine.clone());
     spawn_static_reload(shared_engine.clone());
     spawn_hpf_overlay_refresh(shared_engine.clone());
+    spawn_street_overlay_refresh(shared_engine.clone());
 
     let public_dir = workspace_root.join("public");
     let app = Router::new()
@@ -118,6 +121,7 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(stats))
         .route("/api/stops", get(search_stops))
         .route("/api/query", get(run_query))
+        .route("/api/street", get(run_street_route))
         .route("/api/realtime", get(realtime_snapshot))
         .route("/api/realtime/refresh", post(refresh_realtime))
         .nest_service("/assets", ServeDir::new(public_dir))
@@ -296,6 +300,47 @@ fn spawn_hpf_overlay_refresh(engine: SharedEngine) {
     });
 }
 
+fn spawn_street_overlay_refresh(engine: SharedEngine) {
+    tokio::spawn(async move {
+        let mut first_cycle = true;
+        loop {
+            let poll_every = match engine.current().config.osm_diff.as_ref() {
+                Some(config) => Duration::from_secs(config.poll_interval_secs),
+                None => Duration::from_secs(300),
+            };
+
+            if first_cycle {
+                first_cycle = false;
+            } else {
+                tokio::time::sleep(poll_every).await;
+            }
+
+            let current_engine = engine.current();
+            if current_engine.config.osm_diff.is_none() {
+                continue;
+            }
+
+            match current_engine.refresh_street_overlay().await {
+                Ok(Some(snapshot)) => {
+                    info!(
+                        walk_applied_sequence = ?snapshot.walk.applied_sequence,
+                        walk_blocked_way_ids = snapshot.walk.blocked_way_ids,
+                        walk_way_overrides = snapshot.walk.way_overrides,
+                        drive_applied_sequence = ?snapshot.drive.applied_sequence,
+                        drive_blocked_way_ids = snapshot.drive.blocked_way_ids,
+                        drive_way_overrides = snapshot.drive.way_overrides,
+                        "background street overlay refresh completed"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(%error, "background street overlay refresh failed");
+                }
+            }
+        }
+    });
+}
+
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         error!(%error, "failed to install Ctrl+C handler");
@@ -328,6 +373,16 @@ async fn run_query(
     Query(params): Query<QueryRequest>,
 ) -> impl IntoResponse {
     match state.engine.current().run_query(params).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()),
+    }
+}
+
+async fn run_street_route(
+    State(state): State<AppState>,
+    Query(params): Query<StreetRouteRequest>,
+) -> impl IntoResponse {
+    match state.engine.current().run_street_route(params).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()),
     }

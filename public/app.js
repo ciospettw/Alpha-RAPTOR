@@ -2,6 +2,7 @@ const state = {
   stats: null,
   realtime: null,
   query: null,
+  busyCount: 0,
   map: null,
   routeLayer: null,
   vehicleLayer: null,
@@ -20,6 +21,7 @@ const dom = {
   toSearch: document.getElementById("toSearch"),
   toStopId: document.getElementById("toStopId"),
   toResults: document.getElementById("toResults"),
+  routeModeSelect: document.getElementById("routeModeSelect"),
   dateInput: document.getElementById("dateInput"),
   timeInput: document.getElementById("timeInput"),
   maxTransfersInput: document.getElementById("maxTransfersInput"),
@@ -35,6 +37,7 @@ const dom = {
   realtimeContainer: document.getElementById("realtimeContainer"),
   refreshRealtimeButton: document.getElementById("refreshRealtimeButton"),
   refreshStatus: document.getElementById("refreshStatus"),
+  topbarProgress: document.getElementById("topbarProgress"),
 };
 
 initialize();
@@ -45,10 +48,12 @@ async function initialize() {
   wireSearch("from", dom.fromSearch, dom.fromStopId, dom.fromResults);
   wireSearch("to", dom.toSearch, dom.toStopId, dom.toResults);
   dom.queryForm.addEventListener("submit", onSubmitQuery);
+  dom.routeModeSelect.addEventListener("change", onRouteModeChange);
   dom.swapButton.addEventListener("click", swapStops);
   dom.pickFromButton.addEventListener("click", () => setMapSelectionTarget("from"));
   dom.pickToButton.addEventListener("click", () => setMapSelectionTarget("to"));
   dom.refreshRealtimeButton.addEventListener("click", refreshRealtime);
+  syncRouteModeUI();
   setMapSelectionTarget("from");
 
   await Promise.all([loadStats(), loadRealtime()]);
@@ -94,19 +99,30 @@ function setMapSelectionTarget(prefix) {
 }
 
 async function loadStats() {
-  const payload = await fetchJson("/api/stats");
-  state.stats = payload;
-  renderStats();
+  const releaseBusy = beginBusy();
+  try {
+    const payload = await fetchJson("/api/stats");
+    state.stats = payload;
+    renderStats();
+  } finally {
+    releaseBusy();
+  }
 }
 
 async function loadRealtime() {
-  const payload = await fetchJson("/api/realtime?limit=24");
-  state.realtime = payload;
-  renderRealtime();
+  const releaseBusy = beginBusy();
+  try {
+    const payload = await fetchJson("/api/realtime?limit=24");
+    state.realtime = payload;
+    renderRealtime();
+  } finally {
+    releaseBusy();
+  }
 }
 
 async function refreshRealtime() {
   setRefreshStatus("sync", true);
+  const releaseBusy = beginBusy();
   try {
     const payload = await fetchJson("/api/realtime/refresh", { method: "POST" });
     state.realtime = payload;
@@ -119,31 +135,43 @@ async function refreshRealtime() {
   } catch (error) {
     setRefreshStatus("errore", false);
     dom.realtimeContainer.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
+  } finally {
+    releaseBusy();
   }
 }
 
 async function onSubmitQuery(event) {
   event.preventDefault();
-  const search = new URLSearchParams({
-    date: dom.dateInput.value,
-    time: dom.timeInput.value,
-    max_transfers: dom.maxTransfersInput.value,
-  });
+  const routeMode = getRouteMode();
+  const search = new URLSearchParams();
 
   try {
-    appendEndpointParams(search, "from", dom.fromSearch, dom.fromStopId);
-    appendEndpointParams(search, "to", dom.toSearch, dom.toStopId);
+    if (routeMode === "drive-only") {
+      search.set("mode", "drive");
+      appendStreetEndpointParams(search, "from", dom.fromSearch);
+      appendStreetEndpointParams(search, "to", dom.toSearch);
+    } else {
+      search.set("date", dom.dateInput.value);
+      search.set("time", dom.timeInput.value);
+      search.set("max_transfers", dom.maxTransfersInput.value);
+      appendEndpointParams(search, "from", dom.fromSearch, dom.fromStopId);
+      appendEndpointParams(search, "to", dom.toSearch, dom.toStopId);
+    }
   } catch (error) {
     dom.itinerarySummary.textContent = error.message;
     dom.itinerarySummary.className = "summary-strip error-strip";
     return;
   }
 
-  dom.itinerarySummary.textContent = "Query in esecuzione...";
+  dom.itinerarySummary.textContent = routeMode === "drive-only"
+    ? "Routing stradale in esecuzione..."
+    : "Query in esecuzione...";
   dom.itinerarySummary.className = "summary-strip";
 
+  const releaseBusy = beginBusy();
   try {
-    const payload = await fetchJson(`/api/query?${search.toString()}`);
+    const endpoint = routeMode === "drive-only" ? "/api/street" : "/api/query";
+    const payload = await fetchJson(`${endpoint}?${search.toString()}`);
     state.query = payload;
     renderQuery();
   } catch (error) {
@@ -154,7 +182,22 @@ async function onSubmitQuery(event) {
     dom.traceContainer.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
     clearMapLayers();
     renderEndpointSelections();
+  } finally {
+    releaseBusy();
   }
+}
+
+function onRouteModeChange() {
+  syncRouteModeUI();
+  if (!state.query) {
+    return;
+  }
+
+  markRouteStale(
+    getRouteMode() === "drive-only"
+      ? "Modalità drive only attiva. Premi Route."
+      : "Modalità transit attiva. Premi Route.",
+  );
 }
 
 function swapStops() {
@@ -201,11 +244,14 @@ function wireSearch(prefix, input, hiddenInput, resultsContainer) {
     }
 
     timer = setTimeout(async () => {
+      const releaseBusy = beginBusy();
       try {
         const payload = await fetchJson(`/api/stops?q=${encodeURIComponent(value)}&limit=8`);
         renderSearchResults(prefix, payload, input, hiddenInput, resultsContainer);
       } catch (error) {
         resultsContainer.innerHTML = `<div class="search-result muted">${escapeHtml(error.message)}</div>`;
+      } finally {
+        releaseBusy();
       }
     }, 180);
   });
@@ -317,6 +363,27 @@ function appendEndpointParams(search, prefix, input, hiddenInput) {
   throw new Error(`Specifica ${prefix === "from" ? "origine" : "destinazione"} come fermata o come coordinate lat,lon.`);
 }
 
+function appendStreetEndpointParams(search, prefix, input) {
+  const coordinates = resolveEndpointCoordinates(prefix, input);
+  if (!coordinates) {
+    throw new Error(
+      `Per la modalità drive only serve una ${prefix === "from" ? "origine" : "destinazione"} con coordinate valide. Se scegli una fermata, selezionala dai risultati.`,
+    );
+  }
+
+  search.set(`${prefix}_lat`, String(coordinates.lat));
+  search.set(`${prefix}_lon`, String(coordinates.lon));
+}
+
+function resolveEndpointCoordinates(prefix, input) {
+  const endpoint = state.selectedEndpoints[prefix];
+  if (endpoint && typeof endpoint.lat === "number" && typeof endpoint.lon === "number") {
+    return { lat: endpoint.lat, lon: endpoint.lon };
+  }
+
+  return parseCoordinateInput(input.value);
+}
+
 function parseCoordinateInput(value) {
   const match = value.trim().match(/^(-?\d+(?:\.\d+)?)\s*[,;\s]\s*(-?\d+(?:\.\d+)?)$/);
   if (!match) {
@@ -381,13 +448,16 @@ function renderStats() {
     return;
   }
 
-  const { build, realtime, memoization } = state.stats;
+  const { build, realtime, memoization, hpf_overlay: hpfOverlay, street_overlay: streetOverlay } = state.stats;
   const items = [
     ["Static", build.static_cache_hit ? "hit" : "miss"],
     ["Walk", build.walk_cache_hit ? "hit" : "miss"],
     ["HPF", build.hpf_strategy],
     ["HPF nodes", formatCompactNumber(build.hpf_covered_nodes)],
     ["HPF ms", build.timings.hpf_ms],
+    ["HPF diff", hpfOverlay?.applied_sequence ? `seq ${hpfOverlay.applied_sequence}` : (hpfOverlay?.enabled ? "idle" : "off")],
+    ["Street drive", streetOverlay?.drive?.applied_sequence ? `seq ${streetOverlay.drive.applied_sequence}` : (streetOverlay?.drive?.enabled ? "idle" : "off")],
+    ["Street walk", streetOverlay?.walk?.applied_sequence ? `seq ${streetOverlay.walk.applied_sequence}` : (streetOverlay?.walk?.enabled ? "idle" : "off")],
     ["Vehicles", realtime.vehicle_count],
     ["Shadow", realtime.shadow_delta_count],
     ["Memo hits", memoization?.hits ?? 0],
@@ -410,7 +480,15 @@ function renderQuery() {
     return;
   }
 
-  const summary = state.query;
+  if (isStreetRoute(state.query)) {
+    renderStreetRoute(state.query);
+    return;
+  }
+
+  renderTransitQuery(state.query);
+}
+
+function renderTransitQuery(summary) {
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.innerHTML = `
     <div><strong>${escapeHtml(summary.from.name)}</strong> → <strong>${escapeHtml(summary.to.name)}</strong></div>
@@ -508,6 +586,64 @@ function renderQuery() {
   drawQueryOnMap(summary);
 }
 
+function renderStreetRoute(summary) {
+  const directions = Array.isArray(summary.directions) ? summary.directions : [];
+  const previewStep = directions.find(
+    (step) => step.maneuver !== "depart" && step.maneuver !== "arrive",
+  ) || directions[0] || null;
+
+  dom.itinerarySummary.className = "summary-strip";
+  dom.itinerarySummary.innerHTML = `
+    <div><strong>Drive only</strong> · ${escapeHtml(formatStreetEndpoint(summary.from))} → <strong>${escapeHtml(formatStreetEndpoint(summary.to))}</strong></div>
+    <div>${formatDistance(summary.distance_meters)} / ${Math.round(summary.duration_seconds / 60)} min</div>
+    <div>${summary.trace.query_runtime_ms} ms / ${escapeHtml(summary.trace.strategy)}</div>
+  `;
+
+  dom.legsContainer.innerHTML = `
+    <article class="leg-card drive">
+      <div class="leg-badge">drive</div>
+      <div class="leg-title">${escapeHtml(formatStreetEndpoint(summary.from))} → ${escapeHtml(formatStreetEndpoint(summary.to))}</div>
+      ${previewStep ? `<div class="walk-preview drive-preview">${escapeHtml(previewStep.instruction)}</div>` : ""}
+      <div class="leg-meta">${formatDistance(summary.distance_meters)} in auto · ${Math.round(summary.duration_seconds / 60)} min</div>
+      ${directions.length ? `
+        <ol class="walk-directions">
+          ${directions
+            .map(
+              (step) => `
+                <li class="walk-direction drive-direction">
+                  <span class="walk-direction-text">${escapeHtml(step.instruction)}</span>
+                  <span class="walk-direction-distance">${Math.round(step.distance_meters || 0)} m</span>
+                </li>
+              `,
+            )
+            .join("")}
+        </ol>
+      ` : ""}
+    </article>
+  `;
+
+  dom.traceContainer.innerHTML = `
+    <div class="mini-card">
+      <strong>Street</strong>
+      <span>${escapeHtml(summary.mode || "drive")}</span>
+      <span>${escapeHtml(summary.trace.strategy)}</span>
+    </div>
+    <div class="mini-card">
+      <strong>Snap</strong>
+      <span>src ${Math.round(summary.trace.source_snap_distance_meters || 0)} m</span>
+      <span>dst ${Math.round(summary.trace.destination_snap_distance_meters || 0)} m</span>
+    </div>
+    <div class="mini-card">
+      <strong>Search</strong>
+      <span>fw ${summary.trace.explored_forward_nodes}</span>
+      <span>bw ${summary.trace.explored_backward_nodes}</span>
+      <span>${summary.trace.query_runtime_ms} ms</span>
+    </div>
+  `;
+
+  drawStreetRouteOnMap(summary);
+}
+
 function renderRealtime() {
   if (!state.realtime) {
     return;
@@ -579,6 +715,26 @@ function drawQueryOnMap(query) {
   }
 }
 
+function drawStreetRouteOnMap(route) {
+  clearMapLayers();
+  const bounds = [];
+  if (Array.isArray(route.polyline) && route.polyline.length >= 2) {
+    const latlngs = route.polyline.map((point) => [point.lat, point.lon]);
+    latlngs.forEach((latlng) => bounds.push(latlng));
+    L.polyline(latlngs, {
+      color: "#bf5b04",
+      weight: 5,
+      opacity: 0.95,
+    }).addTo(state.routeLayer);
+  }
+
+  renderEndpointSelections();
+
+  if (bounds.length) {
+    state.map.fitBounds(bounds, { padding: [30, 30] });
+  }
+}
+
 function drawVehicles(vehicles) {
   state.vehicleLayer.clearLayers();
   vehicles.slice(0, 50).forEach((vehicle) => {
@@ -614,6 +770,56 @@ function markRouteStale(message) {
 function setRefreshStatus(text, busy) {
   dom.refreshStatus.textContent = text;
   dom.refreshStatus.className = `status-pill ${busy ? "busy" : ""}`;
+}
+
+function beginBusy() {
+  state.busyCount += 1;
+  updateBusyIndicator();
+  return () => {
+    state.busyCount = Math.max(0, state.busyCount - 1);
+    updateBusyIndicator();
+  };
+}
+
+function updateBusyIndicator() {
+  dom.topbarProgress.className = `topbar-progress ${state.busyCount > 0 ? "is-active" : ""}`;
+}
+
+function getRouteMode() {
+  return dom.routeModeSelect.value === "drive-only" ? "drive-only" : "transit";
+}
+
+function syncRouteModeUI() {
+  const driveOnly = getRouteMode() === "drive-only";
+  [dom.dateInput, dom.timeInput, dom.maxTransfersInput].forEach((input) => {
+    input.disabled = driveOnly;
+    const group = input.closest(".field-group");
+    if (group) {
+      group.classList.toggle("is-disabled", driveOnly);
+    }
+  });
+}
+
+function isStreetRoute(payload) {
+  return payload && Array.isArray(payload.polyline) && !Array.isArray(payload.legs);
+}
+
+function formatStreetEndpoint(endpoint) {
+  if (!endpoint || typeof endpoint.lat !== "number" || typeof endpoint.lon !== "number") {
+    return "punto sconosciuto";
+  }
+
+  return formatCoordinateValue(endpoint.lat, endpoint.lon);
+}
+
+function formatDistance(distanceMeters) {
+  if (!Number.isFinite(distanceMeters)) {
+    return "0 m";
+  }
+  if (distanceMeters >= 1000) {
+    return `${(distanceMeters / 1000).toFixed(1)} km`;
+  }
+  return `${Math.round(distanceMeters)} m`;
 }
 
 function formatCoordinateValue(latitude, longitude) {
