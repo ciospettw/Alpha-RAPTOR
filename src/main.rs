@@ -1,3 +1,4 @@
+mod control;
 mod cold_storage;
 mod engine;
 mod geo;
@@ -15,25 +16,34 @@ use arc_swap::ArcSwap;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::control::{INTERNAL_TOKEN_HEADER, matches_internal_token};
 use crate::engine::{Engine, EngineConfig, QueryRequest, StreetRouteRequest};
+use crate::realtime::RealtimeDebugSnapshot;
 
 #[derive(Clone)]
 struct AppState {
-    engine: SharedEngine,
+    controller: EngineController,
 }
 
 #[derive(Clone)]
 struct SharedEngine {
     current: Arc<ArcSwap<Engine>>,
+}
+
+#[derive(Clone)]
+struct EngineController {
+    engine: SharedEngine,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 impl SharedEngine {
@@ -49,6 +59,19 @@ impl SharedEngine {
 
     fn swap(&self, engine: Engine) {
         self.current.store(Arc::new(engine));
+    }
+}
+
+impl EngineController {
+    fn new(engine: Engine) -> Self {
+        Self {
+            engine: SharedEngine::new(engine),
+            operation_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn current(&self) -> Arc<Engine> {
+        self.engine.current()
     }
 }
 
@@ -108,11 +131,10 @@ async fn main() -> Result<()> {
         Err(error) => warn!(%error, "initial realtime refresh failed"),
     }
 
-    let shared_engine = SharedEngine::new(engine.clone());
-    spawn_realtime_refresh(shared_engine.clone());
-    spawn_static_reload(shared_engine.clone());
-    spawn_hpf_overlay_refresh(shared_engine.clone());
-    spawn_street_overlay_refresh(shared_engine.clone());
+    let controller = EngineController::new(engine.clone());
+    spawn_static_reload(controller.clone());
+    spawn_hpf_overlay_refresh(controller.engine.clone());
+    spawn_street_overlay_refresh(controller.engine.clone());
 
     let public_dir = workspace_root.join("public");
     let app = Router::new()
@@ -124,10 +146,11 @@ async fn main() -> Result<()> {
         .route("/api/street", get(run_street_route))
         .route("/api/realtime", get(realtime_snapshot))
         .route("/api/realtime/refresh", post(refresh_realtime))
+        .route("/internal/realtime/refresh", post(refresh_realtime))
         .nest_service("/assets", ServeDir::new(public_dir))
         .layer(TraceLayer::new_for_http())
         .with_state(AppState {
-            engine: shared_engine.clone(),
+            controller: controller.clone(),
         });
 
     info!(address = %bind, "Alpha-RAPTOR debug server listening");
@@ -178,20 +201,7 @@ async fn load_engine_from_workspace(workspace_root: PathBuf) -> Result<Engine> {
     .context("engine bootstrap task panicked")?
 }
 
-fn spawn_realtime_refresh(engine: SharedEngine) {
-    tokio::spawn(async move {
-        loop {
-            let refresh_every = Duration::from_secs(engine.current().config.refresh_interval_secs);
-            tokio::time::sleep(refresh_every).await;
-            let current_engine = engine.current();
-            if let Err(error) = current_engine.refresh_realtime().await {
-                warn!(%error, "background realtime refresh failed");
-            }
-        }
-    });
-}
-
-fn spawn_static_reload(engine: SharedEngine) {
+fn spawn_static_reload(controller: EngineController) {
     tokio::spawn(async move {
         let mut first_cycle = true;
         loop {
@@ -199,63 +209,12 @@ fn spawn_static_reload(engine: SharedEngine) {
                 first_cycle = false;
             } else {
                 let poll_every =
-                    Duration::from_secs(engine.current().config.static_reload_interval_secs);
+                    Duration::from_secs(controller.current().config.static_reload_interval_secs);
                 tokio::time::sleep(poll_every).await;
             }
 
-            let current_engine = engine.current();
-            let current_config = current_engine.config.clone();
-            let next_config = match tokio::task::spawn_blocking(move || {
-                current_config.reload_from_source()
-            })
-            .await
-            {
-                Ok(Ok(config)) => config,
-                Ok(Err(error)) => {
-                    warn!(%error, "failed to reload engine configuration for static polling");
-                    continue;
-                }
-                Err(error) => {
-                    warn!(%error, "static polling configuration task panicked");
-                    continue;
-                }
-            };
-
-            if !current_engine.config.static_inputs_changed(&next_config) {
-                continue;
-            }
-
-            info!(
-                sources = %next_config.static_sources_display(),
-                "detected static GTFS change, rebuilding engine in background"
-            );
-            let rebuild_started = std::time::Instant::now();
-            let previous_engine = current_engine.clone();
-            match tokio::task::spawn_blocking(move || {
-                Engine::reload_from_previous(previous_engine.as_ref(), next_config)
-            })
-            .await
-            {
-                Ok(Ok(next_engine)) => {
-                    if let Err(error) = next_engine.refresh_realtime().await {
-                        warn!(%error, "reloaded engine initialized but realtime prewarm failed");
-                    }
-                    let next_stats = next_engine.stats().build;
-                    engine.swap(next_engine);
-                    info!(
-                        reload_ms = rebuild_started.elapsed().as_millis(),
-                        static_cache_hit = next_stats.static_cache_hit,
-                        walk_cache_hit = next_stats.walk_cache_hit,
-                        build_millis = next_stats.build_millis,
-                        "static engine swap completed"
-                    );
-                }
-                Ok(Err(error)) => {
-                    warn!(%error, "static GTFS change detected but rebuild failed; keeping current engine");
-                }
-                Err(error) => {
-                    warn!(%error, "static GTFS rebuild task panicked; keeping current engine");
-                }
+            if let Err(error) = rebuild_engine_if_changed(&controller).await {
+                warn!(%error, "background static reload failed");
             }
         }
     });
@@ -356,7 +315,7 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.engine.current().stats())
+    Json(state.controller.current().stats())
 }
 
 async fn search_stops(
@@ -365,14 +324,14 @@ async fn search_stops(
 ) -> impl IntoResponse {
     let query = params.q.unwrap_or_default();
     let limit = params.limit.unwrap_or(12).clamp(1, 50);
-    Json(state.engine.current().search_stops(&query, limit))
+    Json(state.controller.current().search_stops(&query, limit))
 }
 
 async fn run_query(
     State(state): State<AppState>,
     Query(params): Query<QueryRequest>,
 ) -> impl IntoResponse {
-    match state.engine.current().run_query(params).await {
+    match state.controller.current().run_query(params).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()),
     }
@@ -382,7 +341,7 @@ async fn run_street_route(
     State(state): State<AppState>,
     Query(params): Query<StreetRouteRequest>,
 ) -> impl IntoResponse {
-    match state.engine.current().run_street_route(params).await {
+    match state.controller.current().run_street_route(params).await {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()),
     }
@@ -393,13 +352,82 @@ async fn realtime_snapshot(
     Query(params): Query<RealtimeQueryParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(24).clamp(1, 200);
-    Json(state.engine.current().realtime_snapshot(limit))
+    Json(state.controller.current().realtime_snapshot(limit))
 }
 
-async fn refresh_realtime(State(state): State<AppState>) -> impl IntoResponse {
-    match state.engine.current().refresh_realtime().await {
+async fn refresh_realtime(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = authorize_internal_request(&headers) {
+        return response;
+    }
+
+    match refresh_realtime_now(&state.controller).await {
         Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+async fn refresh_realtime_now(controller: &EngineController) -> Result<RealtimeDebugSnapshot> {
+    let _guard = controller.operation_lock.lock().await;
+    controller.current().refresh_realtime().await
+}
+
+async fn rebuild_engine_if_changed(controller: &EngineController) -> Result<()> {
+    let _guard = controller.operation_lock.lock().await;
+    let current_engine = controller.current();
+    let current_config = current_engine.config.clone();
+    let next_config = tokio::task::spawn_blocking(move || current_config.reload_from_source())
+        .await
+        .context("static reload configuration task panicked")??;
+
+    if !current_engine.config.static_inputs_changed(&next_config) {
+        return Ok(());
+    }
+
+    info!(
+        sources = %next_config.static_sources_display(),
+        "detected static GTFS change, rebuilding engine in background"
+    );
+    let rebuild_started = std::time::Instant::now();
+    let previous_engine = current_engine.clone();
+    let next_engine = tokio::task::spawn_blocking(move || {
+        Engine::reload_from_previous(previous_engine.as_ref(), next_config)
+    })
+    .await
+    .context("static GTFS rebuild task panicked")??;
+
+    if let Err(error) = next_engine.refresh_realtime().await {
+        warn!(%error, "reloaded engine initialized but realtime prewarm failed");
+    }
+    let next_stats = next_engine.stats().build;
+    controller.engine.swap(next_engine);
+    let reload_ms = rebuild_started.elapsed().as_millis();
+    info!(
+        reload_ms,
+        static_cache_hit = next_stats.static_cache_hit,
+        walk_cache_hit = next_stats.walk_cache_hit,
+        build_millis = next_stats.build_millis,
+        "static engine swap completed"
+    );
+
+    Ok(())
+}
+
+fn authorize_internal_request(
+    headers: &HeaderMap,
+) -> std::result::Result<(), axum::response::Response> {
+    let provided = headers
+        .get(INTERNAL_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok());
+    match matches_internal_token(provided) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(json_error(
+            StatusCode::FORBIDDEN,
+            "missing or invalid internal token".to_owned(),
+        )),
+        Err(error) => Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
     }
 }
 

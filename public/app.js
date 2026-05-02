@@ -8,11 +8,14 @@ const state = {
   vehicleLayer: null,
   endpointLayer: null,
   mapSelectionTarget: "from",
+  selectedItineraryId: null,
   selectedEndpoints: {
     from: null,
     to: null,
   },
 };
+
+const DEFAULT_ITINERARY_COUNT = 5;
 
 const dom = {
   fromSearch: document.getElementById("fromSearch"),
@@ -38,6 +41,7 @@ const dom = {
   refreshRealtimeButton: document.getElementById("refreshRealtimeButton"),
   refreshStatus: document.getElementById("refreshStatus"),
   topbarProgress: document.getElementById("topbarProgress"),
+  itineraryOptions: document.getElementById("itineraryOptions"),
 };
 
 initialize();
@@ -154,6 +158,7 @@ async function onSubmitQuery(event) {
       search.set("date", dom.dateInput.value);
       search.set("time", dom.timeInput.value);
       search.set("max_transfers", dom.maxTransfersInput.value);
+      search.set("num_itineraries", String(DEFAULT_ITINERARY_COUNT));
       appendEndpointParams(search, "from", dom.fromSearch, dom.fromStopId);
       appendEndpointParams(search, "to", dom.toSearch, dom.toStopId);
     }
@@ -173,11 +178,14 @@ async function onSubmitQuery(event) {
     const endpoint = routeMode === "drive-only" ? "/api/street" : "/api/query";
     const payload = await fetchJson(`${endpoint}?${search.toString()}`);
     state.query = payload;
+    state.selectedItineraryId = null;
     renderQuery();
   } catch (error) {
     state.query = null;
+    state.selectedItineraryId = null;
     dom.itinerarySummary.textContent = error.message;
     dom.itinerarySummary.className = "summary-strip error-strip";
+    dom.itineraryOptions.innerHTML = '<div class="empty-state">Nessuna alternativa.</div>';
     dom.legsContainer.innerHTML = '<div class="empty-state">Nessun itinerario.</div>';
     dom.traceContainer.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
     clearMapLayers();
@@ -489,14 +497,70 @@ function renderQuery() {
 }
 
 function renderTransitQuery(summary) {
+  const itineraries = normalizeQueryItineraries(summary);
+  const selected = selectActiveItinerary(itineraries);
+  const selectedTransitLegCount = selected.transit_leg_count ?? selected.legs.filter((leg) => leg.kind === "transit").length;
+  const selectedRealtimeLegs = selected.transit_legs_with_gtfs_rt ?? 0;
+  const selectedOccupancyLegs = selected.occupancy_covered_transit_legs ?? 0;
+  const summaryBadges = Array.isArray(selected.badges) && selected.badges.length
+    ? `<div class="summary-badges">${selected.badges
+      .slice(0, 4)
+      .map((badge, index) => `<span class="${index === 0 ? "itinerary-badge" : "itinerary-badge secondary"}">${escapeHtml(badge)}</span>`)
+      .join("")}</div>`
+    : "";
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.innerHTML = `
     <div><strong>${escapeHtml(summary.from.name)}</strong> → <strong>${escapeHtml(summary.to.name)}</strong></div>
-    <div>${escapeHtml(summary.departure_time)} → ${escapeHtml(summary.arrival_time)}</div>
-    <div>${Math.round(summary.duration_seconds / 60)} min / ${summary.transfers} cambi / ${summary.trace.query_runtime_ms} ms</div>
+    <div>${escapeHtml(selected.departure_time)} → ${escapeHtml(selected.arrival_time)}</div>
+    <div>${Math.round(selected.duration_seconds / 60)} min / ${selected.transfers} cambi / ${summary.trace.query_runtime_ms} ms / ${itineraries.length} opzioni</div>
+    <div>GTFS-RT ${selectedRealtimeLegs}/${selectedTransitLegCount || 0} leg transit · occupancy ${selectedOccupancyLegs}/${selectedTransitLegCount || 0} · crowd ${escapeHtml(String(selected.crowding_level || "unknown"))}</div>
+    ${summaryBadges}
   `;
 
-  dom.legsContainer.innerHTML = summary.legs
+  dom.itineraryOptions.innerHTML = itineraries
+    .map((itinerary, index) => {
+      const badges = Array.isArray(itinerary.badges) && itinerary.badges.length
+        ? itinerary.badges
+            .map((badge, badgeIndex) => {
+              const badgeClass = badgeIndex === 0 ? "itinerary-badge" : "itinerary-badge secondary";
+              return `<span class="${badgeClass}">${escapeHtml(badge)}</span>`;
+            })
+            .join("")
+        : `<span class="itinerary-badge secondary">Alternativa ${index + 1}</span>`;
+      return `
+        <button
+          class="itinerary-option-card ${itinerary.id === selected.id ? "is-active" : ""}"
+          type="button"
+          data-itinerary-id="${escapeHtml(itinerary.id)}"
+        >
+          <div class="itinerary-option-head">
+            <div class="itinerary-option-title">
+              <strong>${escapeHtml(itinerary.label || `Alternativa ${index + 1}`)}</strong>
+              <div class="itinerary-option-badges">${badges}</div>
+            </div>
+            <strong>${Math.round(itinerary.duration_seconds / 60)} min</strong>
+          </div>
+          <div class="itinerary-option-metrics">
+            <span>${escapeHtml(itinerary.departure_time)} → ${escapeHtml(itinerary.arrival_time)}</span>
+            <span>${itinerary.transfers} cambi</span>
+            <span>${itinerary.legs.length} leg</span>
+            <span>RT ${itinerary.transit_legs_with_gtfs_rt || 0}/${itinerary.transit_leg_count || 0}</span>
+            <span>occ ${itinerary.occupancy_covered_transit_legs || 0}/${itinerary.transit_leg_count || 0}</span>
+            <span>crowd ${escapeHtml(String(itinerary.crowding_level || "unknown"))}</span>
+          </div>
+        </button>
+      `;
+    })
+    .join("");
+
+  Array.from(dom.itineraryOptions.querySelectorAll(".itinerary-option-card")).forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedItineraryId = button.dataset.itineraryId || null;
+      renderQuery();
+    });
+  });
+
+  dom.legsContainer.innerHTML = selected.legs
     .map((leg) => {
       const walkDirections = leg.kind === "walk" && Array.isArray(leg.walk_directions)
         ? leg.walk_directions
@@ -507,6 +571,15 @@ function renderTransitQuery(summary) {
       const meta = leg.kind === "walk"
         ? `${Math.round(leg.walk_distance_meters || 0)} m a piedi`
         : `${escapeHtml(leg.route_label || leg.route_id || "linea")} · ${escapeHtml(leg.headsign || "")}`;
+      const detailChips = leg.kind === "transit"
+        ? [
+            leg.has_gtfs_rt ? `<span class="leg-chip rt-chip">GTFS-RT${leg.has_trip_update && leg.has_vehicle_position ? " T+V" : leg.has_trip_update ? " T" : leg.has_vehicle_position ? " V" : ""}</span>` : "",
+            leg.occupancy_status || Number.isFinite(leg.occupancy_percentage) ? `<span class="leg-chip occ-chip">${escapeHtml(String(leg.occupancy_status || "OCC"))}${Number.isFinite(leg.occupancy_percentage) ? ` ${Math.round(leg.occupancy_percentage)}%` : ""}</span>` : "",
+            leg.schedule_relationship && leg.schedule_relationship !== "SCHEDULED" ? `<span class="leg-chip rel-chip">${escapeHtml(leg.schedule_relationship)}</span>` : "",
+          ]
+            .filter(Boolean)
+            .join("")
+        : "";
       const walkPreview = leg.kind === "walk" && walkPreviewStep
         ? `<div class="walk-preview">${escapeHtml(walkPreviewStep.instruction)}</div>`
         : "";
@@ -533,6 +606,7 @@ function renderTransitQuery(summary) {
           <div class="leg-title">${escapeHtml(leg.from_stop.name)} → ${escapeHtml(leg.to_stop.name)}</div>
           ${walkPreview}
           <div class="leg-meta">${meta}</div>
+          ${detailChips ? `<div class="leg-chip-row">${detailChips}</div>` : ""}
           ${directions}
         </article>
       `;
@@ -583,7 +657,7 @@ function renderTransitQuery(summary) {
     </table>
   `;
 
-  drawQueryOnMap(summary);
+  drawQueryOnMap(selected);
 }
 
 function renderStreetRoute(summary) {
@@ -591,6 +665,8 @@ function renderStreetRoute(summary) {
   const previewStep = directions.find(
     (step) => step.maneuver !== "depart" && step.maneuver !== "arrive",
   ) || directions[0] || null;
+
+  dom.itineraryOptions.innerHTML = '<div class="empty-state">Modalità drive only.</div>';
 
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.innerHTML = `
@@ -689,11 +765,11 @@ function renderRealtime() {
   drawVehicles(payload.vehicles);
 }
 
-function drawQueryOnMap(query) {
+function drawQueryOnMap(itinerary) {
   clearMapLayers();
 
   const bounds = [];
-  query.legs.forEach((leg) => {
+  itinerary.legs.forEach((leg) => {
     if (leg.polyline.length < 2) {
       return;
     }
@@ -760,11 +836,66 @@ function clearMapLayers() {
 
 function markRouteStale(message) {
   state.query = null;
+  state.selectedItineraryId = null;
   clearMapLayers();
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.textContent = message || "Parametri aggiornati. Premi Route.";
+  dom.itineraryOptions.innerHTML = '<div class="empty-state">Nessuna alternativa.</div>';
   dom.legsContainer.innerHTML = '<div class="empty-state">Nessun itinerario.</div>';
   dom.traceContainer.innerHTML = '<div class="empty-state">Nessun trace disponibile.</div>';
+}
+
+function normalizeQueryItineraries(query) {
+  if (Array.isArray(query.itineraries) && query.itineraries.length) {
+    return query.itineraries;
+  }
+
+  return [
+    {
+      id: "primary",
+      label: "Piu veloce",
+      badges: ["Piu veloce"],
+      is_recommended: true,
+      is_fastest: true,
+      is_fewest_transfers: true,
+      is_best_realtime: false,
+      is_least_crowded: false,
+      has_canceled_legs: false,
+      departure_time: query.departure_time,
+      arrival_time: query.arrival_time,
+      duration_seconds: query.duration_seconds,
+      transfers: query.transfers,
+      realtime_score: 0,
+      transit_leg_count: query.legs.filter((leg) => leg.kind === "transit").length,
+      transit_legs_with_gtfs_rt: 0,
+      crowding_score: null,
+      crowding_level: "unknown",
+      occupancy_covered_transit_legs: 0,
+      canceled_transit_legs: 0,
+      legs: query.legs,
+      deferred_hydration: query.deferred_hydration,
+    },
+  ];
+}
+
+function selectActiveItinerary(itineraries) {
+  if (!itineraries.length) {
+    return {
+      id: "empty",
+      label: "Nessun itinerario",
+      badges: [],
+      departure_time: "-",
+      arrival_time: "-",
+      duration_seconds: 0,
+      transfers: 0,
+      legs: [],
+    };
+  }
+
+  const selected = itineraries.find((itinerary) => itinerary.id === state.selectedItineraryId);
+  const active = selected || itineraries[0];
+  state.selectedItineraryId = active.id;
+  return active;
 }
 
 function setRefreshStatus(text, busy) {

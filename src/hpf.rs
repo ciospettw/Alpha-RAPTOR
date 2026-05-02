@@ -187,6 +187,12 @@ struct HpfWayIndex {
     cells_offset: usize,
 }
 
+enum HpfCacheLoadState {
+    Hit(HpfCache),
+    Missing,
+    Stale,
+}
+
 #[derive(Clone)]
 enum CandidateLocation {
     BaseNode(usize),
@@ -1286,6 +1292,7 @@ pub fn build_or_load_hpf(
     snap_tolerance_meters: f64,
     snap_quadratic_kappa_meters: f64,
     search_window: usize,
+    defer_rebuild_on_bootstrap: bool,
     diff_config: Option<HpfDiffConfig>,
 ) -> Result<HpfBuildResult> {
     let metadata = build_cache_metadata(osm_pbf_path, stops, max_distance_meters)?;
@@ -1294,7 +1301,12 @@ pub fn build_or_load_hpf(
     let pbf_replication = read_pbf_replication_anchor(osm_pbf_path).ok();
     let mut cache_hit = true;
 
-    let mut cache = load_cache(&cache_path, &metadata)?;
+    let cache_state = load_cache(&cache_path, &metadata)?;
+    let stale_cache_detected = matches!(cache_state, HpfCacheLoadState::Stale);
+    let mut cache = match cache_state {
+        HpfCacheLoadState::Hit(cache) => Some(cache),
+        HpfCacheLoadState::Missing | HpfCacheLoadState::Stale => None,
+    };
     let mut way_index = if diff_config.is_some() {
         match load_way_index(&way_index_path, &metadata)? {
             Some(index) => Some(Arc::new(index)),
@@ -1305,6 +1317,16 @@ pub fn build_or_load_hpf(
     };
 
     if cache.is_none() || (diff_config.is_some() && way_index.is_none()) {
+        if defer_rebuild_on_bootstrap && stale_cache_detected {
+            info!(
+                cache = %cache_path.display(),
+                "stale HPF cache detected at bootstrap, deferring rebuild and falling back to stop-level coordinate connectors"
+            );
+            bail!(
+                "HPF cache is stale at bootstrap and rebuild was deferred"
+            );
+        }
+
         let (node_coordinates, ways) = load_walkable_osm(osm_pbf_path)?;
         if cache.is_none() {
             let built_cache = build_hpf_cache_from_data(
@@ -1684,9 +1706,9 @@ fn snap_stop_to_graph(
     best_anchor.filter(|anchor| anchor.snap_distance_meters <= max_snap_distance_meters)
 }
 
-fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<Option<HpfCache>> {
+fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<HpfCacheLoadState> {
     if !cache_path.exists() {
-        return Ok(None);
+        return Ok(HpfCacheLoadState::Missing);
     }
 
     let file = File::open(cache_path)
@@ -1696,15 +1718,15 @@ fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<Option<H
         Ok(cache) => cache,
         Err(error) => {
             warn!(%error, cache = %cache_path.display(), "invalid HPF cache, rebuilding");
-            return Ok(None);
+            return Ok(HpfCacheLoadState::Stale);
         }
     };
 
     if cache.metadata == *metadata {
-        Ok(Some(cache))
+        Ok(HpfCacheLoadState::Hit(cache))
     } else {
         info!(cache = %cache_path.display(), "HPF cache metadata mismatch, rebuilding");
-        Ok(None)
+        Ok(HpfCacheLoadState::Stale)
     }
 }
 

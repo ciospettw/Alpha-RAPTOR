@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     env,
     fs::{self, File},
@@ -12,6 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration, NaiveDate, NaiveTime, Timelike};
 use gtfs_structures::{Exception, Gtfs};
+use gtfs_rt::{trip_descriptor, vehicle_position};
 use reqwest::{
     blocking::Client as BlockingHttpClient,
     header::{ETAG, LAST_MODIFIED},
@@ -20,6 +22,7 @@ use rstar::{AABB, PointDistance, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::control::{descriptor_url_from_env, maybe_add_internal_token_blocking};
 use crate::cold_storage::{ColdRouteRecord, ColdStore, ColdTripRecord, cold_store_paths};
 use crate::geo::{
     destination_cell as geo_destination_cell,
@@ -34,7 +37,7 @@ use crate::profile_cache::{
     ProfileLookupDecision, SpatialProfileInsertionPoint,
 };
 use crate::progress::{progress_bar, progress_bar_u64, progress_percent, progress_percent_u64};
-use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore};
+use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore, TripRealtimeMetrics};
 use crate::street::{
     StreetMode, StreetRouter, StreetRouterOverlaySnapshot, build_or_load_street_router,
 };
@@ -54,6 +57,8 @@ const DEFAULT_HPF_SNAP_TOLERANCE_METERS: f64 = 140.0;
 const DEFAULT_HPF_SNAP_QUADRATIC_KAPPA_METERS: f64 = 40.0;
 const DEFAULT_HPF_SEARCH_WINDOW: usize = 512;
 const DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS: u64 = 30 * 60;
+const DEFAULT_QUERY_ITINERARY_COUNT: usize = 5;
+const MAX_QUERY_ITINERARY_COUNT: usize = 6;
 const SVRT_WIDTH: usize = 8;
 const BTT_MIN_HUB_CELL_METERS: f64 = 120.0;
 const BTT_MAX_HUB_CELL_METERS: f64 = 220.0;
@@ -77,14 +82,13 @@ pub struct FeedConfig {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawEngineManifest {
     osm_pbf: Option<String>,
     osm_pbf_allow_invalid_tls: Option<bool>,
     walk_radius_meters: Option<f64>,
     walk_speed_mps: Option<f64>,
     max_transfer_candidates: Option<usize>,
-    refresh_interval_secs: Option<u64>,
     static_reload_interval_secs: Option<u64>,
     static_diff_tolerance: Option<f64>,
     default_max_transfers: Option<usize>,
@@ -94,21 +98,22 @@ struct RawEngineManifest {
     feeds: Vec<RawFeedConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawDvniConfig {
     knn_candidates: Option<usize>,
     max_walk_radius_meters: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawHpfConfig {
     max_distance_meters: Option<f64>,
     snap_tolerance_meters: Option<f64>,
     snap_quadratic_kappa_meters: Option<f64>,
     search_window: Option<usize>,
+    defer_rebuild_on_bootstrap: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawOsmDiffConfig {
     state_url: String,
     diff_base_url: Option<String>,
@@ -116,7 +121,7 @@ struct RawOsmDiffConfig {
     allow_invalid_tls: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawFeedConfig {
     id: String,
     static_gtfs: String,
@@ -126,6 +131,31 @@ struct RawFeedConfig {
     vehicle_positions_url: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingDescriptor {
+    static_feeds: Vec<RoutingStaticFeedDescriptor>,
+    realtime_feeds: Vec<RoutingRealtimeFeedDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingStaticFeedDescriptor {
+    id: Option<String>,
+    namespace: Option<String>,
+    feed_id: Option<String>,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingRealtimeFeedDescriptor {
+    namespace: Option<String>,
+    feed_id: Option<String>,
+    trip_updates_url: Option<String>,
+    vehicle_positions_url: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -150,6 +180,7 @@ pub struct Engine {
 pub struct EngineConfig {
     pub workspace_root: PathBuf,
     pub manifest_path: Option<PathBuf>,
+    pub source_manifest_path: Option<PathBuf>,
     pub feeds: Vec<FeedConfig>,
     pub osm_pbf_path: PathBuf,
     pub osm_pbf_source: String,
@@ -158,7 +189,6 @@ pub struct EngineConfig {
     pub walk_radius_meters: f64,
     pub walk_speed_mps: f64,
     pub max_transfer_candidates: usize,
-    pub refresh_interval_secs: u64,
     pub static_reload_interval_secs: u64,
     pub static_diff_tolerance: f64,
     pub default_max_transfers: usize,
@@ -168,6 +198,7 @@ pub struct EngineConfig {
     pub hpf_snap_tolerance_meters: f64,
     pub hpf_snap_quadratic_kappa_meters: f64,
     pub hpf_search_window: usize,
+    pub hpf_defer_rebuild_on_bootstrap: bool,
     pub osm_diff: Option<HpfDiffConfig>,
     static_inputs_metadata: StaticCacheMetadata,
 }
@@ -384,6 +415,7 @@ pub struct QueryRequest {
     pub date: String,
     pub time: String,
     pub max_transfers: Option<usize>,
+    pub num_itineraries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,8 +530,35 @@ pub struct QueryResponse {
     pub duration_seconds: i32,
     pub transfers: usize,
     pub legs: Vec<LegResponse>,
+    pub itineraries: Vec<QueryItineraryResponse>,
     pub deferred_hydration: DeferredHydrationResponse,
     pub trace: QueryTrace,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryItineraryResponse {
+    pub id: String,
+    pub label: String,
+    pub badges: Vec<String>,
+    pub is_recommended: bool,
+    pub is_fastest: bool,
+    pub is_fewest_transfers: bool,
+    pub is_best_realtime: bool,
+    pub is_least_crowded: bool,
+    pub has_canceled_legs: bool,
+    pub departure_time: String,
+    pub arrival_time: String,
+    pub duration_seconds: i32,
+    pub transfers: usize,
+    pub realtime_score: usize,
+    pub transit_leg_count: usize,
+    pub transit_legs_with_gtfs_rt: usize,
+    pub crowding_score: Option<u16>,
+    pub crowding_level: &'static str,
+    pub occupancy_covered_transit_legs: usize,
+    pub canceled_transit_legs: usize,
+    pub legs: Vec<LegResponse>,
+    pub deferred_hydration: DeferredHydrationResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -722,18 +781,25 @@ pub struct LegResponse {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
+    pub has_gtfs_rt: bool,
+    pub has_trip_update: bool,
+    pub has_vehicle_position: bool,
+    pub schedule_relationship: Option<String>,
+    pub occupancy_status: Option<String>,
+    pub occupancy_percentage: Option<u32>,
+    pub occupancy_score: Option<u16>,
     pub intermediate_stops: Vec<StopSearchResult>,
     pub polyline: Vec<PolylinePoint>,
     pub walk_directions: Vec<WalkDirection>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeferredHydrationResponse {
     pub legs: Vec<DeferredLegRef>,
     pub entities: HydrationEntityDictionary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeferredLegRef {
     pub kind: &'static str,
     pub departure_time: String,
@@ -746,12 +812,19 @@ pub struct DeferredLegRef {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
+    pub has_gtfs_rt: bool,
+    pub has_trip_update: bool,
+    pub has_vehicle_position: bool,
+    pub schedule_relationship: Option<String>,
+    pub occupancy_status: Option<String>,
+    pub occupancy_percentage: Option<u32>,
+    pub occupancy_score: Option<u16>,
     pub intermediate_stop_gids: Vec<u64>,
     pub polyline_index: usize,
     pub walk_directions: Vec<WalkDirection>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct HydrationEntityDictionary {
     pub stops: Vec<StopSearchResult>,
     pub routes: Vec<RouteHydration>,
@@ -759,7 +832,7 @@ pub struct HydrationEntityDictionary {
     pub polylines: Vec<Vec<PolylinePoint>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RouteHydration {
     pub global_id: u64,
     pub id: String,
@@ -769,7 +842,7 @@ pub struct RouteHydration {
     pub text_color: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TripHydration {
     pub global_id: u64,
     pub id: String,
@@ -922,6 +995,24 @@ enum RawLeg {
 }
 
 #[derive(Clone)]
+struct QueryItineraryCandidate {
+    round: usize,
+    arrival_secs: i32,
+    transit_legs: usize,
+    raw_legs: Vec<RawLeg>,
+}
+
+struct ItineraryPassiveMetrics {
+    transit_leg_count: usize,
+    transit_legs_with_gtfs_rt: usize,
+    occupancy_covered_transit_legs: usize,
+    crowding_score: Option<u16>,
+    crowding_level: &'static str,
+    canceled_transit_legs: usize,
+    has_canceled_legs: bool,
+}
+
+#[derive(Clone)]
 struct LocalSubqueryResult {
     arrival_secs: i32,
     transit_legs: usize,
@@ -980,7 +1071,7 @@ impl PointDistance for IndexedStopPoint {
 impl EngineConfig {
     pub fn from_env(workspace_root: PathBuf) -> Result<Self> {
         if let Some(manifest_override) = env::var("ALPHA_CONFIG").ok() {
-            return Self::from_manifest(
+            return Self::from_manifest_source(
                 &workspace_root,
                 resolve_path(
                     &workspace_root,
@@ -993,7 +1084,7 @@ impl EngineConfig {
 
         let default_manifest = workspace_root.join(DEFAULT_MANIFEST_NAME);
         if default_manifest.exists() {
-            return Self::from_manifest(
+            return Self::from_manifest_source(
                 &workspace_root,
                 default_manifest,
                 StaticGtfsRefreshMode::Bootstrap,
@@ -1004,10 +1095,10 @@ impl EngineConfig {
     }
 
     pub fn reload_from_source(&self) -> Result<Self> {
-        if let Some(manifest_path) = &self.manifest_path {
-            return Self::from_manifest(
+        if let Some(source_manifest_path) = &self.source_manifest_path {
+            return Self::from_manifest_source(
                 &self.workspace_root,
-                manifest_path.clone(),
+                source_manifest_path.clone(),
                 StaticGtfsRefreshMode::Poll,
             );
         }
@@ -1019,8 +1110,23 @@ impl EngineConfig {
         self.static_inputs_metadata != other.static_inputs_metadata
     }
 
+    fn from_manifest_source(
+        workspace_root: &PathBuf,
+        source_manifest_path: PathBuf,
+        refresh_mode: StaticGtfsRefreshMode,
+    ) -> Result<Self> {
+        let runtime_manifest_path = materialize_runtime_manifest(workspace_root, &source_manifest_path)?;
+        Self::from_manifest(
+            workspace_root,
+            source_manifest_path,
+            runtime_manifest_path,
+            refresh_mode,
+        )
+    }
+
     fn from_manifest(
         workspace_root: &PathBuf,
+        source_manifest_path: PathBuf,
         manifest_path: PathBuf,
         refresh_mode: StaticGtfsRefreshMode,
     ) -> Result<Self> {
@@ -1087,6 +1193,7 @@ impl EngineConfig {
         let mut config = Self {
             workspace_root: workspace_root.clone(),
             manifest_path: Some(manifest_path),
+            source_manifest_path: Some(source_manifest_path),
             feeds,
             osm_pbf_path: prepared_osm_pbf.local_path,
             osm_pbf_source: prepared_osm_pbf.source,
@@ -1095,7 +1202,6 @@ impl EngineConfig {
             walk_radius_meters: manifest.walk_radius_meters.unwrap_or(450.0),
             walk_speed_mps: manifest.walk_speed_mps.unwrap_or(1.35),
             max_transfer_candidates: manifest.max_transfer_candidates.unwrap_or(12),
-            refresh_interval_secs: manifest.refresh_interval_secs.unwrap_or(45),
             static_reload_interval_secs: manifest.static_reload_interval_secs.unwrap_or(600),
             static_diff_tolerance: manifest
                 .static_diff_tolerance
@@ -1137,6 +1243,11 @@ impl EngineConfig {
                 .and_then(|hpf| hpf.search_window)
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
+            hpf_defer_rebuild_on_bootstrap: manifest
+                .hpf
+                .as_ref()
+                .and_then(|hpf| hpf.defer_rebuild_on_bootstrap)
+                .unwrap_or(false),
             osm_diff: manifest.osm_diff.as_ref().map(|diff| HpfDiffConfig {
                 state_url: diff.state_url.clone(),
                 diff_base_url: diff.diff_base_url.clone(),
@@ -1163,8 +1274,13 @@ impl EngineConfig {
                 feed_sources: Vec::new(),
             },
         };
-        config.static_inputs_metadata =
-            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config)?;
+        config.static_inputs_metadata = capture_static_inputs_metadata(
+            config
+                .source_manifest_path
+                .as_ref()
+                .or(config.manifest_path.as_ref()),
+            &config,
+        )?;
         Ok(config)
     }
 
@@ -1214,6 +1330,7 @@ impl EngineConfig {
         let mut config = Self {
             workspace_root: workspace_root.clone(),
             manifest_path: None,
+            source_manifest_path: None,
             feeds: vec![FeedConfig {
                 feed_index: 0,
                 id: feed_id,
@@ -1249,10 +1366,6 @@ impl EngineConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(12),
-            refresh_interval_secs: env::var("ALPHA_RT_REFRESH_SECS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(45),
             static_reload_interval_secs: env::var("ALPHA_STATIC_POLL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1295,6 +1408,15 @@ impl EngineConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
+            hpf_defer_rebuild_on_bootstrap: matches!(
+                env::var("ALPHA_HPF_DEFER_REBUILD_ON_BOOTSTRAP")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            ),
             osm_diff: env::var("ALPHA_OSM_DIFF_STATE_URL")
                 .ok()
                 .map(|state_url| HpfDiffConfig {
@@ -1330,8 +1452,13 @@ impl EngineConfig {
                 feed_sources: Vec::new(),
             },
         };
-        config.static_inputs_metadata =
-            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config)?;
+        config.static_inputs_metadata = capture_static_inputs_metadata(
+            config
+                .source_manifest_path
+                .as_ref()
+                .or(config.manifest_path.as_ref()),
+            &config,
+        )?;
         Ok(config)
     }
 
@@ -1372,6 +1499,159 @@ impl EngineConfig {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+fn materialize_runtime_manifest(
+    workspace_root: &Path,
+    source_manifest_path: &Path,
+) -> Result<PathBuf> {
+    if descriptor_url_from_env().is_none() {
+        return Ok(source_manifest_path.to_path_buf());
+    }
+
+    let generated_manifest_path = runtime_root(workspace_root)
+        .join("generated")
+        .join("busone-descriptor.toml");
+
+    match write_descriptor_manifest(source_manifest_path, &generated_manifest_path) {
+        Ok(()) => Ok(generated_manifest_path),
+        Err(error) if generated_manifest_path.exists() => {
+            warn!(
+                %error,
+                manifest = %generated_manifest_path.display(),
+                "descriptor refresh failed; reusing cached generated manifest"
+            );
+            Ok(generated_manifest_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_descriptor_manifest(
+    source_manifest_path: &Path,
+    generated_manifest_path: &Path,
+) -> Result<()> {
+    let descriptor_url = descriptor_url_from_env()
+        .context("ALPHA_DESCRIPTOR_URL is required when descriptor bootstrap is enabled")?;
+    let source_manifest_body = fs::read_to_string(source_manifest_path).with_context(|| {
+        format!(
+            "unable to read descriptor template manifest {}",
+            source_manifest_path.display()
+        )
+    })?;
+    let mut manifest: RawEngineManifest = toml::from_str(&source_manifest_body).with_context(|| {
+        format!(
+            "invalid descriptor template manifest TOML at {}",
+            source_manifest_path.display()
+        )
+    })?;
+
+    manifest.feeds = fetch_descriptor_feeds(&descriptor_url, &manifest)?;
+
+    let rendered = toml::to_string_pretty(&manifest)
+        .context("failed to render generated descriptor manifest")?;
+    if let Ok(existing) = fs::read_to_string(generated_manifest_path) {
+        if existing == rendered {
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = generated_manifest_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create generated manifest directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(generated_manifest_path, rendered).with_context(|| {
+        format!(
+            "failed to write generated descriptor manifest {}",
+            generated_manifest_path.display()
+        )
+    })
+}
+
+fn fetch_descriptor_feeds(
+    descriptor_url: &str,
+    base_manifest: &RawEngineManifest,
+) -> Result<Vec<RawFeedConfig>> {
+    let client = BlockingHttpClient::builder()
+        .user_agent("alpha-raptor-engine/0.1")
+        .build()
+        .context("failed to build HTTP client for descriptor bootstrap")?;
+    let response = maybe_add_internal_token_blocking(client.get(descriptor_url), descriptor_url)?
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("failed to fetch routing descriptor from {descriptor_url}"))?;
+    let descriptor: RoutingDescriptor = response
+        .json()
+        .with_context(|| format!("failed to parse routing descriptor from {descriptor_url}"))?;
+
+    let mut depends_on_by_id = HashMap::<String, Vec<String>>::new();
+    for feed in &base_manifest.feeds {
+        depends_on_by_id.insert(feed.id.clone(), feed.depends_on.clone());
+    }
+
+    let mut realtime_by_key = HashMap::<String, RoutingRealtimeFeedDescriptor>::new();
+    for realtime in descriptor.realtime_feeds {
+        if let Some(key) = descriptor_feed_key(realtime.feed_id.as_ref(), realtime.namespace.as_ref()) {
+            realtime_by_key.insert(key, realtime);
+        }
+    }
+
+    let mut feeds = Vec::with_capacity(descriptor.static_feeds.len());
+    for static_feed in descriptor.static_feeds {
+        let feed_id = descriptor_feed_key(
+            static_feed.feed_id.as_ref(),
+            static_feed.namespace.as_ref().or(static_feed.id.as_ref()),
+        )
+        .context("routing descriptor static feed is missing feedId/namespace/id")?;
+        let realtime = realtime_by_key
+            .get(&feed_id)
+            .or_else(|| {
+                static_feed
+                    .namespace
+                    .as_ref()
+                    .and_then(|namespace| realtime_by_key.get(namespace))
+            });
+
+        let depends_on = depends_on_by_id
+            .get(&feed_id)
+            .cloned()
+            .or_else(|| {
+                static_feed
+                    .namespace
+                    .as_ref()
+                    .and_then(|namespace| depends_on_by_id.get(namespace).cloned())
+            })
+            .unwrap_or_default();
+
+        feeds.push(RawFeedConfig {
+            id: feed_id,
+            static_gtfs: static_feed.url,
+            static_gtfs_allow_invalid_tls: false,
+            trip_updates_url: realtime.and_then(|value| value.trip_updates_url.clone()),
+            vehicle_positions_url: realtime.and_then(|value| value.vehicle_positions_url.clone()),
+            depends_on,
+        });
+    }
+
+    if feeds.is_empty() {
+        bail!("routing descriptor at {descriptor_url} does not define any static feeds");
+    }
+
+    Ok(feeds)
+}
+
+fn descriptor_feed_key(primary: Option<&String>, fallback: Option<&String>) -> Option<String> {
+    primary
+        .map(String::as_str)
+        .or(fallback.map(String::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 impl Engine {
@@ -1495,6 +1775,7 @@ impl Engine {
             config.hpf_snap_tolerance_meters,
             config.hpf_snap_quadratic_kappa_meters,
             config.hpf_search_window,
+            previous.is_none() && config.hpf_defer_rebuild_on_bootstrap,
             config.osm_diff.clone(),
         );
         let hpf_millis = hpf_started.elapsed().as_millis();
@@ -2245,6 +2526,10 @@ impl Engine {
             .max_transfers
             .unwrap_or(self.config.default_max_transfers)
             .clamp(0, 8);
+        let requested_itinerary_count = request
+            .num_itineraries
+            .unwrap_or(DEFAULT_QUERY_ITINERARY_COUNT)
+            .clamp(1, MAX_QUERY_ITINERARY_COUNT);
         let (plan, plan_metrics) = self.resolve_query_plan(&request).await?;
         let from_index = plan.from_index;
         let to_index = plan.to_index;
@@ -2757,26 +3042,30 @@ impl Engine {
         }
         let rounds_ms = rounds_started.elapsed().as_millis();
 
-        let destination_round = destination_round.ok_or_else(|| {
-            anyhow!(
+        if destination_round.is_none() {
+            bail!(
                 "no itinerary found from {} to {} after {} transfers",
                 plan.display_from.name,
                 plan.display_to.name,
                 max_transfers
-            )
-        })?;
-        let arrival_secs = round_arrivals[destination_round][to_index];
+            );
+        }
+        let itinerary_limit = requested_itinerary_count.min(rounds + 1);
 
         let reconstruct_started = Instant::now();
-        let raw_legs = self.reconstruct_path(
+        let itinerary_candidates = self.collect_query_itinerary_candidates(
             from_index,
             to_index,
-            destination_round,
+            itinerary_limit,
             &parents,
             &round_arrivals,
         )?;
         let reconstruct_ms = reconstruct_started.elapsed().as_millis();
-        let cacheable_raw_legs = self.cacheable_raw_legs(&raw_legs, static_stop_count);
+        let primary_candidate = itinerary_candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no itinerary candidates reconstructed"))?;
+        let cacheable_raw_legs = self.cacheable_raw_legs(&primary_candidate.raw_legs, static_stop_count);
         let profile_insertions = if let Some(destination_stop) = plan.exact_destination_stop {
             self.build_profile_insertions(destination_stop, &cacheable_raw_legs)
         } else {
@@ -2784,14 +3073,19 @@ impl Engine {
         };
         let spatial_profile_insertions =
             self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs);
-        let transit_legs = raw_legs
-            .iter()
-            .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
-            .count();
+        let transit_legs = primary_candidate.transit_legs;
 
         let hydrate_started = Instant::now();
-        let legs = self.hydrate_legs(service_date, &raw_legs, &plan.overlay)?;
-        let deferred_hydration = self.build_deferred_hydration(&legs)?;
+        let itineraries = self.hydrate_query_itinerary_candidates(
+            service_date,
+            departure_secs,
+            &itinerary_candidates,
+            &plan.overlay,
+        )?;
+        let primary_itinerary = itineraries
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no hydrated itinerary candidates"))?;
         let hydrate_ms = hydrate_started.elapsed().as_millis();
 
         if !profile_insertions.is_empty() || !spatial_profile_insertions.is_empty() {
@@ -2830,12 +3124,13 @@ impl Engine {
         Ok(QueryResponse {
             from: plan.display_from,
             to: plan.display_to,
-            departure_time: format_service_time(service_date, departure_secs),
-            arrival_time: format_service_time(service_date, arrival_secs),
-            duration_seconds: arrival_secs - departure_secs,
+            departure_time: primary_itinerary.departure_time.clone(),
+            arrival_time: primary_itinerary.arrival_time.clone(),
+            duration_seconds: primary_itinerary.duration_seconds,
             transfers: transit_legs.saturating_sub(1),
-            legs,
-            deferred_hydration,
+            legs: primary_itinerary.legs.clone(),
+            itineraries,
+            deferred_hydration: primary_itinerary.deferred_hydration.clone(),
             trace: QueryTrace {
                 service_date: service_date.to_string(),
                 query_runtime_ms,
@@ -2872,6 +3167,206 @@ impl Engine {
                 rounds: trace_rounds,
             },
         })
+    }
+
+    fn collect_query_itinerary_candidates(
+        &self,
+        from_index: usize,
+        to_index: usize,
+        limit: usize,
+        parents: &[Vec<Option<ParentStep>>],
+        round_arrivals: &[Vec<i32>],
+    ) -> Result<Vec<QueryItineraryCandidate>> {
+        let mut candidates = Vec::<QueryItineraryCandidate>::new();
+        let mut seen_signatures = HashSet::<String>::new();
+
+        for round in 0..round_arrivals.len() {
+            let arrival_secs = round_arrivals[round][to_index];
+            if arrival_secs >= INF_TIME || parents[round][to_index].is_none() {
+                continue;
+            }
+
+            let raw_legs = self.reconstruct_path(from_index, to_index, round, parents, round_arrivals)?;
+            let signature = raw_leg_signature(&raw_legs);
+            if !seen_signatures.insert(signature) {
+                continue;
+            }
+
+            let transit_legs = raw_legs
+                .iter()
+                .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
+                .count();
+            candidates.push(QueryItineraryCandidate {
+                round,
+                arrival_secs,
+                transit_legs,
+                raw_legs,
+            });
+        }
+
+        candidates.sort_by(|left, right| {
+            left.arrival_secs
+                .cmp(&right.arrival_secs)
+                .then_with(|| left.transit_legs.cmp(&right.transit_legs))
+                .then_with(|| left.round.cmp(&right.round))
+        });
+
+        let fastest_index = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| (candidate.arrival_secs, candidate.transit_legs, candidate.round))
+            .map(|(index, _)| index);
+        let fewest_transfers_index = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| {
+                (
+                    candidate.transit_legs.saturating_sub(1),
+                    candidate.arrival_secs,
+                    candidate.round,
+                )
+            })
+            .map(|(index, _)| index);
+
+        let mut ordered = Vec::<QueryItineraryCandidate>::with_capacity(candidates.len());
+        let mut used_indices = HashSet::<usize>::new();
+
+        if let Some(index) = fastest_index {
+            used_indices.insert(index);
+            ordered.push(candidates[index].clone());
+        }
+        if let Some(index) = fewest_transfers_index {
+            if used_indices.insert(index) {
+                ordered.push(candidates[index].clone());
+            }
+        }
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if used_indices.insert(index) {
+                ordered.push(candidate);
+            }
+        }
+
+        ordered.truncate(limit.max(1));
+        Ok(ordered)
+    }
+
+    fn hydrate_query_itinerary_candidates(
+        &self,
+        service_date: NaiveDate,
+        departure_secs: i32,
+        candidates: &[QueryItineraryCandidate],
+        overlay: &QueryOverlay,
+    ) -> Result<Vec<QueryItineraryResponse>> {
+        let mut itineraries = Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            let transfers = candidate.transit_legs.saturating_sub(1);
+            let legs = self.hydrate_legs(service_date, &candidate.raw_legs, overlay)?;
+            let passive_metrics = score_itinerary_passive_metrics(&legs);
+            let deferred_hydration = self.build_deferred_hydration(&legs)?;
+
+            itineraries.push(QueryItineraryResponse {
+                id: format!(
+                    "round-{}-{}-{}",
+                    candidate.round,
+                    candidate.arrival_secs,
+                    transfers
+                ),
+                label: String::new(),
+                badges: Vec::new(),
+                is_recommended: false,
+                is_fastest: false,
+                is_fewest_transfers: false,
+                is_best_realtime: false,
+                is_least_crowded: false,
+                has_canceled_legs: passive_metrics.has_canceled_legs,
+                departure_time: format_service_time(service_date, departure_secs),
+                arrival_time: format_service_time(service_date, candidate.arrival_secs),
+                duration_seconds: candidate.arrival_secs - departure_secs,
+                transfers,
+                realtime_score: passive_metrics.transit_legs_with_gtfs_rt,
+                transit_leg_count: passive_metrics.transit_leg_count,
+                transit_legs_with_gtfs_rt: passive_metrics.transit_legs_with_gtfs_rt,
+                crowding_score: passive_metrics.crowding_score,
+                crowding_level: passive_metrics.crowding_level,
+                occupancy_covered_transit_legs: passive_metrics.occupancy_covered_transit_legs,
+                canceled_transit_legs: passive_metrics.canceled_transit_legs,
+                legs,
+                deferred_hydration,
+            });
+        }
+
+        let fastest_duration = itineraries
+            .iter()
+            .map(|itinerary| itinerary.duration_seconds)
+            .min()
+            .unwrap_or(0);
+        let fewest_transfers = itineraries
+            .iter()
+            .map(|itinerary| itinerary.transfers)
+            .min()
+            .unwrap_or(0);
+        let best_realtime_score = itineraries
+            .iter()
+            .map(|itinerary| itinerary.transit_legs_with_gtfs_rt)
+            .max()
+            .unwrap_or(0);
+        let best_crowding_score = itineraries
+            .iter()
+            .filter(|itinerary| itinerary.occupancy_covered_transit_legs > 0)
+            .filter_map(|itinerary| itinerary.crowding_score)
+            .min();
+
+        itineraries.sort_by(|left, right| {
+            left.has_canceled_legs
+                .cmp(&right.has_canceled_legs)
+                .then_with(|| left.duration_seconds.cmp(&right.duration_seconds))
+                .then_with(|| left.transfers.cmp(&right.transfers))
+                .then_with(|| right.transit_legs_with_gtfs_rt.cmp(&left.transit_legs_with_gtfs_rt))
+                .then_with(|| compare_optional_crowding(left.crowding_score, right.crowding_score))
+                .then_with(|| {
+                    right
+                        .occupancy_covered_transit_legs
+                        .cmp(&left.occupancy_covered_transit_legs)
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        for (index, itinerary) in itineraries.iter_mut().enumerate() {
+            let is_recommended = index == 0;
+            let is_fastest = itinerary.duration_seconds == fastest_duration;
+            let is_fewest_transfers = itinerary.transfers == fewest_transfers;
+            let is_best_realtime = best_realtime_score > 0
+                && itinerary.transit_legs_with_gtfs_rt == best_realtime_score;
+            let is_least_crowded = best_crowding_score.is_some()
+                && itinerary.occupancy_covered_transit_legs > 0
+                && itinerary.crowding_score == best_crowding_score;
+
+            itinerary.is_recommended = is_recommended;
+            itinerary.is_fastest = is_fastest;
+            itinerary.is_fewest_transfers = is_fewest_transfers;
+            itinerary.is_best_realtime = is_best_realtime;
+            itinerary.is_least_crowded = is_least_crowded;
+            itinerary.label = build_itinerary_label(
+                index,
+                is_recommended,
+                is_fastest,
+                is_fewest_transfers,
+                is_best_realtime,
+                is_least_crowded,
+            );
+            itinerary.badges = build_itinerary_badges(
+                index,
+                is_recommended,
+                is_fastest,
+                is_fewest_transfers,
+                is_best_realtime,
+                is_least_crowded,
+                itinerary.has_canceled_legs,
+            );
+        }
+
+        Ok(itineraries)
     }
 
     fn scan_line(
@@ -4110,6 +4605,13 @@ impl Engine {
             headsign: None,
             walk_distance_meters: Some(distance_meters),
             delay_applied_seconds: None,
+            has_gtfs_rt: false,
+            has_trip_update: false,
+            has_vehicle_position: false,
+            schedule_relationship: None,
+            occupancy_status: None,
+            occupancy_percentage: None,
+            occupancy_score: None,
             intermediate_stops: Vec::new(),
             polyline: geometry.polyline,
             walk_directions,
@@ -4152,6 +4654,13 @@ impl Engine {
                     headsign: None,
                     walk_distance_meters: Some(distance_meters),
                     delay_applied_seconds: None,
+                    has_gtfs_rt: false,
+                    has_trip_update: false,
+                    has_vehicle_position: false,
+                    schedule_relationship: None,
+                    occupancy_status: None,
+                    occupancy_percentage: None,
+                    occupancy_score: None,
                     intermediate_stops: Vec::new(),
                     polyline: geometry.polyline.clone(),
                     walk_directions: build_walk_directions(
@@ -4174,6 +4683,7 @@ impl Engine {
                 let route = &self.static_data.routes[trip.route_index];
                 let cold_trip = self.cold_trip_record(trip_index);
                 let cold_route = self.cold_route_record(trip.route_index);
+                let passive_realtime = self.passive_realtime_fields(trip_index, board_pos);
                 let scheduled_departure = trip.stop_times[board_pos].departure_secs;
                 let delay_applied_seconds = departure_secs - scheduled_departure;
                 let intermediate_stops = self.trip_intermediate_stops(trip, board_pos, alight_pos);
@@ -4195,6 +4705,24 @@ impl Engine {
                     headsign: cold_trip.headsign.clone(),
                     walk_distance_meters: None,
                     delay_applied_seconds: Some(delay_applied_seconds),
+                    has_gtfs_rt: passive_realtime.has_gtfs_rt(),
+                    has_trip_update: passive_realtime.has_trip_update,
+                    has_vehicle_position: passive_realtime.has_vehicle_position,
+                    schedule_relationship: schedule_relationship_string(
+                        passive_realtime.schedule_relationship,
+                    ),
+                    occupancy_status: occupancy_status_string(
+                        passive_realtime
+                            .stop_departure_occupancy_status
+                            .or(passive_realtime.vehicle_occupancy_status),
+                    ),
+                    occupancy_percentage: passive_realtime.vehicle_occupancy_percentage,
+                    occupancy_score: passive_occupancy_score(
+                        passive_realtime
+                            .stop_departure_occupancy_status
+                            .or(passive_realtime.vehicle_occupancy_status),
+                        passive_realtime.vehicle_occupancy_percentage,
+                    ),
                     intermediate_stops,
                     polyline: self.trip_polyline(trip, board_pos, alight_pos),
                     walk_directions: Vec::new(),
@@ -4315,6 +4843,10 @@ impl Engine {
             segment_way_ids: empty_segment_way_ids(&polyline),
             polyline,
         }
+    }
+
+    fn passive_realtime_fields(&self, trip_index: usize, board_pos: usize) -> TripRealtimeMetrics {
+        self.realtime.trip_realtime_metrics(trip_index, board_pos)
     }
 
     fn query_stop_coordinates(
@@ -4488,6 +5020,13 @@ impl Engine {
                 headsign: leg.headsign.clone(),
                 walk_distance_meters: leg.walk_distance_meters,
                 delay_applied_seconds: leg.delay_applied_seconds,
+                has_gtfs_rt: leg.has_gtfs_rt,
+                has_trip_update: leg.has_trip_update,
+                has_vehicle_position: leg.has_vehicle_position,
+                schedule_relationship: leg.schedule_relationship.clone(),
+                occupancy_status: leg.occupancy_status.clone(),
+                occupancy_percentage: leg.occupancy_percentage,
+                occupancy_score: leg.occupancy_score,
                 intermediate_stop_gids,
                 polyline_index,
                 walk_directions: leg.walk_directions.clone(),
@@ -5055,8 +5594,7 @@ fn probe_remote_static_gtfs_version(
     feed_id: &str,
     url: &str,
 ) -> Result<RemoteStaticGtfsVersionMetadata> {
-    let response = client
-        .head(url)
+    let response = maybe_add_internal_token_blocking(client.head(url), url)?
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| {
@@ -5205,8 +5743,7 @@ fn sync_remote_static_gtfs(
         }
     }
 
-    let response = client
-        .get(url)
+    let response = maybe_add_internal_token_blocking(client.get(url), url)?
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download static GTFS feed {feed_id} from {url}"));
@@ -5409,8 +5946,7 @@ fn sync_remote_osm_pbf(
         }
     }
 
-    let response = client
-        .get(url)
+    let response = maybe_add_internal_token_blocking(client.get(url), url)?
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download OSM PBF from {url}"));
@@ -7686,6 +8222,193 @@ fn record_stop_improvement(
         improved_stops.push(stop_index);
     }
     true
+}
+
+    fn raw_leg_signature(raw_legs: &[RawLeg]) -> String {
+        raw_legs
+            .iter()
+            .map(|leg| match leg {
+                RawLeg::Walk {
+                    from_stop,
+                    to_stop,
+                    departure_secs,
+                    arrival_secs,
+                    ..
+                } => format!(
+                    "walk:{from_stop}:{to_stop}:{departure_secs}:{arrival_secs}"
+                ),
+                RawLeg::Transit {
+                    trip_index,
+                    board_stop,
+                    alight_stop,
+                    departure_secs,
+                    arrival_secs,
+                    ..
+                } => format!(
+                    "transit:{trip_index}:{board_stop}:{alight_stop}:{departure_secs}:{arrival_secs}"
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn build_itinerary_label(
+        index: usize,
+        is_recommended: bool,
+        is_fastest: bool,
+        is_fewest_transfers: bool,
+        is_best_realtime: bool,
+        is_least_crowded: bool,
+    ) -> String {
+        if is_fastest {
+            "Piu veloce".to_owned()
+        } else if is_best_realtime {
+            "Migliori dati RT".to_owned()
+        } else if is_least_crowded {
+            "Meno affollato".to_owned()
+        } else if is_fewest_transfers {
+            "Meno cambi".to_owned()
+        } else if is_recommended {
+            "Consigliato".to_owned()
+        } else {
+            format!("Alternativa {}", index + 1)
+        }
+    }
+
+    fn build_itinerary_badges(
+        index: usize,
+        is_recommended: bool,
+        is_fastest: bool,
+        is_fewest_transfers: bool,
+        is_best_realtime: bool,
+        is_least_crowded: bool,
+        has_canceled_legs: bool,
+    ) -> Vec<String> {
+        let mut badges = Vec::new();
+        if is_recommended {
+            badges.push("Consigliato".to_owned());
+        }
+        if is_fastest {
+            badges.push("Piu veloce".to_owned());
+        }
+        if is_fewest_transfers {
+            badges.push("Meno cambi".to_owned());
+        }
+        if is_best_realtime {
+            badges.push("Migliori dati RT".to_owned());
+        }
+        if is_least_crowded {
+            badges.push("Meno affollato".to_owned());
+        }
+        if has_canceled_legs {
+            badges.push("Contiene CANCELED".to_owned());
+        }
+        if badges.is_empty() {
+            badges.push(format!("Alternativa {}", index + 1));
+        }
+        badges
+    }
+
+fn compare_optional_crowding(left: Option<u16>, right: Option<u16>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn score_itinerary_passive_metrics(legs: &[LegResponse]) -> ItineraryPassiveMetrics {
+    let mut transit_leg_count = 0usize;
+    let mut transit_legs_with_gtfs_rt = 0usize;
+    let mut occupancy_covered_transit_legs = 0usize;
+    let mut crowding_score_total = 0u16;
+    let mut canceled_transit_legs = 0usize;
+
+    for leg in legs {
+        if leg.kind != "transit" {
+            continue;
+        }
+
+        transit_leg_count += 1;
+        if leg.has_gtfs_rt {
+            transit_legs_with_gtfs_rt += 1;
+        }
+        if let Some(score) = leg.occupancy_score {
+            occupancy_covered_transit_legs += 1;
+            crowding_score_total = crowding_score_total.saturating_add(score);
+        }
+        if leg.schedule_relationship.as_deref() == Some("CANCELED") {
+            canceled_transit_legs += 1;
+        }
+    }
+
+    let crowding_score = (occupancy_covered_transit_legs > 0)
+        .then(|| crowding_score_total / occupancy_covered_transit_legs as u16);
+    let crowding_level = passive_occupancy_level(crowding_score, occupancy_covered_transit_legs);
+
+    ItineraryPassiveMetrics {
+        transit_leg_count,
+        transit_legs_with_gtfs_rt,
+        occupancy_covered_transit_legs,
+        crowding_score,
+        crowding_level,
+        canceled_transit_legs,
+        has_canceled_legs: canceled_transit_legs > 0,
+    }
+}
+
+fn passive_occupancy_level(score: Option<u16>, covered_legs: usize) -> &'static str {
+    let Some(score) = score else {
+        return "unknown";
+    };
+    if covered_legs == 0 {
+        return "unknown";
+    }
+
+    if score <= 35 {
+        "low"
+    } else if score <= 70 {
+        "medium"
+    } else {
+        "high"
+    }
+}
+
+fn passive_occupancy_score(
+    occupancy_status: Option<i32>,
+    occupancy_percentage: Option<u32>,
+) -> Option<u16> {
+    if let Some(occupancy_percentage) = occupancy_percentage {
+        return Some(occupancy_percentage.min(150) as u16);
+    }
+
+    occupancy_status.and_then(|value| match vehicle_position::OccupancyStatus::from_i32(value) {
+        Some(vehicle_position::OccupancyStatus::Empty) => Some(0),
+        Some(vehicle_position::OccupancyStatus::ManySeatsAvailable) => Some(20),
+        Some(vehicle_position::OccupancyStatus::FewSeatsAvailable) => Some(45),
+        Some(vehicle_position::OccupancyStatus::StandingRoomOnly) => Some(75),
+        Some(vehicle_position::OccupancyStatus::CrushedStandingRoomOnly) => Some(90),
+        Some(vehicle_position::OccupancyStatus::Full) => Some(100),
+        Some(vehicle_position::OccupancyStatus::NotAcceptingPassengers) => Some(110),
+        Some(vehicle_position::OccupancyStatus::NotBoardable) => Some(120),
+        Some(vehicle_position::OccupancyStatus::NoDataAvailable) => None,
+        None => None,
+    })
+}
+
+fn schedule_relationship_string(value: Option<i32>) -> Option<String> {
+    value.and_then(|value| {
+        trip_descriptor::ScheduleRelationship::from_i32(value)
+            .map(|relationship| relationship.as_str_name().to_owned())
+    })
+}
+
+fn occupancy_status_string(value: Option<i32>) -> Option<String> {
+    value.and_then(|value| {
+        vehicle_position::OccupancyStatus::from_i32(value)
+            .map(|status| status.as_str_name().to_owned())
+    })
 }
 
 fn record_memoized_destination_improvement(

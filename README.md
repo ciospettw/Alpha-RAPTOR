@@ -7,7 +7,7 @@
 [![GTFS](https://img.shields.io/badge/feeds-GTFS%20%2B%20GTFS--RT-orange)](https://gtfs.org/)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC%204.0-lightgrey)](./LICENSE)
 
-α-RAPTOR is a local multimodal routing engine for GTFS, GTFS-Realtime, and OSM-based pedestrian access. It exposes an HTTP API, a small built-in web UI, and a manifest-driven runtime that can hot-reload static GTFS sources and refresh realtime feeds in background.
+α-RAPTOR is a local multimodal routing engine for GTFS, GTFS-Realtime, and OSM-based pedestrian access. It exposes an HTTP API, a small built-in web UI, and a manifest-driven runtime that can hot-reload static GTFS sources while accepting push-driven realtime refresh notifications.
 
 The repository also contains the architecture notes for the core subsystems under [docs/btt.md](docs/btt.md), [docs/hpf.md](docs/hpf.md), [docs/hydra-slab.md](docs/hydra-slab.md), [docs/svrt.md](docs/svrt.md), and [docs/temporal-indirection.md](docs/temporal-indirection.md).
 
@@ -15,7 +15,7 @@ The repository also contains the architecture notes for the core subsystems unde
 
 - Multi-feed static GTFS loading from local files or remote ZIP URLs
 - Background GTFS static polling and atomic hot swap with no process restart
-- GTFS-Realtime trip updates and vehicle positions refresh in background
+- GTFS-Realtime trip updates and vehicle positions refresh on startup and on internal notifications
 - Coordinate-to-coordinate queries with local OSM-backed walking connectors
 - Built-in HPF cache for first/last mile routing without an external walking service
 - Street-only walk and drive queries over cached local OSM graphs
@@ -24,7 +24,7 @@ The repository also contains the architecture notes for the core subsystems unde
 
 ## Requirements
 
-- Rust toolchain with Cargo
+- Rust 1.88+ toolchain with Cargo
 - A static GTFS ZIP for each feed you want to load
 - An OSM `.osm.pbf` extract for the pedestrian graph
 - Network access only if you use remote GTFS or remote OSM sources
@@ -34,6 +34,7 @@ Notes:
 - The preferred configuration mode is the manifest file [alpha-raptor.toml](alpha-raptor.toml).
 - If [alpha-raptor.toml](alpha-raptor.toml) exists in the workspace root, α-RAPTOR uses it automatically.
 - You can override the manifest path with the environment variable `ALPHA_CONFIG`.
+- If `ALPHA_DESCRIPTOR_URL` is set, α-RAPTOR keeps the root settings from [alpha-raptor.toml](alpha-raptor.toml) but regenerates `[[feeds]]` from the BusO-Api descriptor into `.alpha-raptor/generated/busone-descriptor.toml`.
 - If no manifest exists, the runtime falls back to legacy environment variables.
 
 ## Quick Start
@@ -56,6 +57,39 @@ http://127.0.0.1:7878
 
 ```text
 http://127.0.0.1:7878/api/health
+```
+
+## BusO-Api Bootstrap
+
+For the BusO-Api integration mode, α-RAPTOR fetches an internal descriptor from the API, materializes a runtime manifest, and then boots normally on port `7878`.
+
+Required variables:
+
+- `ALPHA_DESCRIPTOR_URL`, for example `http://buso-api:9888/routing/descriptor`
+- `ALPHA_INTERNAL_TOKEN_FILE`, usually `/shared/.internal-token`
+
+In this mode:
+
+- Root settings such as `osm_pbf`, HPF, DVNI, and polling intervals still come from [alpha-raptor.toml](alpha-raptor.toml).
+- Static and realtime feed URLs are sourced from the descriptor.
+- Any descriptor-scoped requests back to BusO-Api automatically include the shared internal token.
+- Static GTFS changes are detected autonomously by Alpha-RAPTOR; BusO-Api only pushes realtime refresh notifications.
+
+## Docker
+
+The repository now includes [Dockerfile](Dockerfile) and [docker-compose.yml](docker-compose.yml) for running α-RAPTOR on the same Docker network as BusO-Api.
+
+The container starts the engine with `cargo run --release --locked`, and the image prebuilds the release profile during `docker build` to avoid paying the full compile cost on every boot.
+
+Assumptions:
+
+- BusO-Api is already running and has created the Docker network `busone-net`.
+- BusO-Api has already created the shared volume `internal-token`.
+
+Start α-RAPTOR:
+
+```bash
+docker compose up -d --build
 ```
 
 ## Install And Run
@@ -100,7 +134,6 @@ osm_pbf = "data/osm/lazio-latest.osm.pbf"
 walk_radius_meters = 450.0
 walk_speed_mps = 1.35
 max_transfer_candidates = 12
-refresh_interval_secs = 45
 static_reload_interval_secs = 600
 static_diff_tolerance = 0.05
 default_max_transfers = 4
@@ -144,7 +177,6 @@ depends_on = []
 | `walk_radius_meters` | float | `450.0` | Maximum stop-to-stop walking radius used by the transfer builder. |
 | `walk_speed_mps` | float | `1.35` | Walking speed used to derive walking durations. |
 | `max_transfer_candidates` | integer | `12` | Maximum number of walking transfer candidates retained per stop. |
-| `refresh_interval_secs` | integer | `45` | Background GTFS-Realtime refresh interval. |
 | `static_reload_interval_secs` | integer | `600` | Background polling interval for static GTFS changes and manifest changes. |
 | `static_diff_tolerance` | float | `0.05` | Tolerance used by static diff logic before choosing a fuller rebuild path. |
 | `default_max_transfers` | integer | `4` | Default max transfers used when `/api/query` omits `max_transfers`. |
@@ -201,6 +233,9 @@ Operational notes:
 | Variable | Description |
 | --- | --- |
 | `ALPHA_CONFIG` | Overrides the manifest path instead of the default [alpha-raptor.toml](alpha-raptor.toml). |
+| `ALPHA_DESCRIPTOR_URL` | Optional BusO-Api descriptor URL. When set, α-RAPTOR regenerates feed entries from the descriptor before loading the engine. |
+| `ALPHA_INTERNAL_TOKEN` | Optional inline override for the shared internal token used on descriptor-scoped requests and internal endpoints. |
+| `ALPHA_INTERNAL_TOKEN_FILE` | Shared-token file path, default `/shared/.internal-token`. |
 | `ALPHA_BIND` | Bind address for the HTTP server, for example `127.0.0.1:7878` or `0.0.0.0:7878`. |
 | `RUST_LOG` | Standard tracing filter used by the runtime logger. |
 
@@ -220,7 +255,6 @@ These are still supported when no manifest is present.
 | `ALPHA_WALK_RADIUS_M` | `walk_radius_meters` |
 | `ALPHA_WALK_SPEED_MPS` | `walk_speed_mps` |
 | `ALPHA_MAX_WALK_NEIGHBORS` | `max_transfer_candidates` |
-| `ALPHA_RT_REFRESH_SECS` | `refresh_interval_secs` |
 | `ALPHA_STATIC_POLL_SECS` | `static_reload_interval_secs` |
 | `ALPHA_STATIC_DIFF_TOLERANCE` | `static_diff_tolerance` |
 | `ALPHA_MAX_TRANSFERS` | `default_max_transfers` |
@@ -266,7 +300,8 @@ The server exposes these endpoints:
 | `/api/query` | `GET` | Journey planning query |
 | `/api/street` | `GET` | Street-only walk or drive routing |
 | `/api/realtime` | `GET` | Current realtime snapshot |
-| `/api/realtime/refresh` | `POST` | Force an immediate realtime refresh |
+| `/api/realtime/refresh` | `POST` | Internal-only forced realtime refresh; requires `x-buso-internal-token` |
+| `/internal/realtime/refresh` | `POST` | Internal-only GTFS-RT control endpoint; requires `x-buso-internal-token` |
 
 ### Stop Search Example
 
@@ -306,7 +341,8 @@ curl "http://127.0.0.1:7878/api/health"
 curl "http://127.0.0.1:7878/api/stops?q=termini&limit=8"
 curl "http://127.0.0.1:7878/api/query?from=roma:70378&to=roma:71404&date=2026-04-19&time=09:05&max_transfers=3"
 curl "http://127.0.0.1:7878/api/street?mode=drive&from_lat=41.90085&from_lon=12.48354&to_lat=41.89025&to_lon=12.49223"
-curl -X POST "http://127.0.0.1:7878/api/realtime/refresh"
+curl -X POST "http://127.0.0.1:7878/api/realtime/refresh" -H "x-buso-internal-token: <token>"
+curl -X POST "http://127.0.0.1:7878/internal/realtime/refresh" -H "x-buso-internal-token: <token>"
 ```
 
 ### Query Parameters

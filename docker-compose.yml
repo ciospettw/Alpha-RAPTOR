@@ -1,0 +1,33 @@
+services:
+  alpha-raptor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alpha-raptor
+    command: ["/app/target/release/alpha_raptor_engine"]
+    environment:
+      - ALPHA_BIND=0.0.0.0:7878
+      - ALPHA_DESCRIPTOR_URL=http://buso-api:9888/routing/descriptor
+      - ALPHA_INTERNAL_TOKEN_FILE=/shared/.internal-token
+      - ALPHA_HPF_DEFER_REBUILD_ON_BOOTSTRAP=1
+      - RUST_LOG=info
+    ports:
+      - "7878:7878"
+    volumes:
+      - ./alpha-raptor.toml:/app/alpha-raptor.toml:ro
+      - alpha-raptor-runtime:/app/.alpha-raptor
+      - internal-token:/shared:ro
+    networks:
+      - busone-net
+    restart: unless-stopped
+
+volumes:
+  alpha-raptor-runtime:
+  internal-token:
+    external: true
+    name: internal-token
+
+networks:
+  busone-net:
+    external: true
+    name: busone-net
