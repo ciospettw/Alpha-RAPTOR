@@ -2,20 +2,16 @@ const state = {
   stats: null,
   realtime: null,
   query: null,
-  busyCount: 0,
   map: null,
   routeLayer: null,
   vehicleLayer: null,
   endpointLayer: null,
   mapSelectionTarget: "from",
-  selectedItineraryId: null,
   selectedEndpoints: {
     from: null,
     to: null,
   },
 };
-
-const DEFAULT_ITINERARY_COUNT = 5;
 
 const dom = {
   fromSearch: document.getElementById("fromSearch"),
@@ -24,7 +20,6 @@ const dom = {
   toSearch: document.getElementById("toSearch"),
   toStopId: document.getElementById("toStopId"),
   toResults: document.getElementById("toResults"),
-  routeModeSelect: document.getElementById("routeModeSelect"),
   dateInput: document.getElementById("dateInput"),
   timeInput: document.getElementById("timeInput"),
   maxTransfersInput: document.getElementById("maxTransfersInput"),
@@ -40,8 +35,6 @@ const dom = {
   realtimeContainer: document.getElementById("realtimeContainer"),
   refreshRealtimeButton: document.getElementById("refreshRealtimeButton"),
   refreshStatus: document.getElementById("refreshStatus"),
-  topbarProgress: document.getElementById("topbarProgress"),
-  itineraryOptions: document.getElementById("itineraryOptions"),
 };
 
 initialize();
@@ -52,12 +45,10 @@ async function initialize() {
   wireSearch("from", dom.fromSearch, dom.fromStopId, dom.fromResults);
   wireSearch("to", dom.toSearch, dom.toStopId, dom.toResults);
   dom.queryForm.addEventListener("submit", onSubmitQuery);
-  dom.routeModeSelect.addEventListener("change", onRouteModeChange);
   dom.swapButton.addEventListener("click", swapStops);
   dom.pickFromButton.addEventListener("click", () => setMapSelectionTarget("from"));
   dom.pickToButton.addEventListener("click", () => setMapSelectionTarget("to"));
   dom.refreshRealtimeButton.addEventListener("click", refreshRealtime);
-  syncRouteModeUI();
   setMapSelectionTarget("from");
 
   await Promise.all([loadStats(), loadRealtime()]);
@@ -103,30 +94,19 @@ function setMapSelectionTarget(prefix) {
 }
 
 async function loadStats() {
-  const releaseBusy = beginBusy();
-  try {
-    const payload = await fetchJson("/api/stats");
-    state.stats = payload;
-    renderStats();
-  } finally {
-    releaseBusy();
-  }
+  const payload = await fetchJson("/api/stats");
+  state.stats = payload;
+  renderStats();
 }
 
 async function loadRealtime() {
-  const releaseBusy = beginBusy();
-  try {
-    const payload = await fetchJson("/api/realtime?limit=24");
-    state.realtime = payload;
-    renderRealtime();
-  } finally {
-    releaseBusy();
-  }
+  const payload = await fetchJson("/api/realtime?limit=24");
+  state.realtime = payload;
+  renderRealtime();
 }
 
 async function refreshRealtime() {
   setRefreshStatus("sync", true);
-  const releaseBusy = beginBusy();
   try {
     const payload = await fetchJson("/api/realtime/refresh", { method: "POST" });
     state.realtime = payload;
@@ -139,73 +119,42 @@ async function refreshRealtime() {
   } catch (error) {
     setRefreshStatus("errore", false);
     dom.realtimeContainer.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
-  } finally {
-    releaseBusy();
   }
 }
 
 async function onSubmitQuery(event) {
   event.preventDefault();
-  const routeMode = getRouteMode();
-  const search = new URLSearchParams();
+  const search = new URLSearchParams({
+    date: dom.dateInput.value,
+    time: dom.timeInput.value,
+    max_transfers: dom.maxTransfersInput.value,
+  });
 
   try {
-    if (routeMode === "drive-only") {
-      search.set("mode", "drive");
-      appendStreetEndpointParams(search, "from", dom.fromSearch);
-      appendStreetEndpointParams(search, "to", dom.toSearch);
-    } else {
-      search.set("date", dom.dateInput.value);
-      search.set("time", dom.timeInput.value);
-      search.set("max_transfers", dom.maxTransfersInput.value);
-      search.set("num_itineraries", String(DEFAULT_ITINERARY_COUNT));
-      appendEndpointParams(search, "from", dom.fromSearch, dom.fromStopId);
-      appendEndpointParams(search, "to", dom.toSearch, dom.toStopId);
-    }
+    appendEndpointParams(search, "from", dom.fromSearch, dom.fromStopId);
+    appendEndpointParams(search, "to", dom.toSearch, dom.toStopId);
   } catch (error) {
     dom.itinerarySummary.textContent = error.message;
     dom.itinerarySummary.className = "summary-strip error-strip";
     return;
   }
 
-  dom.itinerarySummary.textContent = routeMode === "drive-only"
-    ? "Routing stradale in esecuzione..."
-    : "Query in esecuzione...";
+  dom.itinerarySummary.textContent = "Query in esecuzione...";
   dom.itinerarySummary.className = "summary-strip";
 
-  const releaseBusy = beginBusy();
   try {
-    const endpoint = routeMode === "drive-only" ? "/api/street" : "/api/query";
-    const payload = await fetchJson(`${endpoint}?${search.toString()}`);
+    const payload = await fetchJson(`/api/query?${search.toString()}`);
     state.query = payload;
-    state.selectedItineraryId = null;
     renderQuery();
   } catch (error) {
     state.query = null;
-    state.selectedItineraryId = null;
     dom.itinerarySummary.textContent = error.message;
     dom.itinerarySummary.className = "summary-strip error-strip";
-    dom.itineraryOptions.innerHTML = '<div class="empty-state">Nessuna alternativa.</div>';
     dom.legsContainer.innerHTML = '<div class="empty-state">Nessun itinerario.</div>';
     dom.traceContainer.innerHTML = `<div class="error-box">${escapeHtml(error.message)}</div>`;
     clearMapLayers();
     renderEndpointSelections();
-  } finally {
-    releaseBusy();
   }
-}
-
-function onRouteModeChange() {
-  syncRouteModeUI();
-  if (!state.query) {
-    return;
-  }
-
-  markRouteStale(
-    getRouteMode() === "drive-only"
-      ? "Modalità drive only attiva. Premi Route."
-      : "Modalità transit attiva. Premi Route.",
-  );
 }
 
 function swapStops() {
@@ -252,14 +201,11 @@ function wireSearch(prefix, input, hiddenInput, resultsContainer) {
     }
 
     timer = setTimeout(async () => {
-      const releaseBusy = beginBusy();
       try {
         const payload = await fetchJson(`/api/stops?q=${encodeURIComponent(value)}&limit=8`);
         renderSearchResults(prefix, payload, input, hiddenInput, resultsContainer);
       } catch (error) {
         resultsContainer.innerHTML = `<div class="search-result muted">${escapeHtml(error.message)}</div>`;
-      } finally {
-        releaseBusy();
       }
     }, 180);
   });
@@ -371,27 +317,6 @@ function appendEndpointParams(search, prefix, input, hiddenInput) {
   throw new Error(`Specifica ${prefix === "from" ? "origine" : "destinazione"} come fermata o come coordinate lat,lon.`);
 }
 
-function appendStreetEndpointParams(search, prefix, input) {
-  const coordinates = resolveEndpointCoordinates(prefix, input);
-  if (!coordinates) {
-    throw new Error(
-      `Per la modalità drive only serve una ${prefix === "from" ? "origine" : "destinazione"} con coordinate valide. Se scegli una fermata, selezionala dai risultati.`,
-    );
-  }
-
-  search.set(`${prefix}_lat`, String(coordinates.lat));
-  search.set(`${prefix}_lon`, String(coordinates.lon));
-}
-
-function resolveEndpointCoordinates(prefix, input) {
-  const endpoint = state.selectedEndpoints[prefix];
-  if (endpoint && typeof endpoint.lat === "number" && typeof endpoint.lon === "number") {
-    return { lat: endpoint.lat, lon: endpoint.lon };
-  }
-
-  return parseCoordinateInput(input.value);
-}
-
 function parseCoordinateInput(value) {
   const match = value.trim().match(/^(-?\d+(?:\.\d+)?)\s*[,;\s]\s*(-?\d+(?:\.\d+)?)$/);
   if (!match) {
@@ -456,16 +381,13 @@ function renderStats() {
     return;
   }
 
-  const { build, realtime, memoization, hpf_overlay: hpfOverlay, street_overlay: streetOverlay } = state.stats;
+  const { build, realtime, memoization } = state.stats;
   const items = [
     ["Static", build.static_cache_hit ? "hit" : "miss"],
     ["Walk", build.walk_cache_hit ? "hit" : "miss"],
     ["HPF", build.hpf_strategy],
     ["HPF nodes", formatCompactNumber(build.hpf_covered_nodes)],
     ["HPF ms", build.timings.hpf_ms],
-    ["HPF diff", hpfOverlay?.applied_sequence ? `seq ${hpfOverlay.applied_sequence}` : (hpfOverlay?.enabled ? "idle" : "off")],
-    ["Street drive", streetOverlay?.drive?.applied_sequence ? `seq ${streetOverlay.drive.applied_sequence}` : (streetOverlay?.drive?.enabled ? "idle" : "off")],
-    ["Street walk", streetOverlay?.walk?.applied_sequence ? `seq ${streetOverlay.walk.applied_sequence}` : (streetOverlay?.walk?.enabled ? "idle" : "off")],
     ["Vehicles", realtime.vehicle_count],
     ["Shadow", realtime.shadow_delta_count],
     ["Memo hits", memoization?.hits ?? 0],
@@ -488,79 +410,15 @@ function renderQuery() {
     return;
   }
 
-  if (isStreetRoute(state.query)) {
-    renderStreetRoute(state.query);
-    return;
-  }
-
-  renderTransitQuery(state.query);
-}
-
-function renderTransitQuery(summary) {
-  const itineraries = normalizeQueryItineraries(summary);
-  const selected = selectActiveItinerary(itineraries);
-  const selectedTransitLegCount = selected.transit_leg_count ?? selected.legs.filter((leg) => leg.kind === "transit").length;
-  const selectedRealtimeLegs = selected.transit_legs_with_gtfs_rt ?? 0;
-  const selectedOccupancyLegs = selected.occupancy_covered_transit_legs ?? 0;
-  const summaryBadges = Array.isArray(selected.badges) && selected.badges.length
-    ? `<div class="summary-badges">${selected.badges
-      .slice(0, 4)
-      .map((badge, index) => `<span class="${index === 0 ? "itinerary-badge" : "itinerary-badge secondary"}">${escapeHtml(badge)}</span>`)
-      .join("")}</div>`
-    : "";
+  const summary = state.query;
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.innerHTML = `
     <div><strong>${escapeHtml(summary.from.name)}</strong> → <strong>${escapeHtml(summary.to.name)}</strong></div>
-    <div>${escapeHtml(selected.departure_time)} → ${escapeHtml(selected.arrival_time)}</div>
-    <div>${Math.round(selected.duration_seconds / 60)} min / ${selected.transfers} cambi / ${summary.trace.query_runtime_ms} ms / ${itineraries.length} opzioni</div>
-    <div>GTFS-RT ${selectedRealtimeLegs}/${selectedTransitLegCount || 0} leg transit · occupancy ${selectedOccupancyLegs}/${selectedTransitLegCount || 0} · crowd ${escapeHtml(String(selected.crowding_level || "unknown"))}</div>
-    ${summaryBadges}
+    <div>${escapeHtml(summary.departure_time)} → ${escapeHtml(summary.arrival_time)}</div>
+    <div>${Math.round(summary.duration_seconds / 60)} min / ${summary.transfers} cambi / ${summary.trace.query_runtime_ms} ms</div>
   `;
 
-  dom.itineraryOptions.innerHTML = itineraries
-    .map((itinerary, index) => {
-      const badges = Array.isArray(itinerary.badges) && itinerary.badges.length
-        ? itinerary.badges
-            .map((badge, badgeIndex) => {
-              const badgeClass = badgeIndex === 0 ? "itinerary-badge" : "itinerary-badge secondary";
-              return `<span class="${badgeClass}">${escapeHtml(badge)}</span>`;
-            })
-            .join("")
-        : `<span class="itinerary-badge secondary">Alternativa ${index + 1}</span>`;
-      return `
-        <button
-          class="itinerary-option-card ${itinerary.id === selected.id ? "is-active" : ""}"
-          type="button"
-          data-itinerary-id="${escapeHtml(itinerary.id)}"
-        >
-          <div class="itinerary-option-head">
-            <div class="itinerary-option-title">
-              <strong>${escapeHtml(itinerary.label || `Alternativa ${index + 1}`)}</strong>
-              <div class="itinerary-option-badges">${badges}</div>
-            </div>
-            <strong>${Math.round(itinerary.duration_seconds / 60)} min</strong>
-          </div>
-          <div class="itinerary-option-metrics">
-            <span>${escapeHtml(itinerary.departure_time)} → ${escapeHtml(itinerary.arrival_time)}</span>
-            <span>${itinerary.transfers} cambi</span>
-            <span>${itinerary.legs.length} leg</span>
-            <span>RT ${itinerary.transit_legs_with_gtfs_rt || 0}/${itinerary.transit_leg_count || 0}</span>
-            <span>occ ${itinerary.occupancy_covered_transit_legs || 0}/${itinerary.transit_leg_count || 0}</span>
-            <span>crowd ${escapeHtml(String(itinerary.crowding_level || "unknown"))}</span>
-          </div>
-        </button>
-      `;
-    })
-    .join("");
-
-  Array.from(dom.itineraryOptions.querySelectorAll(".itinerary-option-card")).forEach((button) => {
-    button.addEventListener("click", () => {
-      state.selectedItineraryId = button.dataset.itineraryId || null;
-      renderQuery();
-    });
-  });
-
-  dom.legsContainer.innerHTML = selected.legs
+  dom.legsContainer.innerHTML = summary.legs
     .map((leg) => {
       const walkDirections = leg.kind === "walk" && Array.isArray(leg.walk_directions)
         ? leg.walk_directions
@@ -571,15 +429,6 @@ function renderTransitQuery(summary) {
       const meta = leg.kind === "walk"
         ? `${Math.round(leg.walk_distance_meters || 0)} m a piedi`
         : `${escapeHtml(leg.route_label || leg.route_id || "linea")} · ${escapeHtml(leg.headsign || "")}`;
-      const detailChips = leg.kind === "transit"
-        ? [
-            leg.has_gtfs_rt ? `<span class="leg-chip rt-chip">GTFS-RT${leg.has_trip_update && leg.has_vehicle_position ? " T+V" : leg.has_trip_update ? " T" : leg.has_vehicle_position ? " V" : ""}</span>` : "",
-            leg.occupancy_status || Number.isFinite(leg.occupancy_percentage) ? `<span class="leg-chip occ-chip">${escapeHtml(String(leg.occupancy_status || "OCC"))}${Number.isFinite(leg.occupancy_percentage) ? ` ${Math.round(leg.occupancy_percentage)}%` : ""}</span>` : "",
-            leg.schedule_relationship && leg.schedule_relationship !== "SCHEDULED" ? `<span class="leg-chip rel-chip">${escapeHtml(leg.schedule_relationship)}</span>` : "",
-          ]
-            .filter(Boolean)
-            .join("")
-        : "";
       const walkPreview = leg.kind === "walk" && walkPreviewStep
         ? `<div class="walk-preview">${escapeHtml(walkPreviewStep.instruction)}</div>`
         : "";
@@ -606,7 +455,6 @@ function renderTransitQuery(summary) {
           <div class="leg-title">${escapeHtml(leg.from_stop.name)} → ${escapeHtml(leg.to_stop.name)}</div>
           ${walkPreview}
           <div class="leg-meta">${meta}</div>
-          ${detailChips ? `<div class="leg-chip-row">${detailChips}</div>` : ""}
           ${directions}
         </article>
       `;
@@ -657,67 +505,7 @@ function renderTransitQuery(summary) {
     </table>
   `;
 
-  drawQueryOnMap(selected);
-}
-
-function renderStreetRoute(summary) {
-  const directions = Array.isArray(summary.directions) ? summary.directions : [];
-  const previewStep = directions.find(
-    (step) => step.maneuver !== "depart" && step.maneuver !== "arrive",
-  ) || directions[0] || null;
-
-  dom.itineraryOptions.innerHTML = '<div class="empty-state">Modalità drive only.</div>';
-
-  dom.itinerarySummary.className = "summary-strip";
-  dom.itinerarySummary.innerHTML = `
-    <div><strong>Drive only</strong> · ${escapeHtml(formatStreetEndpoint(summary.from))} → <strong>${escapeHtml(formatStreetEndpoint(summary.to))}</strong></div>
-    <div>${formatDistance(summary.distance_meters)} / ${Math.round(summary.duration_seconds / 60)} min</div>
-    <div>${summary.trace.query_runtime_ms} ms / ${escapeHtml(summary.trace.strategy)}</div>
-  `;
-
-  dom.legsContainer.innerHTML = `
-    <article class="leg-card drive">
-      <div class="leg-badge">drive</div>
-      <div class="leg-title">${escapeHtml(formatStreetEndpoint(summary.from))} → ${escapeHtml(formatStreetEndpoint(summary.to))}</div>
-      ${previewStep ? `<div class="walk-preview drive-preview">${escapeHtml(previewStep.instruction)}</div>` : ""}
-      <div class="leg-meta">${formatDistance(summary.distance_meters)} in auto · ${Math.round(summary.duration_seconds / 60)} min</div>
-      ${directions.length ? `
-        <ol class="walk-directions">
-          ${directions
-            .map(
-              (step) => `
-                <li class="walk-direction drive-direction">
-                  <span class="walk-direction-text">${escapeHtml(step.instruction)}</span>
-                  <span class="walk-direction-distance">${Math.round(step.distance_meters || 0)} m</span>
-                </li>
-              `,
-            )
-            .join("")}
-        </ol>
-      ` : ""}
-    </article>
-  `;
-
-  dom.traceContainer.innerHTML = `
-    <div class="mini-card">
-      <strong>Street</strong>
-      <span>${escapeHtml(summary.mode || "drive")}</span>
-      <span>${escapeHtml(summary.trace.strategy)}</span>
-    </div>
-    <div class="mini-card">
-      <strong>Snap</strong>
-      <span>src ${Math.round(summary.trace.source_snap_distance_meters || 0)} m</span>
-      <span>dst ${Math.round(summary.trace.destination_snap_distance_meters || 0)} m</span>
-    </div>
-    <div class="mini-card">
-      <strong>Search</strong>
-      <span>fw ${summary.trace.explored_forward_nodes}</span>
-      <span>bw ${summary.trace.explored_backward_nodes}</span>
-      <span>${summary.trace.query_runtime_ms} ms</span>
-    </div>
-  `;
-
-  drawStreetRouteOnMap(summary);
+  drawQueryOnMap(summary);
 }
 
 function renderRealtime() {
@@ -765,11 +553,11 @@ function renderRealtime() {
   drawVehicles(payload.vehicles);
 }
 
-function drawQueryOnMap(itinerary) {
+function drawQueryOnMap(query) {
   clearMapLayers();
 
   const bounds = [];
-  itinerary.legs.forEach((leg) => {
+  query.legs.forEach((leg) => {
     if (leg.polyline.length < 2) {
       return;
     }
@@ -783,26 +571,6 @@ function drawQueryOnMap(itinerary) {
       opacity: 0.95,
     }).addTo(state.routeLayer);
   });
-
-  renderEndpointSelections();
-
-  if (bounds.length) {
-    state.map.fitBounds(bounds, { padding: [30, 30] });
-  }
-}
-
-function drawStreetRouteOnMap(route) {
-  clearMapLayers();
-  const bounds = [];
-  if (Array.isArray(route.polyline) && route.polyline.length >= 2) {
-    const latlngs = route.polyline.map((point) => [point.lat, point.lon]);
-    latlngs.forEach((latlng) => bounds.push(latlng));
-    L.polyline(latlngs, {
-      color: "#bf5b04",
-      weight: 5,
-      opacity: 0.95,
-    }).addTo(state.routeLayer);
-  }
 
   renderEndpointSelections();
 
@@ -836,121 +604,16 @@ function clearMapLayers() {
 
 function markRouteStale(message) {
   state.query = null;
-  state.selectedItineraryId = null;
   clearMapLayers();
   dom.itinerarySummary.className = "summary-strip";
   dom.itinerarySummary.textContent = message || "Parametri aggiornati. Premi Route.";
-  dom.itineraryOptions.innerHTML = '<div class="empty-state">Nessuna alternativa.</div>';
   dom.legsContainer.innerHTML = '<div class="empty-state">Nessun itinerario.</div>';
   dom.traceContainer.innerHTML = '<div class="empty-state">Nessun trace disponibile.</div>';
-}
-
-function normalizeQueryItineraries(query) {
-  if (Array.isArray(query.itineraries) && query.itineraries.length) {
-    return query.itineraries;
-  }
-
-  return [
-    {
-      id: "primary",
-      label: "Piu veloce",
-      badges: ["Piu veloce"],
-      is_recommended: true,
-      is_fastest: true,
-      is_fewest_transfers: true,
-      is_best_realtime: false,
-      is_least_crowded: false,
-      has_canceled_legs: false,
-      departure_time: query.departure_time,
-      arrival_time: query.arrival_time,
-      duration_seconds: query.duration_seconds,
-      transfers: query.transfers,
-      realtime_score: 0,
-      transit_leg_count: query.legs.filter((leg) => leg.kind === "transit").length,
-      transit_legs_with_gtfs_rt: 0,
-      crowding_score: null,
-      crowding_level: "unknown",
-      occupancy_covered_transit_legs: 0,
-      canceled_transit_legs: 0,
-      legs: query.legs,
-      deferred_hydration: query.deferred_hydration,
-    },
-  ];
-}
-
-function selectActiveItinerary(itineraries) {
-  if (!itineraries.length) {
-    return {
-      id: "empty",
-      label: "Nessun itinerario",
-      badges: [],
-      departure_time: "-",
-      arrival_time: "-",
-      duration_seconds: 0,
-      transfers: 0,
-      legs: [],
-    };
-  }
-
-  const selected = itineraries.find((itinerary) => itinerary.id === state.selectedItineraryId);
-  const active = selected || itineraries[0];
-  state.selectedItineraryId = active.id;
-  return active;
 }
 
 function setRefreshStatus(text, busy) {
   dom.refreshStatus.textContent = text;
   dom.refreshStatus.className = `status-pill ${busy ? "busy" : ""}`;
-}
-
-function beginBusy() {
-  state.busyCount += 1;
-  updateBusyIndicator();
-  return () => {
-    state.busyCount = Math.max(0, state.busyCount - 1);
-    updateBusyIndicator();
-  };
-}
-
-function updateBusyIndicator() {
-  dom.topbarProgress.className = `topbar-progress ${state.busyCount > 0 ? "is-active" : ""}`;
-}
-
-function getRouteMode() {
-  return dom.routeModeSelect.value === "drive-only" ? "drive-only" : "transit";
-}
-
-function syncRouteModeUI() {
-  const driveOnly = getRouteMode() === "drive-only";
-  [dom.dateInput, dom.timeInput, dom.maxTransfersInput].forEach((input) => {
-    input.disabled = driveOnly;
-    const group = input.closest(".field-group");
-    if (group) {
-      group.classList.toggle("is-disabled", driveOnly);
-    }
-  });
-}
-
-function isStreetRoute(payload) {
-  return payload && Array.isArray(payload.polyline) && !Array.isArray(payload.legs);
-}
-
-function formatStreetEndpoint(endpoint) {
-  if (!endpoint || typeof endpoint.lat !== "number" || typeof endpoint.lon !== "number") {
-    return "punto sconosciuto";
-  }
-
-  return formatCoordinateValue(endpoint.lat, endpoint.lon);
-}
-
-function formatDistance(distanceMeters) {
-  if (!Number.isFinite(distanceMeters)) {
-    return "0 m";
-  }
-  if (distanceMeters >= 1000) {
-    return `${(distanceMeters / 1000).toFixed(1)} km`;
-  }
-  return `${Math.round(distanceMeters)} m`;
 }
 
 function formatCoordinateValue(latitude, longitude) {

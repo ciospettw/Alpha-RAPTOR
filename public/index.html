@@ -36,14 +36,6 @@
             <div id="toResults" class="search-results"></div>
           </div>
 
-          <div class="field-group compact-field mode-field">
-            <label for="routeModeSelect">Modo</label>
-            <select id="routeModeSelect">
-              <option value="transit">Transit</option>
-              <option value="drive-only">Drive only</option>
-            </select>
-          </div>
-
           <div class="field-group compact-field">
             <label for="dateInput">Data</label>
             <input id="dateInput" type="date" />
@@ -73,14 +65,11 @@
           <div id="statsGrid" class="stats-grid"></div>
         </div>
 
-        <div id="topbarProgress" class="topbar-progress" aria-hidden="true"></div>
-
         <details class="debug-drawer">
           <summary>Dettagli</summary>
           <div class="debug-grid">
             <section class="debug-panel">
               <h2>Itinerario</h2>
-              <div id="itineraryOptions" class="itinerary-options empty-state">Nessuna alternativa.</div>
               <div id="legsContainer" class="legs-list empty-state">Nessun itinerario.</div>
             </section>
 

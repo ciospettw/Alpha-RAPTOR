@@ -10,7 +10,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
-use bincode::Options;
 use chrono::Utc;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use osmpbfreader::{
@@ -1596,27 +1595,8 @@ fn load_cache(
 
     let file = File::open(cache_path)
         .with_context(|| format!("unable to open street cache {}", cache_path.display()))?;
-    let file_len = file
-        .metadata()
-        .with_context(|| format!("unable to stat street cache {}", cache_path.display()))?
-        .len();
-    let cache: StreetGraphCache = match deserialize_from_reader_limited(
-        BufReader::new(file),
-        file_len,
-        &format!("street cache {}", cache_path.display()),
-    ) {
-        Ok(cache) => cache,
-        Err(error) => {
-            warn!(
-                %error,
-                cache = %cache_path.display(),
-                mode = metadata.mode,
-                "street cache unreadable, removing stale artifact and rebuilding"
-            );
-            remove_stale_artifact(cache_path, "street cache")?;
-            return Ok(None);
-        }
-    };
+    let cache: StreetGraphCache = bincode::deserialize_from(BufReader::new(file))
+        .with_context(|| format!("unable to deserialize street cache {}", cache_path.display()))?;
     if cache.metadata == *metadata {
         Ok(Some(cache))
     } else {
@@ -1651,60 +1631,15 @@ fn load_overlay_persisted(
 
     let file = File::open(overlay_path)
         .with_context(|| format!("unable to open street overlay {}", overlay_path.display()))?;
-    let file_len = file
-        .metadata()
-        .with_context(|| format!("unable to stat street overlay {}", overlay_path.display()))?
-        .len();
-    let persisted: StreetOverlayPersisted = match deserialize_from_reader_limited(
-        BufReader::new(file),
-        file_len,
-        &format!("street overlay {}", overlay_path.display()),
-    ) {
-        Ok(persisted) => persisted,
-        Err(error) => {
-            warn!(
-                %error,
-                overlay = %overlay_path.display(),
-                mode = metadata.mode,
-                "street overlay unreadable, removing stale artifact and rebuilding overlay state"
-            );
-            remove_stale_artifact(overlay_path, "street overlay")?;
-            return Ok(None);
-        }
-    };
+    let persisted: StreetOverlayPersisted = bincode::deserialize_from(BufReader::new(file))
+        .with_context(|| format!("unable to deserialize street overlay {}", overlay_path.display()))?;
     if &persisted.magic != STREET_OVERLAY_MAGIC {
-        remove_stale_artifact(overlay_path, "street overlay")?;
         return Ok(None);
     }
     if persisted.metadata != *metadata {
-        remove_stale_artifact(overlay_path, "street overlay")?;
         return Ok(None);
     }
     Ok(Some(persisted))
-}
-
-fn remove_stale_artifact(path: &Path, label: &str) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("unable to remove stale {label} {}", path.display()))
-        }
-    }
-}
-
-fn deserialize_from_reader_limited<T>(
-    reader: impl Read,
-    file_len: u64,
-    label: &str,
-) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    bincode::DefaultOptions::new()
-        .with_limit(file_len)
-        .deserialize_from(reader)
-        .with_context(|| format!("unable to deserialize {label}"))
 }
 
 fn persist_overlay_runtime(
@@ -2260,33 +2195,6 @@ fn haversine_meters(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unreadable_street_cache_is_treated_as_stale() {
-        let cache_path = std::env::temp_dir().join(format!(
-            "alpha-raptor-street-cache-{}-{}.bin",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&cache_path, b"not-a-street-cache").unwrap();
-
-        let loaded = load_cache(
-            &cache_path,
-            &StreetGraphCacheMetadata {
-                schema_version: STREET_GRAPH_SCHEMA_VERSION,
-                mode: StreetMode::Walk.as_str().to_owned(),
-                osm_pbf_bytes: 123,
-                osm_pbf_modified_unix_secs: Some(456),
-            },
-        )
-        .unwrap();
-
-        assert!(loaded.is_none());
-        assert!(!cache_path.exists());
-    }
 
     #[test]
     fn drive_route_returns_ordered_way_ids() {

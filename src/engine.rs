@@ -1,28 +1,26 @@
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
     env,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Read, Write, copy},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Duration, NaiveDate, NaiveTime, Timelike};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use gtfs_structures::{Exception, Gtfs};
-use gtfs_rt::{trip_descriptor, vehicle_position};
 use reqwest::{
     blocking::Client as BlockingHttpClient,
-    header::{ETAG, LAST_MODIFIED},
+    header::{ETAG, LAST_MODIFIED, RANGE},
+    StatusCode,
 };
 use rstar::{AABB, PointDistance, RTree, RTreeObject};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::control::{descriptor_url_from_env, maybe_add_internal_token_blocking};
 use crate::cold_storage::{ColdRouteRecord, ColdStore, ColdTripRecord, cold_store_paths};
 use crate::geo::{
     destination_cell as geo_destination_cell,
@@ -36,11 +34,7 @@ use crate::profile_cache::{
     CachedLeg, PreparedSpatialLookup, ProfileCache, ProfileCacheStats, ProfileInsertionPoint,
     ProfileLookupDecision, SpatialProfileInsertionPoint,
 };
-use crate::progress::{progress_bar, progress_bar_u64, progress_percent, progress_percent_u64};
-use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore, TripRealtimeMetrics};
-use crate::street::{
-    StreetMode, StreetRouter, StreetRouterOverlaySnapshot, build_or_load_street_router,
-};
+use crate::realtime::{RealtimeDebugSnapshot, RealtimeStore};
 use crate::walker::{
     WalkerBuildResult, build_or_load_walker_transfers, rebuild_walker_transfers_subset,
 };
@@ -57,8 +51,9 @@ const DEFAULT_HPF_SNAP_TOLERANCE_METERS: f64 = 140.0;
 const DEFAULT_HPF_SNAP_QUADRATIC_KAPPA_METERS: f64 = 40.0;
 const DEFAULT_HPF_SEARCH_WINDOW: usize = 512;
 const DEFAULT_OSM_DIFF_POLL_INTERVAL_SECS: u64 = 30 * 60;
-const DEFAULT_QUERY_ITINERARY_COUNT: usize = 5;
-const MAX_QUERY_ITINERARY_COUNT: usize = 6;
+const ARRIVE_BY_INITIAL_LOOKBACK_SECS: i64 = 15 * 60;
+const ARRIVE_BY_MAX_LOOKBACK_SECS: i64 = 6 * 60 * 60;
+const ARRIVE_BY_BINARY_SEARCH_TOLERANCE_SECS: i64 = 60;
 const SVRT_WIDTH: usize = 8;
 const BTT_MIN_HUB_CELL_METERS: f64 = 120.0;
 const BTT_MAX_HUB_CELL_METERS: f64 = 220.0;
@@ -82,13 +77,14 @@ pub struct FeedConfig {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawEngineManifest {
     osm_pbf: Option<String>,
     osm_pbf_allow_invalid_tls: Option<bool>,
     walk_radius_meters: Option<f64>,
     walk_speed_mps: Option<f64>,
     max_transfer_candidates: Option<usize>,
+    refresh_interval_secs: Option<u64>,
     static_reload_interval_secs: Option<u64>,
     static_diff_tolerance: Option<f64>,
     default_max_transfers: Option<usize>,
@@ -98,22 +94,21 @@ struct RawEngineManifest {
     feeds: Vec<RawFeedConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawDvniConfig {
     knn_candidates: Option<usize>,
     max_walk_radius_meters: Option<f64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawHpfConfig {
     max_distance_meters: Option<f64>,
     snap_tolerance_meters: Option<f64>,
     snap_quadratic_kappa_meters: Option<f64>,
     search_window: Option<usize>,
-    defer_rebuild_on_bootstrap: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawOsmDiffConfig {
     state_url: String,
     diff_base_url: Option<String>,
@@ -121,7 +116,7 @@ struct RawOsmDiffConfig {
     allow_invalid_tls: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawFeedConfig {
     id: String,
     static_gtfs: String,
@@ -131,31 +126,6 @@ struct RawFeedConfig {
     vehicle_positions_url: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RoutingDescriptor {
-    static_feeds: Vec<RoutingStaticFeedDescriptor>,
-    realtime_feeds: Vec<RoutingRealtimeFeedDescriptor>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RoutingStaticFeedDescriptor {
-    id: Option<String>,
-    namespace: Option<String>,
-    feed_id: Option<String>,
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RoutingRealtimeFeedDescriptor {
-    namespace: Option<String>,
-    feed_id: Option<String>,
-    trip_updates_url: Option<String>,
-    vehicle_positions_url: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -173,14 +143,12 @@ pub struct Engine {
     profile_cache: ProfileCache,
     walk_way_names: Arc<HashMap<i64, String>>,
     hpf: Option<HolographicPedestrianForest>,
-    street_router: Option<Arc<StreetRouter>>,
 }
 
 #[derive(Clone)]
 pub struct EngineConfig {
     pub workspace_root: PathBuf,
     pub manifest_path: Option<PathBuf>,
-    pub source_manifest_path: Option<PathBuf>,
     pub feeds: Vec<FeedConfig>,
     pub osm_pbf_path: PathBuf,
     pub osm_pbf_source: String,
@@ -189,6 +157,7 @@ pub struct EngineConfig {
     pub walk_radius_meters: f64,
     pub walk_speed_mps: f64,
     pub max_transfer_candidates: usize,
+    pub refresh_interval_secs: u64,
     pub static_reload_interval_secs: u64,
     pub static_diff_tolerance: f64,
     pub default_max_transfers: usize,
@@ -198,7 +167,6 @@ pub struct EngineConfig {
     pub hpf_snap_tolerance_meters: f64,
     pub hpf_snap_quadratic_kappa_meters: f64,
     pub hpf_search_window: usize,
-    pub hpf_defer_rebuild_on_bootstrap: bool,
     pub osm_diff: Option<HpfDiffConfig>,
     static_inputs_metadata: StaticCacheMetadata,
 }
@@ -402,7 +370,7 @@ pub struct ShapePoint {
     pub dist_traveled: Option<f32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct QueryRequest {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -415,16 +383,77 @@ pub struct QueryRequest {
     pub date: String,
     pub time: String,
     pub max_transfers: Option<usize>,
-    pub num_itineraries: Option<usize>,
+    pub arrive_by: Option<bool>,
+    pub transport_modes: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct StreetRouteRequest {
-    pub mode: Option<String>,
-    pub from_lat: Option<f64>,
-    pub from_lon: Option<f64>,
-    pub to_lat: Option<f64>,
-    pub to_lon: Option<f64>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitLineKind {
+    Bus,
+    Tram,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllowedTransitModes {
+    allow_bus: bool,
+    allow_tram: bool,
+}
+
+impl AllowedTransitModes {
+    fn from_query(request: &QueryRequest) -> Result<Self> {
+        let raw_modes = request.transport_modes.as_deref().unwrap_or("bus,tram");
+        let mut allow_bus = false;
+        let mut allow_tram = false;
+
+        for raw_mode in raw_modes.split(',') {
+            let mode = raw_mode.trim().to_ascii_lowercase();
+            if mode.is_empty() {
+                continue;
+            }
+
+            match mode.as_str() {
+                "bus" => allow_bus = true,
+                "tram" => allow_tram = true,
+                unsupported => bail!("unsupported transport mode filter '{unsupported}'"),
+            }
+        }
+
+        if !allow_bus && !allow_tram {
+            bail!("select at least one transit mode");
+        }
+
+        Ok(Self {
+            allow_bus,
+            allow_tram,
+        })
+    }
+
+    fn filter_active(self) -> bool {
+        !(self.allow_bus && self.allow_tram)
+    }
+
+    fn matches_route_type(self, route_type: &str) -> bool {
+        match classify_transit_line_kind(route_type) {
+            TransitLineKind::Bus => self.allow_bus,
+            TransitLineKind::Tram => self.allow_tram,
+            TransitLineKind::Other => self.allow_bus && self.allow_tram,
+        }
+    }
+}
+
+fn classify_transit_line_kind(route_type: &str) -> TransitLineKind {
+    let normalized = route_type.trim().to_ascii_lowercase();
+    if normalized.contains("tram") || normalized.contains("streetcar") {
+        return TransitLineKind::Tram;
+    }
+    if normalized.contains("bus")
+        || normalized.contains("coach")
+        || normalized.contains("trolley")
+    {
+        return TransitLineKind::Bus;
+    }
+    TransitLineKind::Other
 }
 
 #[derive(Debug, Serialize)]
@@ -433,7 +462,6 @@ pub struct EngineStats {
     pub realtime: RealtimeDebugSnapshot,
     pub memoization: ProfileCacheStats,
     pub hpf_overlay: Option<HpfOverlaySnapshot>,
-    pub street_overlay: Option<StreetRouterOverlaySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,63 +558,8 @@ pub struct QueryResponse {
     pub duration_seconds: i32,
     pub transfers: usize,
     pub legs: Vec<LegResponse>,
-    pub itineraries: Vec<QueryItineraryResponse>,
     pub deferred_hydration: DeferredHydrationResponse,
     pub trace: QueryTrace,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct QueryItineraryResponse {
-    pub id: String,
-    pub label: String,
-    pub badges: Vec<String>,
-    pub is_recommended: bool,
-    pub is_fastest: bool,
-    pub is_fewest_transfers: bool,
-    pub is_best_realtime: bool,
-    pub is_least_crowded: bool,
-    pub has_canceled_legs: bool,
-    pub departure_time: String,
-    pub arrival_time: String,
-    pub duration_seconds: i32,
-    pub transfers: usize,
-    pub realtime_score: usize,
-    pub transit_leg_count: usize,
-    pub transit_legs_with_gtfs_rt: usize,
-    pub crowding_score: Option<u16>,
-    pub crowding_level: &'static str,
-    pub occupancy_covered_transit_legs: usize,
-    pub canceled_transit_legs: usize,
-    pub legs: Vec<LegResponse>,
-    pub deferred_hydration: DeferredHydrationResponse,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StreetRouteResponse {
-    pub mode: &'static str,
-    pub from: StreetCoordinatePoint,
-    pub to: StreetCoordinatePoint,
-    pub duration_seconds: i32,
-    pub distance_meters: f64,
-    pub polyline: Vec<PolylinePoint>,
-    pub directions: Vec<WalkDirection>,
-    pub trace: StreetRouteTrace,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StreetCoordinatePoint {
-    pub lat: f64,
-    pub lon: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StreetRouteTrace {
-    pub strategy: &'static str,
-    pub query_runtime_ms: u128,
-    pub source_snap_distance_meters: f64,
-    pub destination_snap_distance_meters: f64,
-    pub explored_forward_nodes: usize,
-    pub explored_backward_nodes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -768,6 +741,7 @@ pub struct LegResponse {
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
+    pub has_realtime_update: bool,
     pub from_stop: StopSearchResult,
     pub to_stop: StopSearchResult,
     pub trip_gid: Option<u64>,
@@ -781,30 +755,24 @@ pub struct LegResponse {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
-    pub has_gtfs_rt: bool,
-    pub has_trip_update: bool,
-    pub has_vehicle_position: bool,
-    pub schedule_relationship: Option<String>,
-    pub occupancy_status: Option<String>,
-    pub occupancy_percentage: Option<u32>,
-    pub occupancy_score: Option<u16>,
     pub intermediate_stops: Vec<StopSearchResult>,
     pub polyline: Vec<PolylinePoint>,
     pub walk_directions: Vec<WalkDirection>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DeferredHydrationResponse {
     pub legs: Vec<DeferredLegRef>,
     pub entities: HydrationEntityDictionary,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DeferredLegRef {
     pub kind: &'static str,
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
+    pub has_realtime_update: bool,
     pub from_stop_gid: u64,
     pub to_stop_gid: u64,
     pub trip_gid: Option<u64>,
@@ -812,19 +780,12 @@ pub struct DeferredLegRef {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
-    pub has_gtfs_rt: bool,
-    pub has_trip_update: bool,
-    pub has_vehicle_position: bool,
-    pub schedule_relationship: Option<String>,
-    pub occupancy_status: Option<String>,
-    pub occupancy_percentage: Option<u32>,
-    pub occupancy_score: Option<u16>,
     pub intermediate_stop_gids: Vec<u64>,
     pub polyline_index: usize,
     pub walk_directions: Vec<WalkDirection>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Serialize, Default)]
 pub struct HydrationEntityDictionary {
     pub stops: Vec<StopSearchResult>,
     pub routes: Vec<RouteHydration>,
@@ -832,7 +793,7 @@ pub struct HydrationEntityDictionary {
     pub polylines: Vec<Vec<PolylinePoint>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RouteHydration {
     pub global_id: u64,
     pub id: String,
@@ -842,7 +803,7 @@ pub struct RouteHydration {
     pub text_color: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct TripHydration {
     pub global_id: u64,
     pub id: String,
@@ -995,24 +956,6 @@ enum RawLeg {
 }
 
 #[derive(Clone)]
-struct QueryItineraryCandidate {
-    round: usize,
-    arrival_secs: i32,
-    transit_legs: usize,
-    raw_legs: Vec<RawLeg>,
-}
-
-struct ItineraryPassiveMetrics {
-    transit_leg_count: usize,
-    transit_legs_with_gtfs_rt: usize,
-    occupancy_covered_transit_legs: usize,
-    crowding_score: Option<u16>,
-    crowding_level: &'static str,
-    canceled_transit_legs: usize,
-    has_canceled_legs: bool,
-}
-
-#[derive(Clone)]
 struct LocalSubqueryResult {
     arrival_secs: i32,
     transit_legs: usize,
@@ -1071,7 +1014,7 @@ impl PointDistance for IndexedStopPoint {
 impl EngineConfig {
     pub fn from_env(workspace_root: PathBuf) -> Result<Self> {
         if let Some(manifest_override) = env::var("ALPHA_CONFIG").ok() {
-            return Self::from_manifest_source(
+            return Self::from_manifest(
                 &workspace_root,
                 resolve_path(
                     &workspace_root,
@@ -1084,7 +1027,7 @@ impl EngineConfig {
 
         let default_manifest = workspace_root.join(DEFAULT_MANIFEST_NAME);
         if default_manifest.exists() {
-            return Self::from_manifest_source(
+            return Self::from_manifest(
                 &workspace_root,
                 default_manifest,
                 StaticGtfsRefreshMode::Bootstrap,
@@ -1095,10 +1038,10 @@ impl EngineConfig {
     }
 
     pub fn reload_from_source(&self) -> Result<Self> {
-        if let Some(source_manifest_path) = &self.source_manifest_path {
-            return Self::from_manifest_source(
+        if let Some(manifest_path) = &self.manifest_path {
+            return Self::from_manifest(
                 &self.workspace_root,
-                source_manifest_path.clone(),
+                manifest_path.clone(),
                 StaticGtfsRefreshMode::Poll,
             );
         }
@@ -1110,23 +1053,8 @@ impl EngineConfig {
         self.static_inputs_metadata != other.static_inputs_metadata
     }
 
-    fn from_manifest_source(
-        workspace_root: &PathBuf,
-        source_manifest_path: PathBuf,
-        refresh_mode: StaticGtfsRefreshMode,
-    ) -> Result<Self> {
-        let runtime_manifest_path = materialize_runtime_manifest(workspace_root, &source_manifest_path)?;
-        Self::from_manifest(
-            workspace_root,
-            source_manifest_path,
-            runtime_manifest_path,
-            refresh_mode,
-        )
-    }
-
     fn from_manifest(
         workspace_root: &PathBuf,
-        source_manifest_path: PathBuf,
         manifest_path: PathBuf,
         refresh_mode: StaticGtfsRefreshMode,
     ) -> Result<Self> {
@@ -1193,7 +1121,6 @@ impl EngineConfig {
         let mut config = Self {
             workspace_root: workspace_root.clone(),
             manifest_path: Some(manifest_path),
-            source_manifest_path: Some(source_manifest_path),
             feeds,
             osm_pbf_path: prepared_osm_pbf.local_path,
             osm_pbf_source: prepared_osm_pbf.source,
@@ -1202,6 +1129,7 @@ impl EngineConfig {
             walk_radius_meters: manifest.walk_radius_meters.unwrap_or(450.0),
             walk_speed_mps: manifest.walk_speed_mps.unwrap_or(1.35),
             max_transfer_candidates: manifest.max_transfer_candidates.unwrap_or(12),
+            refresh_interval_secs: manifest.refresh_interval_secs.unwrap_or(45),
             static_reload_interval_secs: manifest.static_reload_interval_secs.unwrap_or(600),
             static_diff_tolerance: manifest
                 .static_diff_tolerance
@@ -1243,11 +1171,6 @@ impl EngineConfig {
                 .and_then(|hpf| hpf.search_window)
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
-            hpf_defer_rebuild_on_bootstrap: manifest
-                .hpf
-                .as_ref()
-                .and_then(|hpf| hpf.defer_rebuild_on_bootstrap)
-                .unwrap_or(false),
             osm_diff: manifest.osm_diff.as_ref().map(|diff| HpfDiffConfig {
                 state_url: diff.state_url.clone(),
                 diff_base_url: diff.diff_base_url.clone(),
@@ -1274,13 +1197,8 @@ impl EngineConfig {
                 feed_sources: Vec::new(),
             },
         };
-        config.static_inputs_metadata = capture_static_inputs_metadata(
-            config
-                .source_manifest_path
-                .as_ref()
-                .or(config.manifest_path.as_ref()),
-            &config,
-        )?;
+        config.static_inputs_metadata =
+            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config)?;
         Ok(config)
     }
 
@@ -1305,7 +1223,7 @@ impl EngineConfig {
             &workspace_root,
             &feed_id,
             static_gtfs_value,
-            "data/gtfs/rome_static_gtfs.zip",
+            "https://romamobilita.it/sites/default/files/rome_static_gtfs.zip",
             static_gtfs_allow_invalid_tls,
             refresh_mode,
         )?;
@@ -1330,7 +1248,6 @@ impl EngineConfig {
         let mut config = Self {
             workspace_root: workspace_root.clone(),
             manifest_path: None,
-            source_manifest_path: None,
             feeds: vec![FeedConfig {
                 feed_index: 0,
                 id: feed_id,
@@ -1366,6 +1283,10 @@ impl EngineConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(12),
+            refresh_interval_secs: env::var("ALPHA_RT_REFRESH_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(45),
             static_reload_interval_secs: env::var("ALPHA_STATIC_POLL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -1408,15 +1329,6 @@ impl EngineConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(DEFAULT_HPF_SEARCH_WINDOW)
                 .clamp(64, 16_384),
-            hpf_defer_rebuild_on_bootstrap: matches!(
-                env::var("ALPHA_HPF_DEFER_REBUILD_ON_BOOTSTRAP")
-                    .ok()
-                    .as_deref()
-                    .map(str::trim)
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("1" | "true" | "yes" | "on")
-            ),
             osm_diff: env::var("ALPHA_OSM_DIFF_STATE_URL")
                 .ok()
                 .map(|state_url| HpfDiffConfig {
@@ -1452,13 +1364,8 @@ impl EngineConfig {
                 feed_sources: Vec::new(),
             },
         };
-        config.static_inputs_metadata = capture_static_inputs_metadata(
-            config
-                .source_manifest_path
-                .as_ref()
-                .or(config.manifest_path.as_ref()),
-            &config,
-        )?;
+        config.static_inputs_metadata =
+            capture_static_inputs_metadata(config.manifest_path.as_ref(), &config)?;
         Ok(config)
     }
 
@@ -1501,159 +1408,6 @@ impl EngineConfig {
     }
 }
 
-fn materialize_runtime_manifest(
-    workspace_root: &Path,
-    source_manifest_path: &Path,
-) -> Result<PathBuf> {
-    if descriptor_url_from_env().is_none() {
-        return Ok(source_manifest_path.to_path_buf());
-    }
-
-    let generated_manifest_path = runtime_root(workspace_root)
-        .join("generated")
-        .join("busone-descriptor.toml");
-
-    match write_descriptor_manifest(source_manifest_path, &generated_manifest_path) {
-        Ok(()) => Ok(generated_manifest_path),
-        Err(error) if generated_manifest_path.exists() => {
-            warn!(
-                %error,
-                manifest = %generated_manifest_path.display(),
-                "descriptor refresh failed; reusing cached generated manifest"
-            );
-            Ok(generated_manifest_path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn write_descriptor_manifest(
-    source_manifest_path: &Path,
-    generated_manifest_path: &Path,
-) -> Result<()> {
-    let descriptor_url = descriptor_url_from_env()
-        .context("ALPHA_DESCRIPTOR_URL is required when descriptor bootstrap is enabled")?;
-    let source_manifest_body = fs::read_to_string(source_manifest_path).with_context(|| {
-        format!(
-            "unable to read descriptor template manifest {}",
-            source_manifest_path.display()
-        )
-    })?;
-    let mut manifest: RawEngineManifest = toml::from_str(&source_manifest_body).with_context(|| {
-        format!(
-            "invalid descriptor template manifest TOML at {}",
-            source_manifest_path.display()
-        )
-    })?;
-
-    manifest.feeds = fetch_descriptor_feeds(&descriptor_url, &manifest)?;
-
-    let rendered = toml::to_string_pretty(&manifest)
-        .context("failed to render generated descriptor manifest")?;
-    if let Ok(existing) = fs::read_to_string(generated_manifest_path) {
-        if existing == rendered {
-            return Ok(());
-        }
-    }
-
-    if let Some(parent) = generated_manifest_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create generated manifest directory {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    fs::write(generated_manifest_path, rendered).with_context(|| {
-        format!(
-            "failed to write generated descriptor manifest {}",
-            generated_manifest_path.display()
-        )
-    })
-}
-
-fn fetch_descriptor_feeds(
-    descriptor_url: &str,
-    base_manifest: &RawEngineManifest,
-) -> Result<Vec<RawFeedConfig>> {
-    let client = BlockingHttpClient::builder()
-        .user_agent("alpha-raptor-engine/0.1")
-        .build()
-        .context("failed to build HTTP client for descriptor bootstrap")?;
-    let response = maybe_add_internal_token_blocking(client.get(descriptor_url), descriptor_url)?
-        .send()
-        .and_then(|response| response.error_for_status())
-        .with_context(|| format!("failed to fetch routing descriptor from {descriptor_url}"))?;
-    let descriptor: RoutingDescriptor = response
-        .json()
-        .with_context(|| format!("failed to parse routing descriptor from {descriptor_url}"))?;
-
-    let mut depends_on_by_id = HashMap::<String, Vec<String>>::new();
-    for feed in &base_manifest.feeds {
-        depends_on_by_id.insert(feed.id.clone(), feed.depends_on.clone());
-    }
-
-    let mut realtime_by_key = HashMap::<String, RoutingRealtimeFeedDescriptor>::new();
-    for realtime in descriptor.realtime_feeds {
-        if let Some(key) = descriptor_feed_key(realtime.feed_id.as_ref(), realtime.namespace.as_ref()) {
-            realtime_by_key.insert(key, realtime);
-        }
-    }
-
-    let mut feeds = Vec::with_capacity(descriptor.static_feeds.len());
-    for static_feed in descriptor.static_feeds {
-        let feed_id = descriptor_feed_key(
-            static_feed.feed_id.as_ref(),
-            static_feed.namespace.as_ref().or(static_feed.id.as_ref()),
-        )
-        .context("routing descriptor static feed is missing feedId/namespace/id")?;
-        let realtime = realtime_by_key
-            .get(&feed_id)
-            .or_else(|| {
-                static_feed
-                    .namespace
-                    .as_ref()
-                    .and_then(|namespace| realtime_by_key.get(namespace))
-            });
-
-        let depends_on = depends_on_by_id
-            .get(&feed_id)
-            .cloned()
-            .or_else(|| {
-                static_feed
-                    .namespace
-                    .as_ref()
-                    .and_then(|namespace| depends_on_by_id.get(namespace).cloned())
-            })
-            .unwrap_or_default();
-
-        feeds.push(RawFeedConfig {
-            id: feed_id,
-            static_gtfs: static_feed.url,
-            static_gtfs_allow_invalid_tls: false,
-            trip_updates_url: realtime.and_then(|value| value.trip_updates_url.clone()),
-            vehicle_positions_url: realtime.and_then(|value| value.vehicle_positions_url.clone()),
-            depends_on,
-        });
-    }
-
-    if feeds.is_empty() {
-        bail!("routing descriptor at {descriptor_url} does not define any static feeds");
-    }
-
-    Ok(feeds)
-}
-
-fn descriptor_feed_key(primary: Option<&String>, fallback: Option<&String>) -> Option<String> {
-    primary
-        .map(String::as_str)
-        .or(fallback.map(String::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
 impl Engine {
     pub fn load(config: EngineConfig) -> Result<Self> {
         Self::load_internal(config, None)
@@ -1666,14 +1420,6 @@ impl Engine {
     fn load_internal(config: EngineConfig, previous: Option<&Engine>) -> Result<Self> {
         let started = Instant::now();
         let static_core_result = load_or_build_static_core(&config, previous)?;
-        info!(
-            phase = "engine-bootstrap",
-            step = 1,
-            total_steps = 5,
-            progress = %progress_bar(1, 5),
-            percent = progress_percent(1, 5),
-            "bootstrap progress"
-        );
         let cold_store_started = Instant::now();
         let cold_generation = static_metadata_generation_token(&config.static_inputs_metadata);
         let cold_store = Arc::new(ColdStore::load_or_build(
@@ -1685,15 +1431,6 @@ impl Engine {
             &static_core_result.core.shapes,
         )?);
         let cold_store_ms = cold_store_started.elapsed().as_millis();
-        info!(
-            phase = "engine-bootstrap",
-            step = 2,
-            total_steps = 5,
-            progress = %progress_bar(2, 5),
-            percent = progress_percent(2, 5),
-            cold_store_ms,
-            "bootstrap progress"
-        );
         let StaticCore {
             feeds,
             stops,
@@ -1740,15 +1477,6 @@ impl Engine {
             }
         }
         let walker_millis = walker_started.elapsed().as_millis();
-        info!(
-            phase = "engine-bootstrap",
-            step = 3,
-            total_steps = 5,
-            progress = %progress_bar(3, 5),
-            percent = progress_percent(3, 5),
-            walker_ms = walker_millis,
-            "bootstrap progress"
-        );
         let transfers = walker_build.transfers;
         let walk_way_names = Arc::new(walker_build.way_names.clone());
         let transfer_hub_cell_meters = (config.walk_radius_meters / 3.0)
@@ -1775,7 +1503,6 @@ impl Engine {
             config.hpf_snap_tolerance_meters,
             config.hpf_snap_quadratic_kappa_meters,
             config.hpf_search_window,
-            previous.is_none() && config.hpf_defer_rebuild_on_bootstrap,
             config.osm_diff.clone(),
         );
         let hpf_millis = hpf_started.elapsed().as_millis();
@@ -1793,35 +1520,6 @@ impl Engine {
                     (None, "hpf-unavailable-stop-knn-fallback", false, 0, 0)
                 }
             };
-        info!(
-            phase = "engine-bootstrap",
-            step = 4,
-            total_steps = 5,
-            progress = %progress_bar(4, 5),
-            percent = progress_percent(4, 5),
-            hpf_ms = hpf_millis,
-            "bootstrap progress"
-        );
-
-        let street_router = match build_or_load_street_router(
-            &config.osm_pbf_path,
-            &runtime_cache_dir(&config.workspace_root, "osm"),
-            config.osm_diff.clone(),
-        ) {
-            Ok(router) => Some(Arc::new(router)),
-            Err(error) => {
-                warn!(%error, "failed to build street router; /api/street will be unavailable");
-                None
-            }
-        };
-        info!(
-            phase = "engine-bootstrap",
-            step = 5,
-            total_steps = 5,
-            progress = %progress_bar(5, 5),
-            percent = progress_percent(5, 5),
-            "bootstrap progress"
-        );
 
         let stop_cells = build_stop_cells(&stops, &active_stop_indices);
         let coordinate_query_strategy = if hpf.is_some() {
@@ -1929,7 +1627,6 @@ impl Engine {
             profile_cache: ProfileCache::new(),
             walk_way_names,
             hpf,
-            street_router,
         })
     }
 
@@ -1964,7 +1661,6 @@ impl Engine {
             realtime: self.realtime.snapshot(&self.static_data, 16),
             memoization: self.profile_cache.snapshot(),
             hpf_overlay: self.hpf.as_ref().map(|hpf| hpf.overlay_snapshot()),
-            street_overlay: self.street_router.as_ref().map(|router| router.overlay_snapshot()),
         }
     }
 
@@ -1979,72 +1675,8 @@ impl Engine {
             .map(Some)
     }
 
-    pub async fn refresh_street_overlay(&self) -> Result<Option<StreetRouterOverlaySnapshot>> {
-        let Some(router) = self.street_router.clone() else {
-            return Ok(None);
-        };
-
-        tokio::task::spawn_blocking(move || router.poll_remote_updates())
-            .await
-            .context("street overlay refresh task panicked")?
-            .map(Some)
-    }
-
     pub fn realtime_snapshot(&self, limit: usize) -> RealtimeDebugSnapshot {
         self.realtime.snapshot(&self.static_data, limit)
-    }
-
-    pub async fn run_street_route(
-        &self,
-        request: StreetRouteRequest,
-    ) -> Result<StreetRouteResponse> {
-        let mode = StreetMode::parse(request.mode.as_deref())?;
-        let from_lat = validate_query_latitude("from_lat", request.from_lat)?;
-        let from_lon = validate_query_longitude("from_lon", request.from_lon)?;
-        let to_lat = validate_query_latitude("to_lat", request.to_lat)?;
-        let to_lon = validate_query_longitude("to_lon", request.to_lon)?;
-        let router = self
-            .street_router
-            .clone()
-            .ok_or_else(|| anyhow!("street router unavailable for the current OSM extract"))?;
-
-        let route_started = Instant::now();
-        let path = tokio::task::spawn_blocking(move || {
-            router.route(mode, (from_lat, from_lon), (to_lat, to_lon))
-        })
-        .await
-        .context("street routing task panicked")??;
-
-        let geometry = WalkGeometry {
-            polyline: path.polyline.clone(),
-            segment_way_ids: path.segment_way_ids.clone(),
-        };
-        let directions = build_road_directions(&geometry, path.way_names.as_ref(), "");
-
-        Ok(StreetRouteResponse {
-            mode: mode.as_str(),
-            from: StreetCoordinatePoint {
-                lat: from_lat,
-                lon: from_lon,
-            },
-            to: StreetCoordinatePoint {
-                lat: to_lat,
-                lon: to_lon,
-            },
-            duration_seconds: i32::try_from(path.duration_seconds)
-                .unwrap_or(i32::MAX.saturating_sub(1)),
-            distance_meters: path.distance_meters,
-            polyline: path.polyline,
-            directions,
-            trace: StreetRouteTrace {
-                strategy: path.strategy,
-                query_runtime_ms: route_started.elapsed().as_millis(),
-                source_snap_distance_meters: path.source_snap_distance_meters,
-                destination_snap_distance_meters: path.destination_snap_distance_meters,
-                explored_forward_nodes: path.explored_forward_nodes,
-                explored_backward_nodes: path.explored_backward_nodes,
-            },
-        })
     }
 
     pub fn search_stops(&self, query: &str, limit: usize) -> Vec<StopSearchResult> {
@@ -2515,8 +2147,18 @@ impl Engine {
     }
 
     pub async fn run_query(&self, request: QueryRequest) -> Result<QueryResponse> {
+        if request.arrive_by.unwrap_or(false) {
+            return self.run_arrive_by_query(request).await;
+        }
+
+        self.run_depart_after_query(request).await
+    }
+
+    async fn run_depart_after_query(&self, request: QueryRequest) -> Result<QueryResponse> {
         let query_started = Instant::now();
         let request_setup_started = Instant::now();
+        let allowed_transit_modes = AllowedTransitModes::from_query(&request)?;
+        let route_filter_active = allowed_transit_modes.filter_active();
         let service_date = NaiveDate::parse_from_str(&request.date, "%Y-%m-%d")
             .with_context(|| format!("invalid date {}", request.date))?;
         let departure_time = parse_clock_time(&request.time)
@@ -2526,10 +2168,6 @@ impl Engine {
             .max_transfers
             .unwrap_or(self.config.default_max_transfers)
             .clamp(0, 8);
-        let requested_itinerary_count = request
-            .num_itineraries
-            .unwrap_or(DEFAULT_QUERY_ITINERARY_COUNT)
-            .clamp(1, MAX_QUERY_ITINERARY_COUNT);
         let (plan, plan_metrics) = self.resolve_query_plan(&request).await?;
         let from_index = plan.from_index;
         let to_index = plan.to_index;
@@ -2547,6 +2185,8 @@ impl Engine {
         let request_setup_ms = request_setup_started.elapsed().as_millis();
         let destination_cell = plan.destination_cell_for_insert;
         let destination_cells = plan.destination_cells.clone();
+        let allowed_line_mask = route_filter_active
+            .then(|| self.build_allowed_line_mask(allowed_transit_modes));
 
         let trip_mask_started = Instant::now();
         let trip_is_available = self.build_trip_availability(active_services);
@@ -2568,11 +2208,15 @@ impl Engine {
         let trip_mask_ms = trip_mask_started.elapsed().as_millis();
 
         let flat_spatial_mask_started = Instant::now();
-        let spatial_flat_mask = self.profile_cache.materialize_spatial_query_surface(
-            service_date,
-            &destination_cells,
-            static_stop_count,
-        );
+        let spatial_flat_mask = if route_filter_active {
+            PreparedSpatialLookup::default()
+        } else {
+            self.profile_cache.materialize_spatial_query_surface(
+                service_date,
+                &destination_cells,
+                static_stop_count,
+            )
+        };
         let flat_spatial_mask_ms = flat_spatial_mask_started.elapsed().as_millis();
 
         let state_init_started = Instant::now();
@@ -2711,32 +2355,34 @@ impl Engine {
             );
         }
 
-        let initial_profile_lookup_started = Instant::now();
-        self.apply_profile_lookahead(
-            service_date,
-            to_index,
-            plan.exact_destination_stop,
-            &spatial_flat_mask,
-            &plan.destination_egress_edges,
-            0,
-            rounds,
-            &marked_stops,
-            &trip_is_available,
-            &trip_has_realtime_update,
-            &line_max_positive_delay_secs,
-            &mut global_best,
-            &mut round_arrivals,
-            &mut parents,
-            &mut destination_round,
-            &mut profile_lookups,
-            &mut profile_hits,
-            &mut profile_bound_improvements,
-            &mut counters.destination_bound_prunes,
-            &mut flat_spatial_mask_checks,
-            &mut flat_spatial_mask_hits,
-            &mut local_subquery_cache,
-        );
-        profile_lookup_ms += initial_profile_lookup_started.elapsed().as_millis();
+        if !route_filter_active {
+            let initial_profile_lookup_started = Instant::now();
+            self.apply_profile_lookahead(
+                service_date,
+                to_index,
+                plan.exact_destination_stop,
+                &spatial_flat_mask,
+                &plan.destination_egress_edges,
+                0,
+                rounds,
+                &marked_stops,
+                &trip_is_available,
+                &trip_has_realtime_update,
+                &line_max_positive_delay_secs,
+                &mut global_best,
+                &mut round_arrivals,
+                &mut parents,
+                &mut destination_round,
+                &mut profile_lookups,
+                &mut profile_hits,
+                &mut profile_bound_improvements,
+                &mut counters.destination_bound_prunes,
+                &mut flat_spatial_mask_checks,
+                &mut flat_spatial_mask_hits,
+                &mut local_subquery_cache,
+            );
+            profile_lookup_ms += initial_profile_lookup_started.elapsed().as_millis();
+        }
 
         let rounds_started = Instant::now();
 
@@ -2765,6 +2411,11 @@ impl Engine {
                     continue;
                 }
                 for line_ref in &self.static_data.stop_to_lines[stop_index] {
+                    if let Some(mask) = allowed_line_mask.as_ref() {
+                        if !mask[line_ref.line_index] {
+                            continue;
+                        }
+                    }
                     let queued_pos = &mut queued_line_positions[line_ref.line_index];
                     if line_ref.stop_pos < *queued_pos {
                         *queued_pos = line_ref.stop_pos;
@@ -2827,7 +2478,7 @@ impl Engine {
                 round_metrics.timings_us.destination_egress_pre_transfer_us +=
                     destination_egress_started.elapsed().as_micros();
             }
-            if transit_frontier_len > 0 {
+            if !route_filter_active && transit_frontier_len > 0 {
                 let profile_lookup_started = Instant::now();
                 let profile_lookups_before = profile_lookups;
                 let profile_hits_before = profile_hits;
@@ -2906,50 +2557,52 @@ impl Engine {
                     round_metrics.timings_us.destination_egress_post_transfer_us +=
                         destination_egress_started.elapsed().as_micros();
                 }
-                let profile_lookup_started = Instant::now();
-                let profile_lookups_before = profile_lookups;
-                let profile_hits_before = profile_hits;
-                let profile_bound_improvements_before = profile_bound_improvements;
-                let destination_bound_prunes_before = counters.destination_bound_prunes;
-                let flat_spatial_mask_checks_before = flat_spatial_mask_checks;
-                let flat_spatial_mask_hits_before = flat_spatial_mask_hits;
-                self.apply_profile_lookahead(
-                    service_date,
-                    to_index,
-                    plan.exact_destination_stop,
-                    &spatial_flat_mask,
-                    &plan.destination_egress_edges,
-                    round,
-                    rounds,
-                    &next_marked[transit_frontier_len..],
-                    &trip_is_available,
-                    &trip_has_realtime_update,
-                    &line_max_positive_delay_secs,
-                    &mut global_best,
-                    &mut round_arrivals,
-                    &mut parents,
-                    &mut destination_round,
-                    &mut profile_lookups,
-                    &mut profile_hits,
-                    &mut profile_bound_improvements,
-                    &mut counters.destination_bound_prunes,
-                    &mut flat_spatial_mask_checks,
-                    &mut flat_spatial_mask_hits,
-                    &mut local_subquery_cache,
-                );
-                profile_lookup_ms += profile_lookup_started.elapsed().as_millis();
-                round_metrics.timings_us.profile_lookup_post_transfer_us +=
-                    profile_lookup_started.elapsed().as_micros();
-                round_metrics.profile_lookups += profile_lookups - profile_lookups_before;
-                round_metrics.profile_hits += profile_hits - profile_hits_before;
-                round_metrics.profile_bound_improvements +=
-                    profile_bound_improvements - profile_bound_improvements_before;
-                round_metrics.destination_bound_prunes +=
-                    counters.destination_bound_prunes - destination_bound_prunes_before;
-                round_metrics.flat_spatial_mask_checks +=
-                    flat_spatial_mask_checks - flat_spatial_mask_checks_before;
-                round_metrics.flat_spatial_mask_hits +=
-                    flat_spatial_mask_hits - flat_spatial_mask_hits_before;
+                if !route_filter_active {
+                    let profile_lookup_started = Instant::now();
+                    let profile_lookups_before = profile_lookups;
+                    let profile_hits_before = profile_hits;
+                    let profile_bound_improvements_before = profile_bound_improvements;
+                    let destination_bound_prunes_before = counters.destination_bound_prunes;
+                    let flat_spatial_mask_checks_before = flat_spatial_mask_checks;
+                    let flat_spatial_mask_hits_before = flat_spatial_mask_hits;
+                    self.apply_profile_lookahead(
+                        service_date,
+                        to_index,
+                        plan.exact_destination_stop,
+                        &spatial_flat_mask,
+                        &plan.destination_egress_edges,
+                        round,
+                        rounds,
+                        &next_marked[transit_frontier_len..],
+                        &trip_is_available,
+                        &trip_has_realtime_update,
+                        &line_max_positive_delay_secs,
+                        &mut global_best,
+                        &mut round_arrivals,
+                        &mut parents,
+                        &mut destination_round,
+                        &mut profile_lookups,
+                        &mut profile_hits,
+                        &mut profile_bound_improvements,
+                        &mut counters.destination_bound_prunes,
+                        &mut flat_spatial_mask_checks,
+                        &mut flat_spatial_mask_hits,
+                        &mut local_subquery_cache,
+                    );
+                    profile_lookup_ms += profile_lookup_started.elapsed().as_millis();
+                    round_metrics.timings_us.profile_lookup_post_transfer_us +=
+                        profile_lookup_started.elapsed().as_micros();
+                    round_metrics.profile_lookups += profile_lookups - profile_lookups_before;
+                    round_metrics.profile_hits += profile_hits - profile_hits_before;
+                    round_metrics.profile_bound_improvements +=
+                        profile_bound_improvements - profile_bound_improvements_before;
+                    round_metrics.destination_bound_prunes +=
+                        counters.destination_bound_prunes - destination_bound_prunes_before;
+                    round_metrics.flat_spatial_mask_checks +=
+                        flat_spatial_mask_checks - flat_spatial_mask_checks_before;
+                    round_metrics.flat_spatial_mask_hits +=
+                        flat_spatial_mask_hits - flat_spatial_mask_hits_before;
+                }
             }
 
             for stop_index in &next_marked {
@@ -3042,50 +2695,48 @@ impl Engine {
         }
         let rounds_ms = rounds_started.elapsed().as_millis();
 
-        if destination_round.is_none() {
-            bail!(
+        let destination_round = destination_round.ok_or_else(|| {
+            anyhow!(
                 "no itinerary found from {} to {} after {} transfers",
                 plan.display_from.name,
                 plan.display_to.name,
                 max_transfers
-            );
-        }
-        let itinerary_limit = requested_itinerary_count.min(rounds + 1);
+            )
+        })?;
+        let arrival_secs = round_arrivals[destination_round][to_index];
 
         let reconstruct_started = Instant::now();
-        let itinerary_candidates = self.collect_query_itinerary_candidates(
+        let raw_legs = self.reconstruct_path(
             from_index,
             to_index,
-            itinerary_limit,
+            destination_round,
             &parents,
             &round_arrivals,
         )?;
         let reconstruct_ms = reconstruct_started.elapsed().as_millis();
-        let primary_candidate = itinerary_candidates
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("no itinerary candidates reconstructed"))?;
-        let cacheable_raw_legs = self.cacheable_raw_legs(&primary_candidate.raw_legs, static_stop_count);
-        let profile_insertions = if let Some(destination_stop) = plan.exact_destination_stop {
-            self.build_profile_insertions(destination_stop, &cacheable_raw_legs)
+        let cacheable_raw_legs = self.cacheable_raw_legs(&raw_legs, static_stop_count);
+        let profile_insertions = if !route_filter_active {
+            if let Some(destination_stop) = plan.exact_destination_stop {
+                self.build_profile_insertions(destination_stop, &cacheable_raw_legs)
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
-        let spatial_profile_insertions =
-            self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs);
-        let transit_legs = primary_candidate.transit_legs;
+        let spatial_profile_insertions = if route_filter_active {
+            Vec::new()
+        } else {
+            self.build_spatial_profile_insertions(destination_cell, &cacheable_raw_legs)
+        };
+        let transit_legs = raw_legs
+            .iter()
+            .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
+            .count();
 
         let hydrate_started = Instant::now();
-        let itineraries = self.hydrate_query_itinerary_candidates(
-            service_date,
-            departure_secs,
-            &itinerary_candidates,
-            &plan.overlay,
-        )?;
-        let primary_itinerary = itineraries
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("no hydrated itinerary candidates"))?;
+        let legs = self.hydrate_legs(service_date, &raw_legs, &plan.overlay)?;
+        let deferred_hydration = self.build_deferred_hydration(&legs)?;
         let hydrate_ms = hydrate_started.elapsed().as_millis();
 
         if !profile_insertions.is_empty() || !spatial_profile_insertions.is_empty() {
@@ -3124,13 +2775,12 @@ impl Engine {
         Ok(QueryResponse {
             from: plan.display_from,
             to: plan.display_to,
-            departure_time: primary_itinerary.departure_time.clone(),
-            arrival_time: primary_itinerary.arrival_time.clone(),
-            duration_seconds: primary_itinerary.duration_seconds,
+            departure_time: format_service_time(service_date, departure_secs),
+            arrival_time: format_service_time(service_date, arrival_secs),
+            duration_seconds: arrival_secs - departure_secs,
             transfers: transit_legs.saturating_sub(1),
-            legs: primary_itinerary.legs.clone(),
-            itineraries,
-            deferred_hydration: primary_itinerary.deferred_hydration.clone(),
+            legs,
+            deferred_hydration,
             trace: QueryTrace {
                 service_date: service_date.to_string(),
                 query_runtime_ms,
@@ -3169,204 +2819,101 @@ impl Engine {
         })
     }
 
-    fn collect_query_itinerary_candidates(
-        &self,
-        from_index: usize,
-        to_index: usize,
-        limit: usize,
-        parents: &[Vec<Option<ParentStep>>],
-        round_arrivals: &[Vec<i32>],
-    ) -> Result<Vec<QueryItineraryCandidate>> {
-        let mut candidates = Vec::<QueryItineraryCandidate>::new();
-        let mut seen_signatures = HashSet::<String>::new();
+    async fn run_arrive_by_query(&self, request: QueryRequest) -> Result<QueryResponse> {
+        let service_date = NaiveDate::parse_from_str(&request.date, "%Y-%m-%d")
+            .with_context(|| format!("invalid date {}", request.date))?;
+        let arrival_time = parse_clock_time(&request.time)
+            .with_context(|| format!("invalid arrival time {}", request.time))?;
+        let target_arrival = service_date.and_time(arrival_time);
 
-        for round in 0..round_arrivals.len() {
-            let arrival_secs = round_arrivals[round][to_index];
-            if arrival_secs >= INF_TIME || parents[round][to_index].is_none() {
-                continue;
+        let latest_departure_request = request_with_departure_datetime(&request, target_arrival);
+        match self.run_depart_after_query(latest_departure_request).await {
+            Ok(result) if query_response_arrives_by(&result, target_arrival)? => {
+                return Ok(result);
             }
-
-            let raw_legs = self.reconstruct_path(from_index, to_index, round, parents, round_arrivals)?;
-            let signature = raw_leg_signature(&raw_legs);
-            if !seen_signatures.insert(signature) {
-                continue;
-            }
-
-            let transit_legs = raw_legs
-                .iter()
-                .filter(|leg| matches!(leg, RawLeg::Transit { .. }))
-                .count();
-            candidates.push(QueryItineraryCandidate {
-                round,
-                arrival_secs,
-                transit_legs,
-                raw_legs,
-            });
+            Ok(_) => {}
+            Err(error) if is_no_itinerary_error(&error) => {}
+            Err(error) => return Err(error),
         }
 
-        candidates.sort_by(|left, right| {
-            left.arrival_secs
-                .cmp(&right.arrival_secs)
-                .then_with(|| left.transit_legs.cmp(&right.transit_legs))
-                .then_with(|| left.round.cmp(&right.round))
-        });
+        let mut lower_bound = None::<(NaiveDateTime, QueryResponse)>;
+        let mut upper_bound = target_arrival;
+        let mut lookback = ARRIVE_BY_INITIAL_LOOKBACK_SECS;
 
-        let fastest_index = candidates
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, candidate)| (candidate.arrival_secs, candidate.transit_legs, candidate.round))
-            .map(|(index, _)| index);
-        let fewest_transfers_index = candidates
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, candidate)| {
-                (
-                    candidate.transit_legs.saturating_sub(1),
-                    candidate.arrival_secs,
-                    candidate.round,
-                )
-            })
-            .map(|(index, _)| index);
+        while lookback <= ARRIVE_BY_MAX_LOOKBACK_SECS {
+            let probe_departure = target_arrival - Duration::seconds(lookback);
+            let probe_request = request_with_departure_datetime(&request, probe_departure);
 
-        let mut ordered = Vec::<QueryItineraryCandidate>::with_capacity(candidates.len());
-        let mut used_indices = HashSet::<usize>::new();
-
-        if let Some(index) = fastest_index {
-            used_indices.insert(index);
-            ordered.push(candidates[index].clone());
-        }
-        if let Some(index) = fewest_transfers_index {
-            if used_indices.insert(index) {
-                ordered.push(candidates[index].clone());
+            match self.run_depart_after_query(probe_request).await {
+                Ok(result) => {
+                    if query_response_arrives_by(&result, target_arrival)? {
+                        lower_bound = Some((probe_departure, result));
+                        break;
+                    }
+                    upper_bound = probe_departure;
+                }
+                Err(error) if is_no_itinerary_error(&error) => {
+                    upper_bound = probe_departure;
+                }
+                Err(error) => return Err(error),
             }
+
+            lookback *= 2;
         }
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            if used_indices.insert(index) {
-                ordered.push(candidate);
+
+        let Some((mut best_departure, mut best_result)) = lower_bound else {
+            bail!("no itinerary found before the requested arrival time");
+        };
+
+        while (upper_bound - best_departure).num_seconds() > ARRIVE_BY_BINARY_SEARCH_TOLERANCE_SECS
+        {
+            let midpoint_delta = (upper_bound - best_departure).num_seconds() / 2;
+            let probe_departure = best_departure + Duration::seconds(midpoint_delta);
+            if probe_departure <= best_departure || probe_departure >= upper_bound {
+                break;
+            }
+
+            let probe_request = request_with_departure_datetime(&request, probe_departure);
+            match self.run_depart_after_query(probe_request).await {
+                Ok(result) => {
+                    if query_response_arrives_by(&result, target_arrival)? {
+                        best_departure = probe_departure;
+                        best_result = result;
+                    } else {
+                        upper_bound = probe_departure;
+                    }
+                }
+                Err(error) if is_no_itinerary_error(&error) => {
+                    upper_bound = probe_departure;
+                }
+                Err(error) => return Err(error),
             }
         }
 
-        ordered.truncate(limit.max(1));
-        Ok(ordered)
+        Ok(best_result)
     }
 
-    fn hydrate_query_itinerary_candidates(
+    fn build_allowed_line_mask(&self, allowed_transit_modes: AllowedTransitModes) -> Vec<bool> {
+        self.static_data
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(line_index, _)| {
+                self.line_matches_allowed_transit_modes(line_index, allowed_transit_modes)
+            })
+            .collect()
+    }
+
+    fn line_matches_allowed_transit_modes(
         &self,
-        service_date: NaiveDate,
-        departure_secs: i32,
-        candidates: &[QueryItineraryCandidate],
-        overlay: &QueryOverlay,
-    ) -> Result<Vec<QueryItineraryResponse>> {
-        let mut itineraries = Vec::with_capacity(candidates.len());
-
-        for candidate in candidates {
-            let transfers = candidate.transit_legs.saturating_sub(1);
-            let legs = self.hydrate_legs(service_date, &candidate.raw_legs, overlay)?;
-            let passive_metrics = score_itinerary_passive_metrics(&legs);
-            let deferred_hydration = self.build_deferred_hydration(&legs)?;
-
-            itineraries.push(QueryItineraryResponse {
-                id: format!(
-                    "round-{}-{}-{}",
-                    candidate.round,
-                    candidate.arrival_secs,
-                    transfers
-                ),
-                label: String::new(),
-                badges: Vec::new(),
-                is_recommended: false,
-                is_fastest: false,
-                is_fewest_transfers: false,
-                is_best_realtime: false,
-                is_least_crowded: false,
-                has_canceled_legs: passive_metrics.has_canceled_legs,
-                departure_time: format_service_time(service_date, departure_secs),
-                arrival_time: format_service_time(service_date, candidate.arrival_secs),
-                duration_seconds: candidate.arrival_secs - departure_secs,
-                transfers,
-                realtime_score: passive_metrics.transit_legs_with_gtfs_rt,
-                transit_leg_count: passive_metrics.transit_leg_count,
-                transit_legs_with_gtfs_rt: passive_metrics.transit_legs_with_gtfs_rt,
-                crowding_score: passive_metrics.crowding_score,
-                crowding_level: passive_metrics.crowding_level,
-                occupancy_covered_transit_legs: passive_metrics.occupancy_covered_transit_legs,
-                canceled_transit_legs: passive_metrics.canceled_transit_legs,
-                legs,
-                deferred_hydration,
-            });
-        }
-
-        let fastest_duration = itineraries
-            .iter()
-            .map(|itinerary| itinerary.duration_seconds)
-            .min()
-            .unwrap_or(0);
-        let fewest_transfers = itineraries
-            .iter()
-            .map(|itinerary| itinerary.transfers)
-            .min()
-            .unwrap_or(0);
-        let best_realtime_score = itineraries
-            .iter()
-            .map(|itinerary| itinerary.transit_legs_with_gtfs_rt)
-            .max()
-            .unwrap_or(0);
-        let best_crowding_score = itineraries
-            .iter()
-            .filter(|itinerary| itinerary.occupancy_covered_transit_legs > 0)
-            .filter_map(|itinerary| itinerary.crowding_score)
-            .min();
-
-        itineraries.sort_by(|left, right| {
-            left.has_canceled_legs
-                .cmp(&right.has_canceled_legs)
-                .then_with(|| left.duration_seconds.cmp(&right.duration_seconds))
-                .then_with(|| left.transfers.cmp(&right.transfers))
-                .then_with(|| right.transit_legs_with_gtfs_rt.cmp(&left.transit_legs_with_gtfs_rt))
-                .then_with(|| compare_optional_crowding(left.crowding_score, right.crowding_score))
-                .then_with(|| {
-                    right
-                        .occupancy_covered_transit_legs
-                        .cmp(&left.occupancy_covered_transit_legs)
-                })
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
-        for (index, itinerary) in itineraries.iter_mut().enumerate() {
-            let is_recommended = index == 0;
-            let is_fastest = itinerary.duration_seconds == fastest_duration;
-            let is_fewest_transfers = itinerary.transfers == fewest_transfers;
-            let is_best_realtime = best_realtime_score > 0
-                && itinerary.transit_legs_with_gtfs_rt == best_realtime_score;
-            let is_least_crowded = best_crowding_score.is_some()
-                && itinerary.occupancy_covered_transit_legs > 0
-                && itinerary.crowding_score == best_crowding_score;
-
-            itinerary.is_recommended = is_recommended;
-            itinerary.is_fastest = is_fastest;
-            itinerary.is_fewest_transfers = is_fewest_transfers;
-            itinerary.is_best_realtime = is_best_realtime;
-            itinerary.is_least_crowded = is_least_crowded;
-            itinerary.label = build_itinerary_label(
-                index,
-                is_recommended,
-                is_fastest,
-                is_fewest_transfers,
-                is_best_realtime,
-                is_least_crowded,
-            );
-            itinerary.badges = build_itinerary_badges(
-                index,
-                is_recommended,
-                is_fastest,
-                is_fewest_transfers,
-                is_best_realtime,
-                is_least_crowded,
-                itinerary.has_canceled_legs,
-            );
-        }
-
-        Ok(itineraries)
+        line_index: usize,
+        allowed_transit_modes: AllowedTransitModes,
+    ) -> bool {
+        let Some(&trip_index) = self.static_data.lines[line_index].trip_indices.first() else {
+            return false;
+        };
+        let route = &self.static_data.routes[self.static_data.trips[trip_index].route_index];
+        allowed_transit_modes.matches_route_type(&route.route_type)
     }
 
     fn scan_line(
@@ -4592,6 +4139,7 @@ impl Engine {
             departure_time: format_service_time(service_date, *departure_secs),
             arrival_time: format_service_time(service_date, *arrival_secs),
             duration_seconds: *arrival_secs - *departure_secs,
+            has_realtime_update: false,
             from_stop: from_result,
             to_stop: to_result,
             trip_gid: None,
@@ -4605,13 +4153,6 @@ impl Engine {
             headsign: None,
             walk_distance_meters: Some(distance_meters),
             delay_applied_seconds: None,
-            has_gtfs_rt: false,
-            has_trip_update: false,
-            has_vehicle_position: false,
-            schedule_relationship: None,
-            occupancy_status: None,
-            occupancy_percentage: None,
-            occupancy_score: None,
             intermediate_stops: Vec::new(),
             polyline: geometry.polyline,
             walk_directions,
@@ -4641,6 +4182,7 @@ impl Engine {
                     departure_time: format_service_time(service_date, departure_secs),
                     arrival_time: format_service_time(service_date, arrival_secs),
                     duration_seconds: duration_secs,
+                    has_realtime_update: false,
                     from_stop: from_result,
                     to_stop: to_result.clone(),
                     trip_gid: None,
@@ -4654,13 +4196,6 @@ impl Engine {
                     headsign: None,
                     walk_distance_meters: Some(distance_meters),
                     delay_applied_seconds: None,
-                    has_gtfs_rt: false,
-                    has_trip_update: false,
-                    has_vehicle_position: false,
-                    schedule_relationship: None,
-                    occupancy_status: None,
-                    occupancy_percentage: None,
-                    occupancy_score: None,
                     intermediate_stops: Vec::new(),
                     polyline: geometry.polyline.clone(),
                     walk_directions: build_walk_directions(
@@ -4683,15 +4218,16 @@ impl Engine {
                 let route = &self.static_data.routes[trip.route_index];
                 let cold_trip = self.cold_trip_record(trip_index);
                 let cold_route = self.cold_route_record(trip.route_index);
-                let passive_realtime = self.passive_realtime_fields(trip_index, board_pos);
                 let scheduled_departure = trip.stop_times[board_pos].departure_secs;
                 let delay_applied_seconds = departure_secs - scheduled_departure;
+                let has_realtime_update = self.realtime.has_trip_update(trip_index);
                 let intermediate_stops = self.trip_intermediate_stops(trip, board_pos, alight_pos);
                 Ok(LegResponse {
                     kind: "transit",
                     departure_time: format_service_time(service_date, departure_secs),
                     arrival_time: format_service_time(service_date, arrival_secs),
                     duration_seconds: arrival_secs - departure_secs,
+                    has_realtime_update,
                     from_stop: self.query_stop_result(board_stop, overlay),
                     to_stop: self.query_stop_result(alight_stop, overlay),
                     trip_gid: Some(trip.global_id),
@@ -4705,24 +4241,6 @@ impl Engine {
                     headsign: cold_trip.headsign.clone(),
                     walk_distance_meters: None,
                     delay_applied_seconds: Some(delay_applied_seconds),
-                    has_gtfs_rt: passive_realtime.has_gtfs_rt(),
-                    has_trip_update: passive_realtime.has_trip_update,
-                    has_vehicle_position: passive_realtime.has_vehicle_position,
-                    schedule_relationship: schedule_relationship_string(
-                        passive_realtime.schedule_relationship,
-                    ),
-                    occupancy_status: occupancy_status_string(
-                        passive_realtime
-                            .stop_departure_occupancy_status
-                            .or(passive_realtime.vehicle_occupancy_status),
-                    ),
-                    occupancy_percentage: passive_realtime.vehicle_occupancy_percentage,
-                    occupancy_score: passive_occupancy_score(
-                        passive_realtime
-                            .stop_departure_occupancy_status
-                            .or(passive_realtime.vehicle_occupancy_status),
-                        passive_realtime.vehicle_occupancy_percentage,
-                    ),
                     intermediate_stops,
                     polyline: self.trip_polyline(trip, board_pos, alight_pos),
                     walk_directions: Vec::new(),
@@ -4843,10 +4361,6 @@ impl Engine {
             segment_way_ids: empty_segment_way_ids(&polyline),
             polyline,
         }
-    }
-
-    fn passive_realtime_fields(&self, trip_index: usize, board_pos: usize) -> TripRealtimeMetrics {
-        self.realtime.trip_realtime_metrics(trip_index, board_pos)
     }
 
     fn query_stop_coordinates(
@@ -5013,6 +4527,7 @@ impl Engine {
                 departure_time: leg.departure_time.clone(),
                 arrival_time: leg.arrival_time.clone(),
                 duration_seconds: leg.duration_seconds,
+                has_realtime_update: leg.has_realtime_update,
                 from_stop_gid: leg.from_stop.global_id,
                 to_stop_gid: leg.to_stop.global_id,
                 trip_gid: leg.trip_gid,
@@ -5020,13 +4535,6 @@ impl Engine {
                 headsign: leg.headsign.clone(),
                 walk_distance_meters: leg.walk_distance_meters,
                 delay_applied_seconds: leg.delay_applied_seconds,
-                has_gtfs_rt: leg.has_gtfs_rt,
-                has_trip_update: leg.has_trip_update,
-                has_vehicle_position: leg.has_vehicle_position,
-                schedule_relationship: leg.schedule_relationship.clone(),
-                occupancy_status: leg.occupancy_status.clone(),
-                occupancy_percentage: leg.occupancy_percentage,
-                occupancy_score: leg.occupancy_score,
                 intermediate_stop_gids,
                 polyline_index,
                 walk_directions: leg.walk_directions.clone(),
@@ -5322,6 +4830,30 @@ impl Engine {
     }
 }
 
+fn request_with_departure_datetime(
+    request: &QueryRequest,
+    departure: NaiveDateTime,
+) -> QueryRequest {
+    let mut next_request = request.clone();
+    next_request.date = departure.date().format("%Y-%m-%d").to_string();
+    next_request.time = departure.time().format("%H:%M").to_string();
+    next_request.arrive_by = Some(false);
+    next_request
+}
+
+fn query_response_arrives_by(
+    response: &QueryResponse,
+    deadline: NaiveDateTime,
+) -> Result<bool> {
+    let arrival = NaiveDateTime::parse_from_str(&response.arrival_time, "%Y-%m-%d %H:%M:%S")
+        .with_context(|| format!("invalid service timestamp {}", response.arrival_time))?;
+    Ok(arrival <= deadline)
+}
+
+fn is_no_itinerary_error(error: &anyhow::Error) -> bool {
+    error.to_string().to_ascii_lowercase().contains("no itinerary found")
+}
+
 fn resolve_path(
     workspace_root: &PathBuf,
     override_path: Option<String>,
@@ -5594,7 +5126,8 @@ fn probe_remote_static_gtfs_version(
     feed_id: &str,
     url: &str,
 ) -> Result<RemoteStaticGtfsVersionMetadata> {
-    let response = maybe_add_internal_token_blocking(client.head(url), url)?
+    let response = client
+        .head(url)
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| {
@@ -5743,7 +5276,8 @@ fn sync_remote_static_gtfs(
         }
     }
 
-    let response = maybe_add_internal_token_blocking(client.get(url), url)?
+    let response = client
+        .get(url)
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download static GTFS feed {feed_id} from {url}"));
@@ -5946,11 +5480,6 @@ fn sync_remote_osm_pbf(
         }
     }
 
-    let response = maybe_add_internal_token_blocking(client.get(url), url)?
-        .send()
-        .and_then(|response| response.error_for_status())
-        .with_context(|| format!("failed to download OSM PBF from {url}"));
-
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -5960,24 +5489,56 @@ fn sync_remote_osm_pbf(
         })?;
     }
 
-    let unique_suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    let tmp_path = cache_path.with_extension(format!("download-{unique_suffix}.tmp"));
+    let tmp_path = cache_path.with_extension("download.tmp");
+    let resume_from_bytes = if cache_path.exists() {
+        if tmp_path.exists() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        0
+    } else {
+        fs::metadata(&tmp_path).map(|metadata| metadata.len()).unwrap_or(0)
+    };
+
+    let mut request = client.get(url);
+    if resume_from_bytes > 0 {
+        request = request.header(RANGE, format!("bytes={resume_from_bytes}-"));
+    }
+
+    let response = request
+        .send()
+        .and_then(|response| response.error_for_status())
+        .with_context(|| format!("failed to download OSM PBF from {url}"));
 
     let (downloaded_bytes, version_metadata) = match response {
         Ok(response) => {
+            let response_status = response.status();
+            let append_mode = resume_from_bytes > 0 && response_status == StatusCode::PARTIAL_CONTENT;
+            if resume_from_bytes > 0 && !append_mode {
+                warn!(
+                    url,
+                    cache = %cache_path.display(),
+                    tmp = %tmp_path.display(),
+                    resume_from_bytes,
+                    response_status = %response_status,
+                    "remote OSM PBF server did not honor range request; restarting download from byte zero"
+                );
+            }
             let response_version = merged_remote_static_gtfs_version_metadata(
                 url,
                 remote_static_gtfs_version_from_headers(url, response.headers()),
                 probed_version.as_ref(),
             );
-            match stream_blocking_response_to_file(response, &tmp_path, "OSM PBF") {
+            match stream_blocking_response_to_file(
+                response,
+                &tmp_path,
+                "OSM PBF",
+                if append_mode { resume_from_bytes } else { 0 },
+                append_mode,
+            ) {
                 Ok(downloaded_bytes) => (downloaded_bytes, response_version),
                 Err(error) => {
-                    let _ = fs::remove_file(&tmp_path);
                     if cache_path.exists() {
+                        let _ = fs::remove_file(&tmp_path);
                         warn!(
                             %error,
                             url,
@@ -5986,6 +5547,12 @@ fn sync_remote_osm_pbf(
                         );
                         return Ok(());
                     }
+                    warn!(
+                        %error,
+                        url,
+                        tmp = %tmp_path.display(),
+                        "remote OSM PBF download interrupted; keeping partial file for next resume attempt"
+                    );
                     return Err(error);
                 }
             }
@@ -6044,8 +5611,16 @@ fn stream_blocking_response_to_file(
     mut response: reqwest::blocking::Response,
     destination_path: &Path,
     artifact_name: &str,
+    resume_from_bytes: u64,
+    append: bool,
 ) -> Result<u64> {
-    let file = File::create(destination_path).with_context(|| {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(!append)
+        .append(append)
+        .open(destination_path)
+        .with_context(|| {
         format!(
             "failed to create temporary {} file {}",
             artifact_name,
@@ -6053,14 +5628,22 @@ fn stream_blocking_response_to_file(
         )
     })?;
     let mut writer = BufWriter::new(file);
-    let total_bytes = response.content_length();
-    let mut downloaded_bytes = 0u64;
-    let mut next_progress_log = 64_u64 * 1024 * 1024;
+    let total_bytes = response
+        .content_length()
+        .map(|content_length| content_length + resume_from_bytes);
+    let mut downloaded_bytes = resume_from_bytes;
+    let progress_chunk_bytes = 64_u64 * 1024 * 1024;
+    let mut next_progress_log = if downloaded_bytes == 0 {
+        progress_chunk_bytes
+    } else {
+        ((downloaded_bytes / progress_chunk_bytes) + 1) * progress_chunk_bytes
+    };
     let mut buffer = vec![0u8; 1024 * 1024];
 
     info!(
         artifact = artifact_name,
         destination = %destination_path.display(),
+        resumed_bytes = resume_from_bytes,
         total_bytes = total_bytes.unwrap_or(0),
         "starting streamed remote download"
     );
@@ -6083,26 +5666,14 @@ fn stream_blocking_response_to_file(
         downloaded_bytes += read as u64;
 
         if downloaded_bytes >= next_progress_log {
-            if let Some(total_bytes) = total_bytes {
-                info!(
-                    artifact = artifact_name,
-                    destination = %destination_path.display(),
-                    downloaded_bytes,
-                    total_bytes,
-                    progress = %progress_bar_u64(downloaded_bytes, total_bytes),
-                    percent = progress_percent_u64(downloaded_bytes, total_bytes),
-                    "streamed remote download progress"
-                );
-            } else {
-                info!(
-                    artifact = artifact_name,
-                    destination = %destination_path.display(),
-                    downloaded_bytes,
-                    total_bytes = 0,
-                    "streamed remote download progress"
-                );
-            }
-            next_progress_log += 64_u64 * 1024 * 1024;
+            info!(
+                artifact = artifact_name,
+                destination = %destination_path.display(),
+                downloaded_bytes,
+                total_bytes = total_bytes.unwrap_or(0),
+                "streamed remote download progress"
+            );
+            next_progress_log += progress_chunk_bytes;
         }
     }
 
@@ -6207,13 +5778,38 @@ fn capture_static_inputs_metadata(
 
     let mut feed_sources = Vec::with_capacity(config.feeds.len());
     for feed in &config.feeds {
-        let metadata = std::fs::metadata(&feed.static_gtfs_path).with_context(|| {
-            format!(
-                "unable to stat GTFS zip for feed {} at {}",
-                feed.id,
-                feed.static_gtfs_path.display()
-            )
-        })?;
+        let metadata = match std::fs::metadata(&feed.static_gtfs_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if feed.static_gtfs_remote_url.is_none() {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "unable to stat GTFS zip for feed {} at {}. The configured source '{}' is treated as a local path; place the ZIP there or switch feeds[].static_gtfs to an http(s) URL so Alpha-RAPTOR downloads and polls it automatically",
+                            feed.id,
+                            feed.static_gtfs_path.display(),
+                            feed.static_gtfs_source
+                        )
+                    });
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "unable to stat cached GTFS zip for feed {} at {} after syncing remote source {}",
+                        feed.id,
+                        feed.static_gtfs_path.display(),
+                        feed.static_gtfs_remote_url.as_deref().unwrap_or("<unknown>")
+                    )
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "unable to stat GTFS zip for feed {} at {}",
+                        feed.id,
+                        feed.static_gtfs_path.display()
+                    )
+                });
+            }
+        };
         feed_sources.push(StaticFeedSourceMetadata {
             feed_id: feed.id.clone(),
             static_gtfs_source: feed.static_gtfs_source.clone(),
@@ -6327,25 +5923,9 @@ fn load_or_build_static_core(
 
     let gtfs_parse_started = Instant::now();
     let mut parsed_feeds = Vec::<(FeedConfig, Gtfs)>::with_capacity(config.feeds.len());
-    let feed_total = config.feeds.len().max(1);
-    for (feed_index, feed) in config.feeds.iter().enumerate() {
-        let gtfs = Gtfs::from_path(&feed.static_gtfs_path).with_context(|| {
-            format!(
-                "unable to read GTFS for feed {} from {}",
-                feed.id,
-                feed.static_gtfs_path.display()
-            )
-        })?;
+    for feed in &config.feeds {
+        let gtfs = load_gtfs_with_calendar_dates_fallback(feed)?;
         parsed_feeds.push((feed.clone(), gtfs));
-        info!(
-            phase = "gtfs-parse",
-            progress = %progress_bar(feed_index + 1, feed_total),
-            percent = progress_percent(feed_index + 1, feed_total),
-            completed = feed_index + 1,
-            total = feed_total,
-            feed_id = %feed.id,
-            "GTFS parse progress"
-        );
     }
     timings.gtfs_parse_ms = gtfs_parse_started.elapsed().as_millis();
     info!(
@@ -6406,6 +5986,211 @@ fn load_or_build_static_core(
         update_strategy,
         diff_summary,
     })
+}
+
+fn load_gtfs_with_calendar_dates_fallback(feed: &FeedConfig) -> Result<Gtfs> {
+    let parse_error = match Gtfs::from_path(&feed.static_gtfs_path) {
+        Ok(gtfs) => return Ok(gtfs),
+        Err(error) => anyhow!(error).context(format!(
+            "unable to read GTFS for feed {} from {}",
+            feed.id,
+            feed.static_gtfs_path.display()
+        )),
+    };
+
+    if !should_sanitize_calendar_dates(&parse_error, &feed.static_gtfs_path) {
+        return Err(parse_error);
+    }
+
+    warn!(
+        %parse_error,
+        feed_id = %feed.id,
+        path = %feed.static_gtfs_path.display(),
+        "invalid calendar_dates.txt exception_type values detected; retrying with sanitized GTFS"
+    );
+
+    let sanitized_path = write_sanitized_gtfs_zip(feed)?;
+    let parsed = Gtfs::from_path(&sanitized_path).with_context(|| {
+        format!(
+            "unable to read sanitized GTFS for feed {} from {}",
+            feed.id,
+            sanitized_path.display()
+        )
+    });
+    let _ = fs::remove_file(&sanitized_path);
+    parsed
+}
+
+fn should_sanitize_calendar_dates(error: &anyhow::Error, source_path: &Path) -> bool {
+    if source_path.extension().and_then(|ext| ext.to_str()) != Some("zip") {
+        return false;
+    }
+
+    let mut saw_calendar_dates = false;
+    let mut saw_unknown_zero = false;
+    let mut saw_expected_variants = false;
+
+    for cause in error.chain() {
+        let message = cause.to_string();
+        saw_calendar_dates |= message.contains("calendar_dates.txt");
+        saw_unknown_zero |= message.contains("unknown variant `0`");
+        saw_expected_variants |= message.contains("expected `1` or `2`");
+    }
+
+    saw_calendar_dates && saw_unknown_zero && saw_expected_variants
+}
+
+fn write_sanitized_gtfs_zip(feed: &FeedConfig) -> Result<PathBuf> {
+    let source_file = File::open(&feed.static_gtfs_path).with_context(|| {
+        format!(
+            "unable to open GTFS zip for sanitization {}",
+            feed.static_gtfs_path.display()
+        )
+    })?;
+    let mut source_zip = zip::ZipArchive::new(source_file).with_context(|| {
+        format!(
+            "unable to inspect GTFS zip for feed {} at {}",
+            feed.id,
+            feed.static_gtfs_path.display()
+        )
+    })?;
+
+    let sanitized_path = feed
+        .static_gtfs_path
+        .with_extension(format!("{}.sanitized.zip", feed.id));
+    let sanitized_file = File::create(&sanitized_path).with_context(|| {
+        format!(
+            "unable to create sanitized GTFS zip for feed {} at {}",
+            feed.id,
+            sanitized_path.display()
+        )
+    })?;
+    let mut writer = zip::ZipWriter::new(sanitized_file);
+    let mut rewritten_rows = 0usize;
+    let mut sanitized_calendar_dates = false;
+
+    for index in 0..source_zip.len() {
+        let mut entry = source_zip.by_index(index).with_context(|| {
+            format!(
+                "unable to read entry #{index} from GTFS zip for feed {}",
+                feed.id
+            )
+        })?;
+        let name = entry.name().to_owned();
+        let mut options = zip::write::FileOptions::default()
+            .compression_method(entry.compression());
+        if let Some(mode) = entry.unix_mode() {
+            options = options.unix_permissions(mode);
+        }
+
+        if entry.is_dir() {
+            writer.add_directory(name, options).with_context(|| {
+                format!("unable to write directory entry into sanitized GTFS for {}", feed.id)
+            })?;
+            continue;
+        }
+
+        writer.start_file(name.clone(), options).with_context(|| {
+            format!(
+                "unable to start file {} in sanitized GTFS for {}",
+                name,
+                feed.id
+            )
+        })?;
+
+        let entry_name = name.rsplit('/').next().unwrap_or(name.as_str());
+        if entry_name.eq_ignore_ascii_case("calendar_dates.txt") {
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).with_context(|| {
+                format!(
+                    "unable to read calendar_dates.txt from GTFS zip for {}",
+                    feed.id
+                )
+            })?;
+            let (sanitized, rewritten) = sanitize_calendar_dates_contents(&contents);
+            rewritten_rows += rewritten;
+            sanitized_calendar_dates = true;
+            writer.write_all(sanitized.as_bytes()).with_context(|| {
+                format!(
+                    "unable to write sanitized calendar_dates.txt for {}",
+                    feed.id
+                )
+            })?;
+        } else {
+            copy(&mut entry, &mut writer).with_context(|| {
+                format!(
+                    "unable to copy GTFS entry {} into sanitized archive for {}",
+                    name,
+                    feed.id
+                )
+            })?;
+        }
+    }
+
+    writer.finish().with_context(|| {
+        format!(
+            "unable to finalize sanitized GTFS zip for feed {} at {}",
+            feed.id,
+            sanitized_path.display()
+        )
+    })?;
+
+    if !sanitized_calendar_dates {
+        bail!(
+            "calendar_dates.txt was not found in GTFS zip for feed {} while sanitizing {}",
+            feed.id,
+            feed.static_gtfs_path.display()
+        );
+    }
+
+    warn!(
+        feed_id = %feed.id,
+        path = %sanitized_path.display(),
+        rewritten_rows,
+        "wrote sanitized GTFS zip after normalizing invalid calendar_dates rows"
+    );
+
+    Ok(sanitized_path)
+}
+
+fn sanitize_calendar_dates_contents(contents: &str) -> (String, usize) {
+    let mut lines = contents.lines();
+    let mut sanitized = String::new();
+    let mut rewritten_rows = 0usize;
+
+    if let Some(header) = lines.next() {
+        sanitized.push_str(header);
+        sanitized.push('\n');
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let exception_type = trimmed
+            .rsplit(',')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"');
+
+        if matches!(exception_type, "1" | "2") {
+            sanitized.push_str(line);
+            sanitized.push('\n');
+            continue;
+        }
+
+        if exception_type == "0" {
+            let split_at = line.rfind(',').unwrap_or(line.len());
+            sanitized.push_str(&line[..split_at]);
+            sanitized.push_str(",2\n");
+            rewritten_rows += 1;
+        }
+    }
+
+    (sanitized, rewritten_rows)
 }
 
 fn summarize_static_divergence(previous: &StaticData, next: &StaticCore) -> StaticDiffSummary {
@@ -6627,8 +6412,7 @@ fn build_static_core(parsed_feeds: &[(FeedConfig, Gtfs)]) -> Result<StaticCore> 
     let mut service_by_date = HashMap::<NaiveDate, HashSet<String>>::new();
     let mut shapes = HashMap::new();
 
-    let feed_total = parsed_feeds.len().max(1);
-    for (feed_index, (feed, gtfs)) in parsed_feeds.iter().enumerate() {
+    for (feed, gtfs) in parsed_feeds {
         feeds.push(FeedRecord {
             feed_index: feed.feed_index,
             id: feed.id.clone(),
@@ -6793,18 +6577,6 @@ fn build_static_core(parsed_feeds: &[(FeedConfig, Gtfs)]) -> Result<StaticCore> 
         }
 
         merge_service_calendar(&mut service_by_date, &feed.id, gtfs);
-        info!(
-            phase = "transit-core",
-            progress = %progress_bar(feed_index + 1, feed_total),
-            percent = progress_percent(feed_index + 1, feed_total),
-            completed = feed_index + 1,
-            total = feed_total,
-            feed_id = %feed.id,
-            stops = gtfs.stops.len(),
-            routes = gtfs.routes.len(),
-            trips = gtfs.trips.len(),
-            "transit core feed normalization progress"
-        );
     }
 
     let mut lines = Vec::<LineRecord>::new();
@@ -7393,39 +7165,6 @@ fn build_walk_directions(
     way_names: &HashMap<i64, String>,
     destination_name: &str,
 ) -> Vec<WalkDirection> {
-    build_turn_directions(
-        geometry,
-        way_names,
-        destination_name,
-        TurnDirectionNarrative::Walk,
-    )
-}
-
-fn build_road_directions(
-    geometry: &WalkGeometry,
-    way_names: &HashMap<i64, String>,
-    destination_name: &str,
-) -> Vec<WalkDirection> {
-    build_turn_directions(
-        geometry,
-        way_names,
-        destination_name,
-        TurnDirectionNarrative::Drive,
-    )
-}
-
-#[derive(Clone, Copy)]
-enum TurnDirectionNarrative {
-    Walk,
-    Drive,
-}
-
-fn build_turn_directions(
-    geometry: &WalkGeometry,
-    way_names: &HashMap<i64, String>,
-    destination_name: &str,
-    narrative: TurnDirectionNarrative,
-) -> Vec<WalkDirection> {
     if geometry.polyline.len() < 2 {
         return Vec::new();
     }
@@ -7439,7 +7178,10 @@ fn build_turn_directions(
 
     let mut directions = vec![WalkDirection {
         maneuver: "depart",
-        instruction: departure_instruction(narrative, start_street_name.as_deref()),
+        instruction: match start_street_name.as_ref() {
+            Some(street_name) => format!("Parti a piedi su {street_name}"),
+            None => "Parti a piedi".to_owned(),
+        },
         street_name: start_street_name,
         distance_meters: 0.0,
         lat: geometry.polyline[0].lat,
@@ -7514,22 +7256,6 @@ fn build_turn_directions(
     directions
 }
 
-fn departure_instruction(
-    narrative: TurnDirectionNarrative,
-    street_name: Option<&str>,
-) -> String {
-    match (narrative, street_name) {
-        (TurnDirectionNarrative::Walk, Some(street_name)) => {
-            format!("Parti a piedi su {street_name}")
-        }
-        (TurnDirectionNarrative::Walk, None) => "Parti a piedi".to_owned(),
-        (TurnDirectionNarrative::Drive, Some(street_name)) => {
-            format!("Parti in auto su {street_name}")
-        }
-        (TurnDirectionNarrative::Drive, None) => "Parti in auto".to_owned(),
-    }
-}
-
 fn cumulative_polyline_distances(polyline: &[PolylinePoint]) -> Vec<f64> {
     let mut cumulative = Vec::with_capacity(polyline.len());
     let mut total = 0.0;
@@ -7602,22 +7328,6 @@ fn same_road_identity(
 
 fn points_equal(left: &PolylinePoint, right: &PolylinePoint) -> bool {
     (left.lat - right.lat).abs() <= 1e-7 && (left.lon - right.lon).abs() <= 1e-7
-}
-
-fn validate_query_latitude(label: &str, value: Option<f64>) -> Result<f64> {
-    let value = value.ok_or_else(|| anyhow!("missing {label}"))?;
-    if !value.is_finite() || !(-90.0..=90.0).contains(&value) {
-        bail!("invalid {label}");
-    }
-    Ok(value)
-}
-
-fn validate_query_longitude(label: &str, value: Option<f64>) -> Result<f64> {
-    let value = value.ok_or_else(|| anyhow!("missing {label}"))?;
-    if !value.is_finite() || !(-180.0..=180.0).contains(&value) {
-        bail!("invalid {label}");
-    }
-    Ok(value)
 }
 
 fn build_full_walker_matrix(config: &EngineConfig, stops: &[StopRecord]) -> WalkerBuildResult {
@@ -8222,193 +7932,6 @@ fn record_stop_improvement(
         improved_stops.push(stop_index);
     }
     true
-}
-
-    fn raw_leg_signature(raw_legs: &[RawLeg]) -> String {
-        raw_legs
-            .iter()
-            .map(|leg| match leg {
-                RawLeg::Walk {
-                    from_stop,
-                    to_stop,
-                    departure_secs,
-                    arrival_secs,
-                    ..
-                } => format!(
-                    "walk:{from_stop}:{to_stop}:{departure_secs}:{arrival_secs}"
-                ),
-                RawLeg::Transit {
-                    trip_index,
-                    board_stop,
-                    alight_stop,
-                    departure_secs,
-                    arrival_secs,
-                    ..
-                } => format!(
-                    "transit:{trip_index}:{board_stop}:{alight_stop}:{departure_secs}:{arrival_secs}"
-                ),
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    }
-
-    fn build_itinerary_label(
-        index: usize,
-        is_recommended: bool,
-        is_fastest: bool,
-        is_fewest_transfers: bool,
-        is_best_realtime: bool,
-        is_least_crowded: bool,
-    ) -> String {
-        if is_fastest {
-            "Piu veloce".to_owned()
-        } else if is_best_realtime {
-            "Migliori dati RT".to_owned()
-        } else if is_least_crowded {
-            "Meno affollato".to_owned()
-        } else if is_fewest_transfers {
-            "Meno cambi".to_owned()
-        } else if is_recommended {
-            "Consigliato".to_owned()
-        } else {
-            format!("Alternativa {}", index + 1)
-        }
-    }
-
-    fn build_itinerary_badges(
-        index: usize,
-        is_recommended: bool,
-        is_fastest: bool,
-        is_fewest_transfers: bool,
-        is_best_realtime: bool,
-        is_least_crowded: bool,
-        has_canceled_legs: bool,
-    ) -> Vec<String> {
-        let mut badges = Vec::new();
-        if is_recommended {
-            badges.push("Consigliato".to_owned());
-        }
-        if is_fastest {
-            badges.push("Piu veloce".to_owned());
-        }
-        if is_fewest_transfers {
-            badges.push("Meno cambi".to_owned());
-        }
-        if is_best_realtime {
-            badges.push("Migliori dati RT".to_owned());
-        }
-        if is_least_crowded {
-            badges.push("Meno affollato".to_owned());
-        }
-        if has_canceled_legs {
-            badges.push("Contiene CANCELED".to_owned());
-        }
-        if badges.is_empty() {
-            badges.push(format!("Alternativa {}", index + 1));
-        }
-        badges
-    }
-
-fn compare_optional_crowding(left: Option<u16>, right: Option<u16>) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => left.cmp(&right),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn score_itinerary_passive_metrics(legs: &[LegResponse]) -> ItineraryPassiveMetrics {
-    let mut transit_leg_count = 0usize;
-    let mut transit_legs_with_gtfs_rt = 0usize;
-    let mut occupancy_covered_transit_legs = 0usize;
-    let mut crowding_score_total = 0u16;
-    let mut canceled_transit_legs = 0usize;
-
-    for leg in legs {
-        if leg.kind != "transit" {
-            continue;
-        }
-
-        transit_leg_count += 1;
-        if leg.has_gtfs_rt {
-            transit_legs_with_gtfs_rt += 1;
-        }
-        if let Some(score) = leg.occupancy_score {
-            occupancy_covered_transit_legs += 1;
-            crowding_score_total = crowding_score_total.saturating_add(score);
-        }
-        if leg.schedule_relationship.as_deref() == Some("CANCELED") {
-            canceled_transit_legs += 1;
-        }
-    }
-
-    let crowding_score = (occupancy_covered_transit_legs > 0)
-        .then(|| crowding_score_total / occupancy_covered_transit_legs as u16);
-    let crowding_level = passive_occupancy_level(crowding_score, occupancy_covered_transit_legs);
-
-    ItineraryPassiveMetrics {
-        transit_leg_count,
-        transit_legs_with_gtfs_rt,
-        occupancy_covered_transit_legs,
-        crowding_score,
-        crowding_level,
-        canceled_transit_legs,
-        has_canceled_legs: canceled_transit_legs > 0,
-    }
-}
-
-fn passive_occupancy_level(score: Option<u16>, covered_legs: usize) -> &'static str {
-    let Some(score) = score else {
-        return "unknown";
-    };
-    if covered_legs == 0 {
-        return "unknown";
-    }
-
-    if score <= 35 {
-        "low"
-    } else if score <= 70 {
-        "medium"
-    } else {
-        "high"
-    }
-}
-
-fn passive_occupancy_score(
-    occupancy_status: Option<i32>,
-    occupancy_percentage: Option<u32>,
-) -> Option<u16> {
-    if let Some(occupancy_percentage) = occupancy_percentage {
-        return Some(occupancy_percentage.min(150) as u16);
-    }
-
-    occupancy_status.and_then(|value| match vehicle_position::OccupancyStatus::from_i32(value) {
-        Some(vehicle_position::OccupancyStatus::Empty) => Some(0),
-        Some(vehicle_position::OccupancyStatus::ManySeatsAvailable) => Some(20),
-        Some(vehicle_position::OccupancyStatus::FewSeatsAvailable) => Some(45),
-        Some(vehicle_position::OccupancyStatus::StandingRoomOnly) => Some(75),
-        Some(vehicle_position::OccupancyStatus::CrushedStandingRoomOnly) => Some(90),
-        Some(vehicle_position::OccupancyStatus::Full) => Some(100),
-        Some(vehicle_position::OccupancyStatus::NotAcceptingPassengers) => Some(110),
-        Some(vehicle_position::OccupancyStatus::NotBoardable) => Some(120),
-        Some(vehicle_position::OccupancyStatus::NoDataAvailable) => None,
-        None => None,
-    })
-}
-
-fn schedule_relationship_string(value: Option<i32>) -> Option<String> {
-    value.and_then(|value| {
-        trip_descriptor::ScheduleRelationship::from_i32(value)
-            .map(|relationship| relationship.as_str_name().to_owned())
-    })
-}
-
-fn occupancy_status_string(value: Option<i32>) -> Option<String> {
-    value.and_then(|value| {
-        vehicle_position::OccupancyStatus::from_i32(value)
-            .map(|status| status.as_str_name().to_owned())
-    })
 }
 
 fn record_memoized_destination_improvement(
@@ -9357,27 +8880,6 @@ mod tests {
         assert_eq!(directions[0].maneuver, "depart");
         assert_eq!(directions[1].maneuver, "turn-left");
         assert_eq!(directions[2].maneuver, "arrive");
-    }
-
-    #[test]
-    fn build_road_directions_uses_driving_departure_copy() {
-        let mut way_names = HashMap::new();
-        way_names.insert(10, "Tangenziale Est".to_owned());
-
-        let directions = super::build_road_directions(
-            &WalkGeometry {
-                polyline: vec![
-                    test_point(41.9000, 12.5000),
-                    test_point(41.9000, 12.5010),
-                ],
-                segment_way_ids: vec![Some(10)],
-            },
-            &way_names,
-            "",
-        );
-
-        assert_eq!(directions[0].maneuver, "depart");
-        assert!(directions[0].instruction.contains("Parti in auto"));
     }
 
     fn test_stop(global_id: u64, local_id: &str, latitude: f64, longitude: f64) -> StopRecord {

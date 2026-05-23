@@ -32,7 +32,6 @@ use tracing::{info, warn};
 use crate::{
     engine::{PolylinePoint, StopRecord},
     geo::{decode_morton_code, decode_morton_components, morton_code, morton_code_from_components},
-    progress::{progress_bar, progress_percent},
 };
 
 const OSM_HPF_STRATEGY: &str = "osm-pbf-cached-hpf";
@@ -185,12 +184,6 @@ struct HpfWayIndex {
     mmap: Arc<Mmap>,
     record_count: usize,
     cells_offset: usize,
-}
-
-enum HpfCacheLoadState {
-    Hit(HpfCache),
-    Missing,
-    Stale,
 }
 
 #[derive(Clone)]
@@ -1292,7 +1285,6 @@ pub fn build_or_load_hpf(
     snap_tolerance_meters: f64,
     snap_quadratic_kappa_meters: f64,
     search_window: usize,
-    defer_rebuild_on_bootstrap: bool,
     diff_config: Option<HpfDiffConfig>,
 ) -> Result<HpfBuildResult> {
     let metadata = build_cache_metadata(osm_pbf_path, stops, max_distance_meters)?;
@@ -1301,12 +1293,7 @@ pub fn build_or_load_hpf(
     let pbf_replication = read_pbf_replication_anchor(osm_pbf_path).ok();
     let mut cache_hit = true;
 
-    let cache_state = load_cache(&cache_path, &metadata)?;
-    let stale_cache_detected = matches!(cache_state, HpfCacheLoadState::Stale);
-    let mut cache = match cache_state {
-        HpfCacheLoadState::Hit(cache) => Some(cache),
-        HpfCacheLoadState::Missing | HpfCacheLoadState::Stale => None,
-    };
+    let mut cache = load_cache(&cache_path, &metadata)?;
     let mut way_index = if diff_config.is_some() {
         match load_way_index(&way_index_path, &metadata)? {
             Some(index) => Some(Arc::new(index)),
@@ -1317,16 +1304,6 @@ pub fn build_or_load_hpf(
     };
 
     if cache.is_none() || (diff_config.is_some() && way_index.is_none()) {
-        if defer_rebuild_on_bootstrap && stale_cache_detected {
-            info!(
-                cache = %cache_path.display(),
-                "stale HPF cache detected at bootstrap, deferring rebuild and falling back to stop-level coordinate connectors"
-            );
-            bail!(
-                "HPF cache is stale at bootstrap and rebuild was deferred"
-            );
-        }
-
         let (node_coordinates, ways) = load_walkable_osm(osm_pbf_path)?;
         if cache.is_none() {
             let built_cache = build_hpf_cache_from_data(
@@ -1427,26 +1404,17 @@ fn build_hpf_cache_from_data(
     );
 
     let max_snap_distance_meters = max_distance_meters.min(250.0).max(80.0);
-    let mut stop_anchors = Vec::with_capacity(stops.len());
-    for (stop_index, stop) in stops.iter().enumerate() {
-        stop_anchors.push(snap_stop_to_graph(
-            stop,
-            &graph_index,
-            &graph_coordinates,
-            max_snap_distance_meters,
-        ));
-        let completed = stop_index + 1;
-        if completed % 512 == 0 || completed == stops.len() {
-            info!(
-                phase = "hpf-anchor-stops",
-                progress = %progress_bar(completed, stops.len()),
-                percent = progress_percent(completed, stops.len()),
-                completed,
-                total = stops.len(),
-                "HPF stop anchor progress"
-            );
-        }
-    }
+    let stop_anchors = stops
+        .iter()
+        .map(|stop| {
+            snap_stop_to_graph(
+                stop,
+                &graph_index,
+                &graph_coordinates,
+                max_snap_distance_meters,
+            )
+        })
+        .collect::<Vec<_>>();
     let anchored_stops = stop_anchors
         .iter()
         .filter(|anchor| anchor.is_some())
@@ -1460,7 +1428,6 @@ fn build_hpf_cache_from_data(
 
     let mut graph_to_hpf = HashMap::<usize, u32>::new();
     let mut nodes = Vec::<(usize, HpfNode)>::new();
-    let graph_total = best_distances.len().max(1);
     for (graph_index, best_distance) in best_distances.iter().copied().enumerate() {
         let root_stop_index = roots[graph_index];
         if !best_distance.is_finite()
@@ -1482,18 +1449,6 @@ fn build_hpf_cache_from_data(
                 cost_meters: best_distance as f32,
             },
         ));
-
-        let completed = graph_index + 1;
-        if completed % 16384 == 0 || completed == best_distances.len() {
-            info!(
-                phase = "hpf-node-pack",
-                progress = %progress_bar(completed, graph_total),
-                percent = progress_percent(completed, graph_total),
-                completed,
-                total = graph_total,
-                "HPF node packing progress"
-            );
-        }
     }
 
     nodes.sort_by(|left, right| {
@@ -1706,9 +1661,9 @@ fn snap_stop_to_graph(
     best_anchor.filter(|anchor| anchor.snap_distance_meters <= max_snap_distance_meters)
 }
 
-fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<HpfCacheLoadState> {
+fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<Option<HpfCache>> {
     if !cache_path.exists() {
-        return Ok(HpfCacheLoadState::Missing);
+        return Ok(None);
     }
 
     let file = File::open(cache_path)
@@ -1718,15 +1673,15 @@ fn load_cache(cache_path: &Path, metadata: &HpfCacheMetadata) -> Result<HpfCache
         Ok(cache) => cache,
         Err(error) => {
             warn!(%error, cache = %cache_path.display(), "invalid HPF cache, rebuilding");
-            return Ok(HpfCacheLoadState::Stale);
+            return Ok(None);
         }
     };
 
     if cache.metadata == *metadata {
-        Ok(HpfCacheLoadState::Hit(cache))
+        Ok(Some(cache))
     } else {
         info!(cache = %cache_path.display(), "HPF cache metadata mismatch, rebuilding");
-        Ok(HpfCacheLoadState::Stale)
+        Ok(None)
     }
 }
 
