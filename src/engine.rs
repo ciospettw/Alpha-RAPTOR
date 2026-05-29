@@ -91,6 +91,7 @@ struct RawEngineManifest {
     dvni: Option<RawDvniConfig>,
     hpf: Option<RawHpfConfig>,
     osm_diff: Option<RawOsmDiffConfig>,
+    #[serde(default)]
     feeds: Vec<RawFeedConfig>,
 }
 
