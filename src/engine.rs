@@ -5196,8 +5196,9 @@ fn probe_remote_static_gtfs_version(
     feed_id: &str,
     url: &str,
 ) -> Result<RemoteStaticGtfsVersionMetadata> {
-    let response = client
-        .head(url)
+    let builder = client.head(url);
+    let builder = crate::control::maybe_add_internal_token_blocking(builder, url)?;
+    let response = builder
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| {
@@ -5346,8 +5347,9 @@ fn sync_remote_static_gtfs(
         }
     }
 
-    let response = client
-        .get(url)
+    let builder = client.get(url);
+    let builder = crate::control::maybe_add_internal_token_blocking(builder, url)?;
+    let response = builder
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download static GTFS feed {feed_id} from {url}"));
