@@ -1,4 +1,5 @@
 mod cold_storage;
+mod control;
 mod engine;
 mod geo;
 mod hpf;

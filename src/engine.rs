@@ -6077,7 +6077,7 @@ fn write_sanitized_gtfs_zip(feed: &FeedConfig) -> Result<PathBuf> {
             )
         })?;
         let name = entry.name().to_owned();
-        let mut options = zip::write::FileOptions::default()
+        let mut options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
             .compression_method(entry.compression());
         if let Some(mode) = entry.unix_mode() {
             options = options.unix_permissions(mode);

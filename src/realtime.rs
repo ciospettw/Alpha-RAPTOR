@@ -286,6 +286,14 @@ impl RealtimeStore {
         })
     }
 
+    pub fn has_trip_update(&self, trip_index: usize) -> bool {
+        self.trip_metrics.contains_key(&trip_index)
+    }
+
+    pub fn is_trip_canceled(&self, trip_index: usize) -> bool {
+        self.canceled_trips.contains_key(&trip_index)
+    }
+
     pub fn snapshot(&self, static_data: &StaticData, limit: usize) -> RealtimeDebugSnapshot {
         let state = self.state.lock().expect("realtime state poisoned").clone();
         let mut delay_samples = Vec::new();
