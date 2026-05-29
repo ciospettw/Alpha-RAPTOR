@@ -25,7 +25,8 @@ COPY public ./public
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release --locked \
+    find src -type f -name "*.rs" -exec touch {} + \
+    && cargo build --release --locked \
     && cp /app/target/release/alpha_raptor_engine /usr/local/bin/alpha_raptor_engine
 
 COPY alpha-raptor.toml ./alpha-raptor.toml
