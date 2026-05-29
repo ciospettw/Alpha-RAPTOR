@@ -77,7 +77,7 @@ pub struct FeedConfig {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawEngineManifest {
     osm_pbf: Option<String>,
     osm_pbf_allow_invalid_tls: Option<bool>,
@@ -94,13 +94,13 @@ struct RawEngineManifest {
     feeds: Vec<RawFeedConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawDvniConfig {
     knn_candidates: Option<usize>,
     max_walk_radius_meters: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawHpfConfig {
     max_distance_meters: Option<f64>,
     snap_tolerance_meters: Option<f64>,
@@ -108,7 +108,7 @@ struct RawHpfConfig {
     search_window: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawOsmDiffConfig {
     state_url: String,
     diff_base_url: Option<String>,
@@ -116,7 +116,7 @@ struct RawOsmDiffConfig {
     allow_invalid_tls: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawFeedConfig {
     id: String,
     static_gtfs: String,
@@ -126,6 +126,29 @@ struct RawFeedConfig {
     vehicle_positions_url: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingDescriptor {
+    static_feeds: Vec<RoutingStaticFeed>,
+    realtime_feeds: Vec<RoutingRealtimeFeed>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingStaticFeed {
+    id: String,
+    feed_id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingRealtimeFeed {
+    feed_id: String,
+    trip_updates_url: Option<String>,
+    vehicle_positions_url: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -1060,8 +1083,54 @@ impl EngineConfig {
     ) -> Result<Self> {
         let manifest_body = fs::read_to_string(&manifest_path)
             .with_context(|| format!("unable to read manifest {}", manifest_path.display()))?;
-        let manifest: RawEngineManifest = toml::from_str(&manifest_body)
+        let mut manifest: RawEngineManifest = toml::from_str(&manifest_body)
             .with_context(|| format!("invalid manifest TOML at {}", manifest_path.display()))?;
+
+        if let Some(descriptor_url) = crate::control::descriptor_url_from_env() {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .context("failed to build reqwest client for descriptor")?;
+            
+            let builder = client.get(&descriptor_url);
+            let builder = crate::control::maybe_add_internal_token_blocking(builder, &descriptor_url)?;
+            match builder.send() {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<RoutingDescriptor>() {
+                        Ok(descriptor) => {
+                            let mut new_feeds = Vec::new();
+                            for static_feed in descriptor.static_feeds {
+                                let mut feed_config = RawFeedConfig {
+                                    id: static_feed.feed_id.clone(),
+                                    static_gtfs: static_feed.url,
+                                    static_gtfs_allow_invalid_tls: false,
+                                    trip_updates_url: None,
+                                    vehicle_positions_url: None,
+                                    depends_on: Vec::new(),
+                                };
+                                
+                                if let Some(rt_feed) = descriptor.realtime_feeds.iter().find(|rt| rt.feed_id == static_feed.feed_id) {
+                                    feed_config.trip_updates_url = rt_feed.trip_updates_url.clone();
+                                    feed_config.vehicle_positions_url = rt_feed.vehicle_positions_url.clone();
+                                }
+                                
+                                new_feeds.push(feed_config);
+                            }
+                            manifest.feeds = new_feeds;
+                            
+                            if let Ok(toml_string) = toml::to_string(&manifest) {
+                                let generated_path = workspace_root.join(".alpha-raptor").join("generated");
+                                let _ = std::fs::create_dir_all(&generated_path);
+                                let _ = std::fs::write(generated_path.join("busone-descriptor.toml"), toml_string);
+                            }
+                        }
+                        Err(err) => tracing::warn!(%err, "failed to parse descriptor JSON"),
+                    }
+                }
+                Ok(response) => tracing::warn!("failed to fetch descriptor: HTTP {}", response.status()),
+                Err(err) => tracing::warn!(%err, "failed to fetch descriptor"),
+            }
+        }
         if manifest.feeds.is_empty() {
             bail!(
                 "manifest {} does not define any feeds",
