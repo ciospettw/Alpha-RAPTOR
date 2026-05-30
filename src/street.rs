@@ -84,7 +84,7 @@ impl StreetMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct StreetRoutePath {
     pub duration_seconds: u32,
     pub distance_meters: f64,

@@ -167,6 +167,7 @@ pub struct Engine {
     profile_cache: ProfileCache,
     walk_way_names: Arc<HashMap<i64, String>>,
     hpf: Option<HolographicPedestrianForest>,
+    pub street_router: Option<Arc<crate::street::StreetRouter>>,
 }
 
 #[derive(Clone)]
@@ -1598,6 +1599,14 @@ impl Engine {
             "dvni+stop-knn-fallback"
         };
 
+        let street_router_started = Instant::now();
+        let street_router = crate::street::build_or_load_street_router(
+            &config.osm_pbf_path,
+            &runtime_cache_dir(&config.workspace_root, "osm"),
+            config.osm_diff.clone(),
+        ).map_err(|e| warn!(%e, "failed to load street router")).ok().map(Arc::new);
+        let _street_router_ms = street_router_started.elapsed().as_millis();
+
         let timings = BuildTimings {
             hpf_ms: hpf_millis,
             ..timings
@@ -1697,6 +1706,7 @@ impl Engine {
             profile_cache: ProfileCache::new(),
             walk_way_names,
             hpf,
+            street_router,
         })
     }
 
