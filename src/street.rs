@@ -1625,8 +1625,13 @@ fn load_cache(
 
     let file = File::open(cache_path)
         .with_context(|| format!("unable to open street cache {}", cache_path.display()))?;
-    let cache: StreetGraphCache = bincode::deserialize_from(BufReader::new(file))
-        .with_context(|| format!("unable to deserialize street cache {}", cache_path.display()))?;
+    let cache: StreetGraphCache = match bincode::deserialize_from(BufReader::new(file)) {
+        Ok(cache) => cache,
+        Err(e) => {
+            warn!(cache = %cache_path.display(), error = %e, "unable to deserialize street cache, rebuilding");
+            return Ok(None);
+        }
+    };
     if cache.metadata == *metadata {
         Ok(Some(cache))
     } else {
