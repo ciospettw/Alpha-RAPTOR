@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 arc-swap = "1.7"
-axum = { version = "0.8", features = ["http1", "json", "query", "tokio"] }
+axum = { version = "0.8", features = ["http1", "json", "query", "tokio", "ws"] }
+futures = "0.3"
 bincode = "1.3"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6.1"

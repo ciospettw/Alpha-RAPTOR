@@ -6,6 +6,7 @@ mod control;
 mod engine;
 mod geo;
 mod hpf;
+mod live;
 mod profile_cache;
 mod progress;
 mod realtime;
@@ -29,21 +30,28 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::engine::{Engine, EngineConfig, QueryRequest};
+use crate::live::{ActiveDependencyMatrix, ClientRegistry, live_handler, spawn_healing_worker};
+use dashmap::DashMap;
 
 #[derive(Clone)]
-struct AppState {
-    engine: SharedEngine,
+pub struct AppState {
+    pub engine: SharedEngine,
+    pub adm: ActiveDependencyMatrix,
+    pub client_registry: ClientRegistry,
 }
 
 #[derive(Clone)]
-struct SharedEngine {
+pub struct SharedEngine {
     current: Arc<ArcSwap<Engine>>,
+    pub trip_events: Arc<tokio::sync::broadcast::Sender<Vec<usize>>>,
 }
 
 impl SharedEngine {
     fn new(engine: Engine) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(1024);
         Self {
             current: Arc::new(ArcSwap::from_pointee(engine)),
+            trip_events: Arc::new(tx),
         }
     }
 
@@ -112,7 +120,7 @@ async fn main() -> Result<()> {
 
     let realtime_refresh_started = std::time::Instant::now();
     match engine.refresh_realtime().await {
-        Ok(snapshot) => info!(
+        Ok((snapshot, _)) => info!(
             shadow_delta_count = snapshot.shadow_delta_count,
             vehicle_count = snapshot.vehicle_count,
             realtime_refresh_ms = realtime_refresh_started.elapsed().as_millis(),
@@ -127,6 +135,17 @@ async fn main() -> Result<()> {
     spawn_hpf_overlay_refresh(shared_engine.clone());
     spawn_street_overlay_refresh(shared_engine.clone());
 
+    let adm: ActiveDependencyMatrix = Arc::new(DashMap::new());
+    let client_registry: ClientRegistry = Arc::new(DashMap::new());
+
+    let app_state = AppState {
+        engine: shared_engine.clone(),
+        adm,
+        client_registry,
+    };
+
+    spawn_healing_worker(app_state.clone());
+
     let public_dir = workspace_root.join("public");
     let app = Router::new()
         .route("/", get(index))
@@ -137,11 +156,10 @@ async fn main() -> Result<()> {
         .route("/api/street", get(run_street_query))
         .route("/api/realtime", get(realtime_snapshot))
         .route("/api/realtime/refresh", post(refresh_realtime))
+        .route("/live", get(live_handler))
         .nest_service("/assets", ServeDir::new(public_dir))
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState {
-            engine: shared_engine.clone(),
-        });
+        .with_state(app_state);
 
     info!(address = %bind, "Alpha-RAPTOR debug server listening");
     info!(
@@ -197,8 +215,15 @@ fn spawn_realtime_refresh(engine: SharedEngine) {
             let refresh_every = Duration::from_secs(engine.current().config.refresh_interval_secs);
             tokio::time::sleep(refresh_every).await;
             let current_engine = engine.current();
-            if let Err(error) = current_engine.refresh_realtime().await {
-                warn!(%error, "background realtime refresh failed");
+            match current_engine.refresh_realtime().await {
+                Ok((_, changed_trip_indices)) => {
+                    if !changed_trip_indices.is_empty() {
+                        let _ = engine.trip_events.send(changed_trip_indices);
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "background realtime refresh failed");
+                }
             }
         }
     });
@@ -381,7 +406,7 @@ async fn realtime_snapshot(
 
 async fn refresh_realtime(State(state): State<AppState>) -> impl IntoResponse {
     match state.engine.current().refresh_realtime().await {
-        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Ok((snapshot, _)) => (StatusCode::OK, Json(snapshot)).into_response(),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
     }
 }

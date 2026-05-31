@@ -563,7 +563,7 @@ pub struct StaticDiffSummary {
     pub total_entities: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StopSearchResult {
     pub global_id: u64,
     pub feed_id: String,
@@ -574,6 +574,22 @@ pub struct StopSearchResult {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub is_virtual: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IntermediateStopResult {
+    pub global_id: u64,
+    pub feed_id: String,
+    pub local_id: String,
+    pub id: String,
+    pub code: Option<String>,
+    pub name: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub is_virtual: bool,
+    pub arrival_time: Option<String>,
+    pub departure_time: Option<String>,
+    pub delay_seconds: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -762,9 +778,9 @@ struct RoundMetrics {
     destination_bound_prunes: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LegResponse {
-    pub kind: &'static str,
+    pub kind: String,
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
@@ -782,7 +798,7 @@ pub struct LegResponse {
     pub headsign: Option<String>,
     pub walk_distance_meters: Option<f64>,
     pub delay_applied_seconds: Option<i32>,
-    pub intermediate_stops: Vec<StopSearchResult>,
+    pub intermediate_stops: Vec<IntermediateStopResult>,
     pub polyline: Vec<PolylinePoint>,
     pub walk_directions: Vec<WalkDirection>,
 }
@@ -795,7 +811,7 @@ pub struct DeferredHydrationResponse {
 
 #[derive(Debug, Serialize)]
 pub struct DeferredLegRef {
-    pub kind: &'static str,
+    pub kind: String,
     pub departure_time: String,
     pub arrival_time: String,
     pub duration_seconds: i32,
@@ -837,15 +853,15 @@ pub struct TripHydration {
     pub headsign: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolylinePoint {
     pub lat: f64,
     pub lon: f64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalkDirection {
-    pub maneuver: &'static str,
+    pub maneuver: String,
     pub instruction: String,
     pub street_name: Option<String>,
     pub distance_meters: f64,
@@ -854,9 +870,9 @@ pub struct WalkDirection {
 }
 
 #[derive(Clone, Debug, Default)]
-struct WalkGeometry {
-    polyline: Vec<PolylinePoint>,
-    segment_way_ids: Vec<Option<i64>>,
+pub struct WalkGeometry {
+    pub polyline: Vec<PolylinePoint>,
+    pub segment_way_ids: Vec<Option<i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1724,7 +1740,7 @@ impl Engine {
         })
     }
 
-    pub async fn refresh_realtime(&self) -> Result<RealtimeDebugSnapshot> {
+    pub async fn refresh_realtime(&self) -> Result<(RealtimeDebugSnapshot, Vec<usize>)> {
         let refresh = self
             .realtime
             .refresh(&self.static_data, &self.config)
@@ -1746,7 +1762,7 @@ impl Engine {
             return Err(anyhow!(error));
         }
 
-        Ok(refresh.snapshot)
+        Ok((refresh.snapshot, refresh.changed_trip_indices))
     }
 
     pub fn stats(&self) -> EngineStats {
@@ -4241,7 +4257,7 @@ impl Engine {
         );
 
         Ok(LegResponse {
-            kind: "walk",
+            kind: "walk".to_string(),
             departure_time: format_service_time(service_date, *departure_secs),
             arrival_time: format_service_time(service_date, *arrival_secs),
             duration_seconds: *arrival_secs - *departure_secs,
@@ -4284,7 +4300,7 @@ impl Engine {
                 let from_result = self.query_stop_result(from_stop, overlay);
                 let to_result = self.query_stop_result(to_stop, overlay);
                 Ok(LegResponse {
-                    kind: "walk",
+                    kind: "walk".to_string(),
                     departure_time: format_service_time(service_date, departure_secs),
                     arrival_time: format_service_time(service_date, arrival_secs),
                     duration_seconds: duration_secs,
@@ -4327,9 +4343,9 @@ impl Engine {
                 let scheduled_departure = trip.stop_times[board_pos].departure_secs;
                 let delay_applied_seconds = departure_secs - scheduled_departure;
                 let has_realtime_update = self.realtime.has_trip_update(trip_index);
-                let intermediate_stops = self.trip_intermediate_stops(trip, board_pos, alight_pos);
+                let intermediate_stops = self.trip_intermediate_stops(service_date, trip, board_pos, alight_pos);
                 Ok(LegResponse {
-                    kind: "transit",
+                    kind: "transit".to_string(),
                     departure_time: format_service_time(service_date, departure_secs),
                     arrival_time: format_service_time(service_date, arrival_secs),
                     duration_seconds: arrival_secs - departure_secs,
@@ -4357,13 +4373,30 @@ impl Engine {
 
     fn trip_intermediate_stops(
         &self,
+        service_date: NaiveDate,
         trip: &TripRecord,
         board_pos: usize,
         alight_pos: usize,
-    ) -> Vec<StopSearchResult> {
+    ) -> Vec<IntermediateStopResult> {
         intermediate_trip_stop_times(trip, board_pos, alight_pos)
             .iter()
-            .map(|stop_time| self.stop_result(stop_time.stop_index))
+            .map(|stop_time| {
+                let stop_res = self.stop_result(stop_time.stop_index);
+                IntermediateStopResult {
+                    global_id: stop_res.global_id,
+                    feed_id: stop_res.feed_id,
+                    local_id: stop_res.local_id,
+                    id: stop_res.id,
+                    code: stop_res.code,
+                    name: stop_res.name,
+                    latitude: stop_res.latitude,
+                    longitude: stop_res.longitude,
+                    is_virtual: stop_res.is_virtual,
+                    arrival_time: Some(format_service_time(service_date, stop_time.arrival_secs)),
+                    departure_time: Some(format_service_time(service_date, stop_time.departure_secs)),
+                    delay_seconds: None,
+                }
+            })
             .collect()
     }
 
@@ -4580,7 +4613,17 @@ impl Engine {
             }
             for stop in &leg.intermediate_stops {
                 if stop_seen.insert(stop.global_id) {
-                    entities.stops.push(stop.clone());
+                    entities.stops.push(StopSearchResult {
+                        global_id: stop.global_id,
+                        feed_id: stop.feed_id.clone(),
+                        local_id: stop.local_id.clone(),
+                        id: stop.id.clone(),
+                        code: stop.code.clone(),
+                        name: stop.name.clone(),
+                        latitude: stop.latitude,
+                        longitude: stop.longitude,
+                        is_virtual: stop.is_virtual,
+                    });
                 }
             }
 
@@ -4629,7 +4672,7 @@ impl Engine {
                 .collect();
 
             deferred_legs.push(DeferredLegRef {
-                kind: leg.kind,
+                kind: leg.kind.clone(),
                 departure_time: leg.departure_time.clone(),
                 arrival_time: leg.arrival_time.clone(),
                 duration_seconds: leg.duration_seconds,
@@ -6180,7 +6223,8 @@ fn write_sanitized_gtfs_zip(feed: &FeedConfig) -> Result<PathBuf> {
     for index in 0..source_zip.len() {
         let mut entry = source_zip.by_index(index).with_context(|| {
             format!(
-                "unable to read entry #{index} from GTFS zip for feed {}",
+                "unable to read entry #{} from GTFS zip for feed {}",
+                index,
                 feed.id
             )
         })?;
@@ -7268,7 +7312,7 @@ fn append_walk_geometry(target: &mut WalkGeometry, next: &WalkGeometry) {
     target.segment_way_ids.extend(next_segment_way_ids);
 }
 
-fn build_walk_directions(
+pub fn build_walk_directions(
     geometry: &WalkGeometry,
     way_names: &HashMap<i64, String>,
     destination_name: &str,
@@ -7285,11 +7329,8 @@ fn build_walk_directions(
         .map(str::to_owned);
 
     let mut directions = vec![WalkDirection {
-        maneuver: "depart",
-        instruction: match start_street_name.as_ref() {
-            Some(street_name) => format!("Parti a piedi su {street_name}"),
-            None => "Parti a piedi".to_owned(),
-        },
+        maneuver: "depart".to_string(),
+        instruction: "Dirigiti verso la fermata".to_string(),
         street_name: start_street_name,
         distance_meters: 0.0,
         lat: geometry.polyline[0].lat,
@@ -7337,8 +7378,8 @@ fn build_walk_directions(
         };
 
         directions.push(WalkDirection {
-            maneuver,
-            instruction,
+            maneuver: maneuver.to_string(),
+            instruction: format!("Cammina su {}", street_name.as_deref().unwrap_or("strada")),
             street_name,
             distance_meters: instruction_distance,
             lat: geometry.polyline[pivot].lat,
@@ -7349,12 +7390,8 @@ fn build_walk_directions(
 
     let destination_label = destination_name.trim();
     directions.push(WalkDirection {
-        maneuver: "arrive",
-        instruction: if destination_label.is_empty() {
-            "Arrivo a destinazione".to_owned()
-        } else {
-            format!("Arrivo a {destination_label}")
-        },
+        maneuver: "arrive".to_string(),
+        instruction: "Sei arrivato a destinazione".to_string(),
         street_name: None,
         distance_meters: *cumulative_distances.last().unwrap_or(&0.0),
         lat: geometry.polyline.last().map(|point| point.lat).unwrap_or(0.0),

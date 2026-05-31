@@ -90,7 +90,9 @@ pub struct StreetRoutePath {
     pub distance_meters: f64,
     pub polyline: Vec<PolylinePoint>,
     pub segment_way_ids: Vec<Option<i64>>,
-    way_names: Arc<HashMap<i64, String>>,
+    #[serde(skip)]
+    pub way_names: Arc<HashMap<i64, String>>,
+    pub walk_directions: Vec<crate::engine::WalkDirection>,
     pub source_snap_distance_meters: f64,
     pub destination_snap_distance_meters: f64,
     pub explored_forward_nodes: usize,
@@ -488,12 +490,24 @@ impl StreetGraph {
             (connector_distance / self.mode.connector_speed_mps()).ceil() as u32
         };
 
+        let way_names = Arc::new(self.merged_way_names(overlay.as_ref()));
+        let walk_geometry = crate::engine::WalkGeometry {
+            polyline: polyline.clone(),
+            segment_way_ids: segment_way_ids.clone(),
+        };
+        let walk_directions = crate::engine::build_walk_directions(
+            &walk_geometry,
+            &way_names,
+            "Destinazione",
+        );
+
         Ok(StreetRoutePath {
             duration_seconds: best_cost.saturating_add(connector_duration),
             distance_meters: graph_distance_meters + connector_distance,
             polyline,
             segment_way_ids,
-            way_names: Arc::new(self.merged_way_names(overlay.as_ref())),
+            way_names,
+            walk_directions,
             source_snap_distance_meters: source.distance_meters,
             destination_snap_distance_meters: target.distance_meters,
             explored_forward_nodes,
