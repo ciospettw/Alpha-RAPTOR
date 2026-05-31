@@ -33,7 +33,7 @@ use crate::{
     progress::{progress_bar, progress_percent},
 };
 
-const STREET_GRAPH_SCHEMA_VERSION: u32 = 2;
+const STREET_GRAPH_SCHEMA_VERSION: u32 = 3;
 const STREET_ROUTING_STRATEGY: &str = "flat-osm-bidirectional";
 const WALK_CONNECTOR_SPEED_MPS: f64 = 1.35;
 const DRIVE_CONNECTOR_SPEED_MPS: f64 = 8.33;
@@ -90,7 +90,7 @@ pub struct StreetRoutePath {
     pub distance_meters: f64,
     pub polyline: Vec<PolylinePoint>,
     pub segment_way_ids: Vec<Option<i64>>,
-    pub way_names: Arc<HashMap<i64, String>>,
+    way_names: Arc<HashMap<i64, String>>,
     pub source_snap_distance_meters: f64,
     pub destination_snap_distance_meters: f64,
     pub explored_forward_nodes: usize,
@@ -132,12 +132,13 @@ pub struct StreetRouter {
 #[derive(Clone)]
 struct StreetGraph {
     mode: StreetMode,
-    coordinates: Arc<Vec<(f64, f64)>>,
+    coordinates: Arc<Vec<Coordinate>>,
     node_lookup: Arc<HashMap<i64, usize>>,
     node_offsets: Arc<Vec<u32>>,
     forward_edges: Arc<Vec<StreetEdge>>,
     reverse_node_offsets: Arc<Vec<u32>>,
     reverse_edges: Arc<Vec<StreetEdge>>,
+    way_osm_ids: Arc<Vec<i64>>,
     way_names: Arc<HashMap<i64, String>>,
     index: Arc<RTree<IndexedPoint>>,
     overlay_runtime: Arc<ArcSwap<StreetOverlayRuntime>>,
@@ -193,7 +194,7 @@ struct StreetOverlayWay {
     way_id: i64,
     name: Option<String>,
     node_refs: Vec<i64>,
-    coordinates: Vec<(f64, f64)>,
+    coordinates: Vec<Coordinate>,
     tags: HashMap<String, String>,
 }
 
@@ -229,27 +230,47 @@ struct OscWayChange {
     action: OscAction,
     way_id: i64,
     node_refs: Vec<i64>,
-    coordinates: Vec<(f64, f64)>,
+    coordinates: Vec<Coordinate>,
     tags: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Coordinate {
+    pub lat: i32,
+    pub lon: i32,
+}
+
+impl Coordinate {
+    pub fn new(lat: f64, lon: f64) -> Self {
+        Self {
+            lat: (lat * 1_000_000.0).round() as i32,
+            lon: (lon * 1_000_000.0).round() as i32,
+        }
+    }
+
+    pub fn as_f64(&self) -> (f64, f64) {
+        (self.lat as f64 / 1_000_000.0, self.lon as f64 / 1_000_000.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct StreetEdge {
     to: u32,
-    duration_secs: u32,
+    duration_secs: u16,
     distance_meters: f32,
-    way_id: i64,
+    way_id: u32,
 }
 
 #[derive(Serialize, Deserialize)]
 struct StreetGraphCache {
     metadata: StreetGraphCacheMetadata,
-    coordinates: Vec<(f64, f64)>,
+    coordinates: Vec<Coordinate>,
     node_osm_ids: Vec<i64>,
     node_offsets: Vec<u32>,
     forward_edges: Vec<StreetEdge>,
     reverse_node_offsets: Vec<u32>,
     reverse_edges: Vec<StreetEdge>,
+    way_osm_ids: Vec<i64>,
     way_names: HashMap<i64, String>,
 }
 
@@ -270,14 +291,14 @@ struct SnapResult {
 #[derive(Clone, Copy)]
 struct ForwardParent {
     previous: usize,
-    way_id: i64,
+    way_id: u32,
     distance_meters: f32,
 }
 
 #[derive(Clone, Copy)]
 struct BackwardParent {
     next: usize,
-    way_id: i64,
+    way_id: u32,
     distance_meters: f32,
 }
 
@@ -312,12 +333,12 @@ impl Ord for HeapState {
 
 #[derive(Clone)]
 struct IndexedPoint {
-    index: usize,
-    point: [f64; 2],
+    index: u32,
+    point: [f32; 2],
 }
 
 impl RTreeObject for IndexedPoint {
-    type Envelope = AABB<[f64; 2]>;
+    type Envelope = AABB<[f32; 2]>;
 
     fn envelope(&self) -> Self::Envelope {
         AABB::from_point(self.point)
@@ -325,7 +346,7 @@ impl RTreeObject for IndexedPoint {
 }
 
 impl PointDistance for IndexedPoint {
-    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+    fn distance_2(&self, point: &[f32; 2]) -> f32 {
         let dx = self.point[0] - point[0];
         let dy = self.point[1] - point[1];
         (dx * dx) + (dy * dy)
@@ -407,9 +428,9 @@ impl StreetGraph {
                 .coordinates
                 .iter()
                 .enumerate()
-                .map(|(index, (lat, lon))| IndexedPoint {
-                    index,
-                    point: [*lon, *lat],
+                .map(|(index, coord)| IndexedPoint {
+                    index: index as u32,
+                    point: [(coord.lon as f32) / 1_000_000.0, (coord.lat as f32) / 1_000_000.0],
                 })
                 .collect(),
         );
@@ -422,6 +443,7 @@ impl StreetGraph {
             forward_edges: Arc::new(cache.forward_edges),
             reverse_node_offsets: Arc::new(cache.reverse_node_offsets),
             reverse_edges: Arc::new(cache.reverse_edges),
+            way_osm_ids: Arc::new(cache.way_osm_ids),
             way_names: Arc::new(cache.way_names),
             index: Arc::new(index),
             overlay_runtime: Arc::new(ArcSwap::from_pointee(empty_overlay_runtime(
@@ -643,28 +665,28 @@ impl StreetGraph {
         overlay: &StreetOverlayRuntime,
     ) -> Result<SnapResult> {
         let mut best = None::<SnapResult>;
-        for candidate in self.index.nearest_neighbor_iter(&[lon, lat]).take(SNAP_CANDIDATES) {
-            let (candidate_lat, candidate_lon) = self.coordinates[candidate.index];
+        for candidate in self.index.nearest_neighbor_iter(&[lon as f32, lat as f32]).take(SNAP_CANDIDATES) {
+            let (candidate_lat, candidate_lon) = self.coordinates[candidate.index as usize].as_f64();
             let distance_meters = haversine_meters(lat, lon, candidate_lat, candidate_lon);
             match best {
                 Some(current) if current.distance_meters <= distance_meters => {}
                 _ => {
                     best = Some(SnapResult {
-                        node_index: candidate.index,
+                        node_index: candidate.index as usize,
                         distance_meters,
                     })
                 }
             }
         }
 
-        for candidate in overlay.index.nearest_neighbor_iter(&[lon, lat]).take(SNAP_CANDIDATES) {
-            let (candidate_lat, candidate_lon) = self.coordinate_for_node(candidate.index, overlay);
+        for candidate in overlay.index.nearest_neighbor_iter(&[lon as f32, lat as f32]).take(SNAP_CANDIDATES) {
+            let (candidate_lat, candidate_lon) = self.coordinate_for_node(candidate.index as usize, overlay);
             let distance_meters = haversine_meters(lat, lon, candidate_lat, candidate_lon);
             match best {
                 Some(current) if current.distance_meters <= distance_meters => {}
                 _ => {
                     best = Some(SnapResult {
-                        node_index: candidate.index,
+                        node_index: candidate.index as usize,
                         distance_meters,
                     })
                 }
@@ -749,7 +771,7 @@ impl StreetGraph {
                 }
 
                 self.for_each_forward_edge(overlay, state.node_index, |edge| {
-                    let candidate_cost = state.cost_secs.saturating_add(edge.duration_secs);
+                    let candidate_cost = state.cost_secs.saturating_add(edge.duration_secs as u32);
                     if candidate_cost >= best_cost {
                         return;
                     }
@@ -795,7 +817,7 @@ impl StreetGraph {
                 }
 
                 self.for_each_reverse_edge(overlay, state.node_index, |edge| {
-                    let candidate_cost = state.cost_secs.saturating_add(edge.duration_secs);
+                    let candidate_cost = state.cost_secs.saturating_add(edge.duration_secs as u32);
                     if candidate_cost >= best_cost {
                         return;
                     }
@@ -859,7 +881,8 @@ impl StreetGraph {
                 .copied()
                 .ok_or_else(|| anyhow!("incomplete forward street path reconstruction"))?;
             path_nodes.push(parent.previous);
-            path_way_ids.push(Some(parent.way_id));
+            let original_way_id = if parent.way_id == u32::MAX { None } else { Some(self.way_osm_ids[parent.way_id as usize]) };
+            path_way_ids.push(original_way_id);
             graph_distance_meters += parent.distance_meters as f64;
             cursor = parent.previous;
         }
@@ -873,7 +896,8 @@ impl StreetGraph {
                 .copied()
                 .ok_or_else(|| anyhow!("incomplete backward street path reconstruction"))?;
             path_nodes.push(parent.next);
-            path_way_ids.push(Some(parent.way_id));
+            let original_way_id = if parent.way_id == u32::MAX { None } else { Some(self.way_osm_ids[parent.way_id as usize]) };
+            path_way_ids.push(original_way_id);
             graph_distance_meters += parent.distance_meters as f64;
             cursor = parent.next;
         }
@@ -889,7 +913,7 @@ impl StreetGraph {
     ) {
         if node_index < self.coordinates.len() {
             for edge in edge_slice(node_index, &self.node_offsets, &self.forward_edges) {
-                if !overlay.blocked_way_ids.contains(&edge.way_id) {
+                if !overlay.blocked_way_ids.contains(&self.way_osm_ids[edge.way_id as usize]) {
                     apply(edge);
                 }
             }
@@ -909,7 +933,7 @@ impl StreetGraph {
     ) {
         if node_index < self.coordinates.len() {
             for edge in edge_slice(node_index, &self.reverse_node_offsets, &self.reverse_edges) {
-                if !overlay.blocked_way_ids.contains(&edge.way_id) {
+                if !overlay.blocked_way_ids.contains(&self.way_osm_ids[edge.way_id as usize]) {
                     apply(edge);
                 }
             }
@@ -923,13 +947,13 @@ impl StreetGraph {
 
     fn coordinate_for_node(&self, node_index: usize, overlay: &StreetOverlayRuntime) -> (f64, f64) {
         if node_index < self.coordinates.len() {
-            self.coordinates[node_index]
+            self.coordinates[node_index].as_f64()
         } else {
             overlay
                 .nodes
                 .get(node_index.saturating_sub(self.coordinates.len()))
                 .map(|node| node.coordinate)
-                .unwrap_or_else(|| self.coordinates.last().copied().unwrap_or((0.0, 0.0)))
+                .unwrap_or_else(|| self.coordinates.last().map(|c| c.as_f64()).unwrap_or((0.0, 0.0)))
         }
     }
 
@@ -1044,8 +1068,8 @@ impl StreetGraph {
                 .iter()
                 .enumerate()
                 .map(|(offset, node)| IndexedPoint {
-                    index: self.coordinates.len() + offset,
-                    point: [node.coordinate.1, node.coordinate.0],
+                    index: (self.coordinates.len() + offset) as u32,
+                    point: [node.coordinate.1 as f32, node.coordinate.0 as f32],
                 })
                 .collect(),
         );
@@ -1105,13 +1129,13 @@ impl StreetGraph {
             for index in 0..(window_len - 1) {
                 let from_index = self.overlay_node_index_for(
                     way.node_refs[index],
-                    way.coordinates[index],
+                    way.coordinates[index].as_f64(),
                     &mut overlay_lookup,
                     &mut nodes,
                 );
                 let to_index = self.overlay_node_index_for(
                     way.node_refs[index + 1],
-                    way.coordinates[index + 1],
+                    way.coordinates[index + 1].as_f64(),
                     &mut overlay_lookup,
                     &mut nodes,
                 );
@@ -1120,16 +1144,17 @@ impl StreetGraph {
                 }
 
                 let distance_meters = haversine_meters(
-                    way.coordinates[index].0,
-                    way.coordinates[index].1,
-                    way.coordinates[index + 1].0,
-                    way.coordinates[index + 1].1,
+                    way.coordinates[index].lat as f64 / 1_000_000.0,
+                    way.coordinates[index].lon as f64 / 1_000_000.0,
+                    way.coordinates[index + 1].lat as f64 / 1_000_000.0,
+                    way.coordinates[index + 1].lon as f64 / 1_000_000.0,
                 );
                 if !(distance_meters.is_finite()) || distance_meters <= 0.0 {
                     continue;
                 }
 
-                let duration_secs = (distance_meters / speed_mps).ceil().max(1.0) as u32;
+                let duration_secs = ((distance_meters / speed_mps).ceil().max(1.0) as u32).min(u16::MAX as u32) as u16;
+                let internal_way_id = self.way_osm_ids.iter().position(|&id| id == way.way_id).map(|i| i as u32).unwrap_or(u32::MAX);
                 match direction {
                     TravelDirection::Both => {
                         push_overlay_directed_edge(
@@ -1139,7 +1164,7 @@ impl StreetGraph {
                             to_index,
                             duration_secs,
                             distance_meters,
-                            way.way_id,
+                            internal_way_id,
                         );
                         push_overlay_directed_edge(
                             &mut forward_adjacency,
@@ -1148,7 +1173,7 @@ impl StreetGraph {
                             from_index,
                             duration_secs,
                             distance_meters,
-                            way.way_id,
+                            internal_way_id,
                         );
                     }
                     TravelDirection::ForwardOnly => {
@@ -1159,7 +1184,7 @@ impl StreetGraph {
                             to_index,
                             duration_secs,
                             distance_meters,
-                            way.way_id,
+                            internal_way_id,
                         );
                     }
                     TravelDirection::ReverseOnly => {
@@ -1170,7 +1195,7 @@ impl StreetGraph {
                             from_index,
                             duration_secs,
                             distance_meters,
-                            way.way_id,
+                            internal_way_id,
                         );
                     }
                 }
@@ -1267,15 +1292,19 @@ fn build_graph_cache(
 ) -> Result<StreetGraphCache> {
     info!(mode = mode.as_str(), "building street graph from OSM PBF");
 
-    let mut coordinates = Vec::<(f64, f64)>::new();
+    let mut coordinates = Vec::<Coordinate>::new();
     let mut node_osm_ids = Vec::<i64>::new();
     let mut forward_adjacency = Vec::<Vec<StreetEdge>>::new();
     let mut reverse_adjacency = Vec::<Vec<StreetEdge>>::new();
     let mut node_lookup = HashMap::<NodeId, usize>::new();
+    let mut way_osm_ids = Vec::<i64>::new();
     let mut way_names = HashMap::<i64, String>::new();
 
     let total_ways = ways.len().max(1);
     for (way_index, way) in ways.iter().enumerate() {
+        way_osm_ids.push(way.id.0);
+        let internal_way_id = way_index as u32;
+
         if let Some(name) = way.tags.get("name").map(|value| value.trim()).filter(|value| !value.is_empty()) {
             way_names.insert(way.id.0, name.to_owned());
         }
@@ -1321,7 +1350,7 @@ fn build_graph_cache(
                 continue;
             }
 
-            let duration_secs = (distance_meters / speed_mps).ceil().max(1.0) as u32;
+            let duration_secs = ((distance_meters / speed_mps).ceil().max(1.0) as u32).min(u16::MAX as u32) as u16;
 
             match direction {
                 TravelDirection::Both => {
@@ -1332,7 +1361,7 @@ fn build_graph_cache(
                         to_index,
                         duration_secs,
                         distance_meters,
-                        way.id.0,
+                        internal_way_id,
                     )?;
                     push_directed_edge(
                         &mut forward_adjacency,
@@ -1341,7 +1370,7 @@ fn build_graph_cache(
                         from_index,
                         duration_secs,
                         distance_meters,
-                        way.id.0,
+                        internal_way_id,
                     )?;
                 }
                 TravelDirection::ForwardOnly => {
@@ -1352,7 +1381,7 @@ fn build_graph_cache(
                         to_index,
                         duration_secs,
                         distance_meters,
-                        way.id.0,
+                        internal_way_id,
                     )?;
                 }
                 TravelDirection::ReverseOnly => {
@@ -1363,7 +1392,7 @@ fn build_graph_cache(
                         from_index,
                         duration_secs,
                         distance_meters,
-                        way.id.0,
+                        internal_way_id,
                     )?;
                 }
             }
@@ -1404,6 +1433,7 @@ fn build_graph_cache(
         forward_edges,
         reverse_node_offsets,
         reverse_edges,
+        way_osm_ids,
         way_names,
     })
 }
@@ -1412,7 +1442,7 @@ fn graph_index_for(
     node_id: NodeId,
     coordinate: (f64, f64),
     node_lookup: &mut HashMap<NodeId, usize>,
-    coordinates: &mut Vec<(f64, f64)>,
+    coordinates: &mut Vec<Coordinate>,
     node_osm_ids: &mut Vec<i64>,
     forward_adjacency: &mut Vec<Vec<StreetEdge>>,
     reverse_adjacency: &mut Vec<Vec<StreetEdge>>,
@@ -1422,7 +1452,7 @@ fn graph_index_for(
     }
 
     let index = coordinates.len();
-    coordinates.push(coordinate);
+    coordinates.push(Coordinate::new(coordinate.0, coordinate.1));
     node_osm_ids.push(node_id.0);
     forward_adjacency.push(Vec::new());
     reverse_adjacency.push(Vec::new());
@@ -1435,9 +1465,9 @@ fn push_directed_edge(
     reverse_adjacency: &mut [Vec<StreetEdge>],
     from_index: usize,
     to_index: usize,
-    duration_secs: u32,
+    duration_secs: u16,
     distance_meters: f64,
-    way_id: i64,
+    way_id: u32,
 ) -> Result<()> {
     let to_index_u32 = u32::try_from(to_index).context("street graph node index exceeds u32")?;
     let from_index_u32 =
@@ -1464,9 +1494,9 @@ fn push_overlay_directed_edge(
     reverse_adjacency: &mut HashMap<usize, Vec<StreetEdge>>,
     from_index: usize,
     to_index: usize,
-    duration_secs: u32,
+    duration_secs: u16,
     distance_meters: f64,
-    way_id: i64,
+    way_id: u32,
 ) {
     let (Ok(to_index_u32), Ok(from_index_u32)) = (u32::try_from(to_index), u32::try_from(from_index)) else {
         return;
@@ -2033,7 +2063,7 @@ fn parse_osc_diff(bytes: &[u8]) -> Result<OscDiff> {
                     way.coordinates = way
                         .node_refs
                         .iter()
-                        .filter_map(|node_id| nodes.get(node_id).copied())
+                        .filter_map(|node_id| nodes.get(node_id).map(|&(lat, lon)| Coordinate::new(lat, lon)))
                         .collect();
                     ways.push(way);
                 }
