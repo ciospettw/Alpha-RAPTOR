@@ -1,9 +1,14 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cold_storage;
 mod engine;
 mod geo;
 mod hpf;
 mod profile_cache;
+mod progress;
 mod realtime;
+mod street;
 mod walker;
 
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -66,6 +71,15 @@ struct ErrorBody {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct StreetRequest {
+    from_lat: f64,
+    from_lon: f64,
+    to_lat: f64,
+    to_lon: f64,
+    mode: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -110,6 +124,7 @@ async fn main() -> Result<()> {
     spawn_realtime_refresh(shared_engine.clone());
     spawn_static_reload(shared_engine.clone());
     spawn_hpf_overlay_refresh(shared_engine.clone());
+    spawn_street_overlay_refresh(shared_engine.clone());
 
     let public_dir = workspace_root.join("public");
     let app = Router::new()
@@ -118,6 +133,7 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(stats))
         .route("/api/stops", get(search_stops))
         .route("/api/query", get(run_query))
+        .route("/api/street", get(run_street_query))
         .route("/api/realtime", get(realtime_snapshot))
         .route("/api/realtime/refresh", post(refresh_realtime))
         .nest_service("/assets", ServeDir::new(public_dir))
@@ -333,6 +349,27 @@ async fn run_query(
     }
 }
 
+async fn run_street_query(
+    State(state): State<AppState>,
+    Query(params): Query<StreetRequest>,
+) -> impl IntoResponse {
+    let mode_str = params.mode.as_str();
+    let mode = match crate::street::StreetMode::parse(Some(mode_str)) {
+        Ok(m) => m,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+
+    let engine = state.engine.current();
+    let Some(street_router) = engine.street_router.as_ref() else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "Street router not initialized".to_string());
+    };
+
+    match street_router.route(mode, (params.from_lat, params.from_lon), (params.to_lat, params.to_lon)) {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(error) => json_error(StatusCode::BAD_REQUEST, error.to_string()),
+    }
+}
+
 async fn realtime_snapshot(
     State(state): State<AppState>,
     Query(params): Query<RealtimeQueryParams>,
@@ -350,4 +387,42 @@ async fn refresh_realtime(State(state): State<AppState>) -> impl IntoResponse {
 
 fn json_error(status: StatusCode, message: String) -> axum::response::Response {
     (status, Json(ErrorBody { error: message })).into_response()
+}
+
+fn spawn_street_overlay_refresh(engine: SharedEngine) {
+    tokio::spawn(async move {
+        let mut first_cycle = true;
+        loop {
+            let poll_every = match engine.current().config.osm_diff.as_ref() {
+                Some(config) => Duration::from_secs(config.poll_interval_secs),
+                None => Duration::from_secs(300),
+            };
+
+            if first_cycle {
+                first_cycle = false;
+            } else {
+                tokio::time::sleep(poll_every).await;
+            }
+
+            let current_engine = engine.current();
+            if current_engine.config.osm_diff.is_none() {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+
+            match current_engine.refresh_street_overlay().await {
+                Ok(Some(snapshot)) => {
+                    info!(
+                        walk_applied_sequence = ?snapshot.walk.applied_sequence,
+                        drive_applied_sequence = ?snapshot.drive.applied_sequence,
+                        walk_blocked_ways = snapshot.walk.blocked_way_ids,
+                        drive_blocked_ways = snapshot.drive.blocked_way_ids,
+                        "street overlay refresh completed"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%error, "street overlay refresh failed"),
+            }
+        }
+    });
 }

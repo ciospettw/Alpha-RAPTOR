@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -77,7 +78,7 @@ pub struct FeedConfig {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawEngineManifest {
     osm_pbf: Option<String>,
     osm_pbf_allow_invalid_tls: Option<bool>,
@@ -91,16 +92,17 @@ struct RawEngineManifest {
     dvni: Option<RawDvniConfig>,
     hpf: Option<RawHpfConfig>,
     osm_diff: Option<RawOsmDiffConfig>,
+    #[serde(default)]
     feeds: Vec<RawFeedConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawDvniConfig {
     knn_candidates: Option<usize>,
     max_walk_radius_meters: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawHpfConfig {
     max_distance_meters: Option<f64>,
     snap_tolerance_meters: Option<f64>,
@@ -108,7 +110,7 @@ struct RawHpfConfig {
     search_window: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawOsmDiffConfig {
     state_url: String,
     diff_base_url: Option<String>,
@@ -116,7 +118,7 @@ struct RawOsmDiffConfig {
     allow_invalid_tls: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawFeedConfig {
     id: String,
     static_gtfs: String,
@@ -126,6 +128,29 @@ struct RawFeedConfig {
     vehicle_positions_url: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingDescriptor {
+    static_feeds: Vec<RoutingStaticFeed>,
+    realtime_feeds: Vec<RoutingRealtimeFeed>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingStaticFeed {
+    id: String,
+    feed_id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingRealtimeFeed {
+    feed_id: String,
+    trip_updates_url: Option<String>,
+    vehicle_positions_url: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -143,6 +168,7 @@ pub struct Engine {
     profile_cache: ProfileCache,
     walk_way_names: Arc<HashMap<i64, String>>,
     hpf: Option<HolographicPedestrianForest>,
+    pub street_router: Option<Arc<crate::street::StreetRouter>>,
 }
 
 #[derive(Clone)]
@@ -462,6 +488,7 @@ pub struct EngineStats {
     pub realtime: RealtimeDebugSnapshot,
     pub memoization: ProfileCacheStats,
     pub hpf_overlay: Option<HpfOverlaySnapshot>,
+    pub street_overlay: Option<crate::street::StreetRouterOverlaySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1062,6 +1089,7 @@ impl EngineConfig {
             .with_context(|| format!("unable to read manifest {}", manifest_path.display()))?;
         let manifest: RawEngineManifest = toml::from_str(&manifest_body)
             .with_context(|| format!("invalid manifest TOML at {}", manifest_path.display()))?;
+
         if manifest.feeds.is_empty() {
             bail!(
                 "manifest {} does not define any feeds",
@@ -1420,6 +1448,18 @@ impl Engine {
     fn load_internal(config: EngineConfig, previous: Option<&Engine>) -> Result<Self> {
         let started = Instant::now();
         let static_core_result = load_or_build_static_core(&config, previous)?;
+        
+        if let Some(previous_engine) = previous {
+            if static_core_result.diff_summary.divergence_ratio == 0.0 {
+                let osm_changed = previous_engine.config.static_inputs_metadata.osm_source != config.static_inputs_metadata.osm_source;
+                if !osm_changed {
+                    tracing::info!("GTFS divergence ratio is 0.0 and OSM is unchanged, reusing previous engine entirely to save memory and CPU.");
+                    let mut reused_engine = previous_engine.clone();
+                    reused_engine.config = std::sync::Arc::new(config);
+                    return Ok(reused_engine);
+                }
+            }
+        }
         let cold_store_started = Instant::now();
         let cold_generation = static_metadata_generation_token(&config.static_inputs_metadata);
         let cold_store = Arc::new(ColdStore::load_or_build(
@@ -1528,6 +1568,14 @@ impl Engine {
             "dvni+stop-knn-fallback"
         };
 
+        let street_router_started = Instant::now();
+        let street_router = crate::street::build_or_load_street_router(
+            &config.osm_pbf_path,
+            &runtime_cache_dir(&config.workspace_root, "osm"),
+            config.osm_diff.clone(),
+        ).map_err(|e| warn!(%e, "failed to load street router")).ok().map(Arc::new);
+        let _street_router_ms = street_router_started.elapsed().as_millis();
+
         let timings = BuildTimings {
             hpf_ms: hpf_millis,
             ..timings
@@ -1627,6 +1675,7 @@ impl Engine {
             profile_cache: ProfileCache::new(),
             walk_way_names,
             hpf,
+            street_router,
         })
     }
 
@@ -1661,6 +1710,7 @@ impl Engine {
             realtime: self.realtime.snapshot(&self.static_data, 16),
             memoization: self.profile_cache.snapshot(),
             hpf_overlay: self.hpf.as_ref().map(|hpf| hpf.overlay_snapshot()),
+            street_overlay: self.street_router.as_ref().map(|router| router.overlay_snapshot()),
         }
     }
 
@@ -1672,6 +1722,17 @@ impl Engine {
         tokio::task::spawn_blocking(move || hpf.poll_remote_updates())
             .await
             .context("HPF overlay refresh task panicked")?
+            .map(Some)
+    }
+
+    pub async fn refresh_street_overlay(&self) -> Result<Option<crate::street::StreetRouterOverlaySnapshot>> {
+        let Some(router) = self.street_router.clone() else {
+            return Ok(None);
+        };
+
+        tokio::task::spawn_blocking(move || router.poll_remote_updates())
+            .await
+            .context("Street overlay refresh task panicked")?
             .map(Some)
     }
 
@@ -5126,8 +5187,8 @@ fn probe_remote_static_gtfs_version(
     feed_id: &str,
     url: &str,
 ) -> Result<RemoteStaticGtfsVersionMetadata> {
-    let response = client
-        .head(url)
+    let builder = client.head(url);
+    let response = builder
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| {
@@ -5276,8 +5337,8 @@ fn sync_remote_static_gtfs(
         }
     }
 
-    let response = client
-        .get(url)
+    let builder = client.get(url);
+    let response = builder
         .send()
         .and_then(|response| response.error_for_status())
         .with_context(|| format!("failed to download static GTFS feed {feed_id} from {url}"));
@@ -6077,7 +6138,7 @@ fn write_sanitized_gtfs_zip(feed: &FeedConfig) -> Result<PathBuf> {
             )
         })?;
         let name = entry.name().to_owned();
-        let mut options = zip::write::FileOptions::default()
+        let mut options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
             .compression_method(entry.compression());
         if let Some(mode) = entry.unix_mode() {
             options = options.unix_permissions(mode);
