@@ -295,6 +295,11 @@ impl RealtimeStore {
         self.canceled_trips.contains_key(&trip_index)
     }
 
+    pub fn vehicles(&self) -> Vec<VehicleSnapshot> {
+        let state = self.state.lock().expect("realtime state poisoned");
+        state.vehicles.clone()
+    }
+
     pub fn snapshot(&self, static_data: &StaticData, limit: usize) -> RealtimeDebugSnapshot {
         let state = self.state.lock().expect("realtime state poisoned").clone();
         let mut delay_samples = Vec::new();

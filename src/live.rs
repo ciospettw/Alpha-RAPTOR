@@ -27,12 +27,16 @@ pub struct UserSession {
     pub sender: mpsc::Sender<serde_json::Value>,
     pub original_query: Option<QueryRequest>,
     pub original_legs: Option<Vec<LegResponse>>,
+    pub user_lat: Option<f64>,
+    pub user_lon: Option<f64>,
+    pub current_leg_index: Option<usize>,
+    pub trip_indices: Option<Vec<usize>>,
 }
 pub type ClientRegistry = Arc<DashMap<SocketId, UserSession>>;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct SubscribeMessage {
-    pub trip_indices: Vec<usize>,
+    pub trip_indices: Option<Vec<usize>>,
     pub original_query: Option<QueryRequest>,
     pub original_legs: Option<Vec<LegResponse>>,
     pub user_lat: Option<f64>,
@@ -58,6 +62,118 @@ pub struct UxEvent {
     pub alighting_stop_name: Option<String>,
 }
 
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6371000.0; // meters
+    let phi1 = lat1.to_radians();
+    let phi2 = lat2.to_radians();
+    let delta_phi = (lat2 - lat1).to_radians();
+    let delta_lambda = (lon2 - lon1).to_radians();
+    let a = (delta_phi / 2.0).sin().powi(2)
+        + phi1.cos() * phi2.cos() * (delta_lambda / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    r * c
+}
+
+async fn detect_boarding_and_stops(
+    state: &AppState,
+    socket_id: SocketId,
+    user_lat: f64,
+    user_lon: f64,
+    current_leg_index: usize,
+) {
+    let (original_legs, sender) = match state.client_registry.get(&socket_id) {
+        Some(session) => (session.original_legs.clone(), session.sender.clone()),
+        None => return,
+    };
+
+    let legs = match original_legs {
+        Some(l) => l,
+        None => return,
+    };
+
+    // 1. Boarding Detection
+    let mut next_transit_idx = None;
+    for (i, leg) in legs.iter().enumerate() {
+        if i >= current_leg_index && leg.kind == "transit" {
+            next_transit_idx = Some(i);
+            break;
+        }
+    }
+
+    if let Some(transit_idx) = next_transit_idx {
+        if let Some(trip_id) = &legs[transit_idx].trip_id {
+            let vehicles = state.engine.current().realtime.vehicles();
+            let vehicle = vehicles.iter().find(|v| {
+                v.trip_id.as_deref() == Some(trip_id.as_str()) ||
+                v.trip_id.as_deref().map(|id| id.contains(trip_id)).unwrap_or(false)
+            });
+
+            if let Some(veh) = vehicle {
+                if let (Some(v_lat), Some(v_lon)) = (veh.latitude, veh.longitude) {
+                    let dist = haversine_distance(user_lat, user_lon, v_lat, v_lon);
+                    // Boarding detected if user is within 80 meters
+                    if dist < 80.0 {
+                        info!(socket_id, trip_id, dist, "Transit vehicle boarding detected");
+                        let msg = serde_json::json!({
+                            "type": "BOARDED",
+                            "leg_index": transit_idx,
+                            "trip_id": trip_id,
+                        });
+                        let _ = sender.send(msg).await;
+
+                        // Update current_leg_index in registry to avoid repeatedly sending BOARDED
+                        if let Some(mut session) = state.client_registry.get_mut(&socket_id) {
+                            session.current_leg_index = Some(transit_idx);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Current Stop Update
+    if current_leg_index < legs.len() && legs[current_leg_index].kind == "transit" {
+        let leg = &legs[current_leg_index];
+        let mut stops_seq = Vec::new();
+        
+        if let (Some(lat), Some(lon)) = (leg.from_stop.latitude, leg.from_stop.longitude) {
+            stops_seq.push((&leg.from_stop.name, lat, lon));
+        }
+        for stop in &leg.intermediate_stops {
+            if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
+                stops_seq.push((&stop.name, lat, lon));
+            }
+        }
+        if let (Some(lat), Some(lon)) = (leg.to_stop.latitude, leg.to_stop.longitude) {
+            stops_seq.push((&leg.to_stop.name, lat, lon));
+        }
+
+        if !stops_seq.is_empty() {
+            let mut closest_stop_idx = 0;
+            let mut min_dist = f64::MAX;
+
+            for (idx, &(_, s_lat, s_lon)) in stops_seq.iter().enumerate() {
+                let dist = haversine_distance(user_lat, user_lon, s_lat, s_lon);
+                if dist < min_dist {
+                    min_dist = dist;
+                    closest_stop_idx = idx;
+                }
+            }
+
+            let current_stop_name = stops_seq[closest_stop_idx].0;
+            let stops_remaining = stops_seq.len().saturating_sub(closest_stop_idx + 1);
+
+            let msg = serde_json::json!({
+                "type": "STOP_UPDATE",
+                "current_stop_name": current_stop_name,
+                "stops_remaining": stops_remaining,
+            });
+            let _ = sender.send(msg).await;
+        }
+    }
+}
+
 pub async fn live_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -79,6 +195,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             sender: tx,
             original_query: None,
             original_legs: None,
+            user_lat: None,
+            user_lon: None,
+            current_leg_index: None,
+            trip_indices: None,
         },
     );
 
@@ -98,21 +218,39 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
             if let Ok(sub) = serde_json::from_str::<SubscribeMessage>(&text) {
-                info!(socket_id, trips = ?sub.trip_indices, "client subscribed to trips");
-                
-                // Update original query in registry
-                if let Some(mut session) = local_state.client_registry.get_mut(&socket_id) {
-                    session.original_query = sub.original_query.clone();
-                    session.original_legs = sub.original_legs.clone();
-                }
+                if let Some(trip_indices) = &sub.trip_indices {
+                    info!(socket_id, trips = ?trip_indices, "client subscribed to trips");
+                    
+                    // Update original query and initial state in registry
+                    if let Some(mut session) = local_state.client_registry.get_mut(&socket_id) {
+                        session.original_query = sub.original_query.clone();
+                        session.original_legs = sub.original_legs.clone();
+                        session.trip_indices = Some(trip_indices.clone());
+                        session.user_lat = sub.user_lat;
+                        session.user_lon = sub.user_lon;
+                        session.current_leg_index = sub.current_leg_index;
+                    }
 
-                // Register in ADM
-                for trip_idx in sub.trip_indices {
-                    local_state
-                        .adm
-                        .entry(trip_idx)
-                        .or_default()
-                        .push(socket_id);
+                    // Register in ADM
+                    for &trip_idx in trip_indices {
+                        local_state
+                            .adm
+                            .entry(trip_idx)
+                            .or_default()
+                            .push(socket_id);
+                    }
+                } else if sub.user_lat.is_some() && sub.user_lon.is_some() {
+                    let lat = sub.user_lat.unwrap();
+                    let lon = sub.user_lon.unwrap();
+                    let leg_idx = sub.current_leg_index.unwrap_or(0);
+
+                    if let Some(mut session) = local_state.client_registry.get_mut(&socket_id) {
+                        session.user_lat = Some(lat);
+                        session.user_lon = Some(lon);
+                        session.current_leg_index = Some(leg_idx);
+                    }
+
+                    detect_boarding_and_stops(&local_state, socket_id, lat, lon, leg_idx).await;
                 }
             }
         }

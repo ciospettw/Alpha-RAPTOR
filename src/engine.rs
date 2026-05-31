@@ -164,7 +164,7 @@ enum EntityKind {
 pub struct Engine {
     pub config: Arc<EngineConfig>,
     static_data: Arc<StaticData>,
-    realtime: RealtimeStore,
+    pub realtime: RealtimeStore,
     profile_cache: ProfileCache,
     walk_way_names: Arc<HashMap<i64, String>>,
     hpf: Option<HolographicPedestrianForest>,
