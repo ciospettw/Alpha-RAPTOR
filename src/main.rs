@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
         .route("/api/street", get(run_street_query))
         .route("/api/realtime", get(realtime_snapshot))
         .route("/api/realtime/refresh", post(refresh_realtime))
+        .route("/internal/realtime/refresh", post(refresh_realtime))
         .route("/live", get(live_handler))
         .nest_service("/assets", ServeDir::new(public_dir))
         .layer(TraceLayer::new_for_http())
@@ -404,7 +405,26 @@ async fn realtime_snapshot(
     Json(state.engine.current().realtime_snapshot(limit))
 }
 
-async fn refresh_realtime(State(state): State<AppState>) -> impl IntoResponse {
+async fn refresh_realtime(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let header_val = headers.get("x-buso-internal-token")
+        .and_then(|h| h.to_str().ok());
+
+    match crate::control::load_internal_token() {
+        Ok(Some(expected)) => {
+            let matched = header_val.map(|h| h.trim() == expected.trim()).unwrap_or(false);
+            if !matched {
+                return json_error(StatusCode::UNAUTHORIZED, "Unauthorized internal token".to_string());
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load internal token: {err}"));
+        }
+    }
+
     match state.engine.current().refresh_realtime().await {
         Ok((snapshot, _)) => (StatusCode::OK, Json(snapshot)).into_response(),
         Err(error) => json_error(StatusCode::BAD_GATEWAY, error.to_string()),
