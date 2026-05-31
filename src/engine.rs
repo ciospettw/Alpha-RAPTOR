@@ -1491,6 +1491,18 @@ impl Engine {
     fn load_internal(config: EngineConfig, previous: Option<&Engine>) -> Result<Self> {
         let started = Instant::now();
         let static_core_result = load_or_build_static_core(&config, previous)?;
+        
+        if let Some(previous_engine) = previous {
+            if static_core_result.diff_summary.divergence_ratio == 0.0 {
+                let osm_changed = previous_engine.config.static_inputs_metadata.osm_source != config.static_inputs_metadata.osm_source;
+                if !osm_changed {
+                    tracing::info!("GTFS divergence ratio is 0.0 and OSM is unchanged, reusing previous engine entirely to save memory and CPU.");
+                    let mut reused_engine = previous_engine.clone();
+                    reused_engine.config = std::sync::Arc::new(config);
+                    return Ok(reused_engine);
+                }
+            }
+        }
         let cold_store_started = Instant::now();
         let cold_generation = static_metadata_generation_token(&config.static_inputs_metadata);
         let cold_store = Arc::new(ColdStore::load_or_build(

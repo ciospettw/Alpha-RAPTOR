@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cold_storage;
 mod control;
 mod engine;
