@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -487,6 +488,7 @@ pub struct EngineStats {
     pub realtime: RealtimeDebugSnapshot,
     pub memoization: ProfileCacheStats,
     pub hpf_overlay: Option<HpfOverlaySnapshot>,
+    pub street_overlay: Option<crate::street::StreetRouterOverlaySnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1753,6 +1755,7 @@ impl Engine {
             realtime: self.realtime.snapshot(&self.static_data, 16),
             memoization: self.profile_cache.snapshot(),
             hpf_overlay: self.hpf.as_ref().map(|hpf| hpf.overlay_snapshot()),
+            street_overlay: self.street_router.as_ref().map(|router| router.overlay_snapshot()),
         }
     }
 
@@ -1764,6 +1767,17 @@ impl Engine {
         tokio::task::spawn_blocking(move || hpf.poll_remote_updates())
             .await
             .context("HPF overlay refresh task panicked")?
+            .map(Some)
+    }
+
+    pub async fn refresh_street_overlay(&self) -> Result<Option<crate::street::StreetRouterOverlaySnapshot>> {
+        let Some(router) = self.street_router.clone() else {
+            return Ok(None);
+        };
+
+        tokio::task::spawn_blocking(move || router.poll_remote_updates())
+            .await
+            .context("Street overlay refresh task panicked")?
             .map(Some)
     }
 

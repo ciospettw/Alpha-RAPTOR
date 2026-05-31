@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};

@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
     spawn_realtime_refresh(shared_engine.clone());
     spawn_static_reload(shared_engine.clone());
     spawn_hpf_overlay_refresh(shared_engine.clone());
+    spawn_street_overlay_refresh(shared_engine.clone());
 
     let public_dir = workspace_root.join("public");
     let app = Router::new()
@@ -387,4 +388,42 @@ async fn refresh_realtime(State(state): State<AppState>) -> impl IntoResponse {
 
 fn json_error(status: StatusCode, message: String) -> axum::response::Response {
     (status, Json(ErrorBody { error: message })).into_response()
+}
+
+fn spawn_street_overlay_refresh(engine: SharedEngine) {
+    tokio::spawn(async move {
+        let mut first_cycle = true;
+        loop {
+            let poll_every = match engine.current().config.osm_diff.as_ref() {
+                Some(config) => Duration::from_secs(config.poll_interval_secs),
+                None => Duration::from_secs(300),
+            };
+
+            if first_cycle {
+                first_cycle = false;
+            } else {
+                tokio::time::sleep(poll_every).await;
+            }
+
+            let current_engine = engine.current();
+            if current_engine.config.osm_diff.is_none() {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+
+            match current_engine.refresh_street_overlay().await {
+                Ok(Some(snapshot)) => {
+                    info!(
+                        walk_applied_sequence = ?snapshot.walk.applied_sequence,
+                        drive_applied_sequence = ?snapshot.drive.applied_sequence,
+                        walk_blocked_ways = snapshot.walk.blocked_way_ids,
+                        drive_blocked_ways = snapshot.drive.blocked_way_ids,
+                        "street overlay refresh completed"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%error, "street overlay refresh failed"),
+            }
+        }
+    });
 }
