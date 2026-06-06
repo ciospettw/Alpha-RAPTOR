@@ -101,7 +101,10 @@ async fn detect_boarding_and_stops(
     }
 
     if let Some(transit_idx) = next_transit_idx {
-        if let Some(trip_id) = &legs[transit_idx].trip_id {
+        let leg = &legs[transit_idx];
+        let mut boarded = false;
+
+        if let Some(trip_id) = &leg.trip_id {
             let vehicles = state.engine.current().realtime.vehicles();
             let vehicle = vehicles.iter().find(|v| {
                 v.trip_id.as_deref() == Some(trip_id.as_str()) ||
@@ -113,22 +116,37 @@ async fn detect_boarding_and_stops(
                     let dist = haversine_distance(user_lat, user_lon, v_lat, v_lon);
                     // Boarding detected if user is within 80 meters
                     if dist < 80.0 {
-                        info!(socket_id, trip_id, dist, "Transit vehicle boarding detected");
-                        let msg = serde_json::json!({
-                            "type": "BOARDED",
-                            "leg_index": transit_idx,
-                            "trip_id": trip_id,
-                        });
-                        let _ = sender.send(msg).await;
-
-                        // Update current_leg_index in registry to avoid repeatedly sending BOARDED
-                        if let Some(mut session) = state.client_registry.get_mut(&socket_id) {
-                            session.current_leg_index = Some(transit_idx);
-                        }
-                        return;
+                        boarded = true;
                     }
                 }
             }
+        }
+
+        // Simulate boarding for scheduled legs that don't have GTFS-RT
+        if !boarded {
+            if let Ok(dep_time) = chrono::NaiveDateTime::parse_from_str(&leg.departure_time, "%Y-%m-%d %H:%M:%S") {
+                if chrono::Local::now().naive_local() >= dep_time {
+                    if !leg.has_realtime_update {
+                        boarded = true;
+                    }
+                }
+            }
+        }
+
+        if boarded {
+            info!(socket_id, transit_idx, "Transit vehicle boarding detected/simulated");
+            let msg = serde_json::json!({
+                "type": "BOARDED",
+                "leg_index": transit_idx,
+                "trip_id": leg.trip_id,
+            });
+            let _ = sender.send(msg).await;
+
+            // Update current_leg_index in registry to avoid repeatedly sending BOARDED
+            if let Some(mut session) = state.client_registry.get_mut(&socket_id) {
+                session.current_leg_index = Some(transit_idx);
+            }
+            return;
         }
     }
 
@@ -263,10 +281,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 
     info!(socket_id, "WebSocket client disconnected");
-    state.client_registry.remove(&socket_id);
-    
-    // We do not eagerly clean up ADM right now for simplicity (it's lock-free and fast enough),
-    // but in a production environment, we might remove socket_id from the vectors.
+    if let Some((_, session)) = state.client_registry.remove(&socket_id) {
+        if let Some(trip_indices) = session.trip_indices {
+            for trip_idx in trip_indices {
+                if let Some(mut sockets) = state.adm.get_mut(&trip_idx) {
+                    sockets.retain(|&id| id != socket_id);
+                }
+            }
+        }
+    }
 }
 
 pub fn spawn_healing_worker(state: AppState) {

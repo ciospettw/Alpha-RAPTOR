@@ -494,6 +494,7 @@ impl ProfileCache {
 
         self.inserted_points
             .fetch_add(inserted_points, Ordering::Relaxed);
+        self.enforce_size_limit();
     }
 
     pub fn insert_spatial_batch(
@@ -547,6 +548,7 @@ impl ProfileCache {
 
         self.inserted_spatial_points
             .fetch_add(inserted_points, Ordering::Relaxed);
+        self.enforce_size_limit();
     }
 
     pub fn invalidate_trips(&self, changed_trips: &[usize]) -> ProfileInvalidationSummary {
@@ -617,6 +619,21 @@ impl ProfileCache {
         self.bloom_checks
             .fetch_add(summary.bloom_checks, Ordering::Relaxed);
         summary
+    }
+
+    fn enforce_size_limit(&self) {
+        let max_keys = 100_000;
+        let current_keys = self.exact_entries.len() + self.spatial_entries.len();
+        if current_keys > max_keys {
+            let _guard = self.gate.write().expect("profile cache gate poisoned");
+            let locked_current_keys = self.exact_entries.len() + self.spatial_entries.len();
+            if locked_current_keys > max_keys {
+                self.exact_entries.clear();
+                self.exact_summaries.clear();
+                self.spatial_entries.clear();
+                tracing::warn!("ProfileCache exceeded {max_keys} keys and was cleared to prevent OOM.");
+            }
+        }
     }
 
     pub fn snapshot(&self) -> ProfileCacheStats {
